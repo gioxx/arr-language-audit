@@ -94,9 +94,11 @@ cd arr-language-audit
 All'avvio fa un pre-check: carica `.env`, verifica le dipendenze e interroga
 Radarr/Sonarr (`/api/v3/system/status`), così l'intestazione mostra cosa è
 connesso, quale versione e — in *Connection details* — le root folder con
-accessibilità e spazio libero. Menu: *Scan (fase 1)* → *Verify (fase 2)* →
-*Build / Serve HTML report* → *Run full pipeline*, con *Reconfigure (.env)* e
-*About* in fondo. Usa `whiptail` se disponibile (dialoghi ncurses), altrimenti
+accessibilità e spazio libero, e propone il passo successivo sensato
+(marcato *(recommended)* e preselezionato). Menu: *Scan (fase 1)* → *Verify
+(fase 2)* → *Build / Serve HTML report* → *Run full pipeline* → *Set up phase 2*
+(crea `verify/venv` e installa `faster-whisper`, con conferma), con
+*Connection details*, *Reconfigure (.env)* e *About* in fondo. Usa `whiptail` se disponibile (dialoghi ncurses), altrimenti
 un menu numerato. Tutti gli output finiscono in `reports/`.
 
 Le sezioni seguenti descrivono i singoli script, se preferisci lanciarli a
@@ -392,9 +394,11 @@ cd arr-language-audit
 On launch it runs a pre-flight: it loads `.env`, checks the tools each phase
 needs, and queries Radarr/Sonarr (`/api/v3/system/status`) so the header shows
 what is connected, which version, and — under *Connection details* — the root
-folders with their accessibility and free space. Menu: *Scan (phase 1)* →
-*Verify (phase 2)* → *Build / Serve HTML report* → *Run full pipeline*, with
-*Reconfigure (.env)* and *About* at the bottom. It uses `whiptail` when
+folders with their accessibility and free space, and it suggests the next
+sensible step (tagged *(recommended)* and pre-selected). Menu: *Scan (phase 1)*
+→ *Verify (phase 2)* → *Build / Serve HTML report* → *Run full pipeline* →
+*Set up phase 2* (creates `verify/venv` and installs `faster-whisper`, with
+confirmation), plus *Connection details*, *Reconfigure (.env)* and *About*. It uses `whiptail` when
 available (ncurses dialogs) and falls back to a plain numbered prompt. All
 output lands in `reports/`.
 

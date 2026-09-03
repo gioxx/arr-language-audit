@@ -19,6 +19,7 @@
 #
 # Usage:
 #   ./verify/verify-audio-language.sh [INPUT_CSV] [OUTPUT_CSV]
+#   ./verify/verify-audio-language.sh --check     # only check the environment
 #   ./verify/verify-audio-language.sh -h | --help
 #
 # Arguments:
@@ -68,6 +69,7 @@ Nothing is installed automatically and no media file is modified.
 
 Usage:
   verify-audio-language.sh [INPUT_CSV] [OUTPUT_CSV]
+  verify-audio-language.sh --check            (check the environment only, no run)
   verify-audio-language.sh -h | --help
 
 Arguments:
@@ -96,6 +98,15 @@ Exit codes:
 EOF
 }
 
+# --check: run only the dependency checks (sections 1-6) and exit 0 if the
+# environment is ready for phase 2, non-zero otherwise. Nothing is run or
+# installed. Used by the orchestrator to show what is missing.
+CHECK_ONLY=0
+if [[ "${1:-}" == "--check" ]]; then
+    CHECK_ONLY=1
+    shift
+fi
+
 case "${1:-}" in
     -h|--help) usage; exit 0 ;;
 esac
@@ -116,9 +127,9 @@ MIN_FREE_SPACE_MB="${MIN_FREE_SPACE_MB:-500}"
 missing_deps=0
 
 # ---------------------------------------------------------------------------
-# 1. Check input file exists
+# 1. Check input file exists  (skipped in --check mode)
 # ---------------------------------------------------------------------------
-if [[ ! -f "$INPUT_CSV" ]]; then
+if [[ "$CHECK_ONLY" -eq 0 && ! -f "$INPUT_CSV" ]]; then
     err "Input CSV not found: $INPUT_CSV"
     err "Run scan/find-missing-italian-audio.sh first, or pass the correct path as the first argument."
     exit 1
@@ -281,6 +292,13 @@ if [[ "$missing_deps" -eq 1 ]]; then
     log ""
     err "One or more dependencies are missing. Install them and re-run this script."
     exit 1
+fi
+
+# --check mode stops here: the environment is ready, nothing else to do.
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    log ""
+    log "[OK] phase 2 environment is ready (python via: $PYTHON_BIN)."
+    exit 0
 fi
 
 # ---------------------------------------------------------------------------

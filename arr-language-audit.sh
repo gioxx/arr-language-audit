@@ -139,7 +139,9 @@ info_box() {
 }
 
 pause() {
-    [[ "$HAVE_WHIPTAIL" == "true" ]] && return 0
+    # Always a plain prompt (even under whiptail): the actions that call
+    # pause stream command output to the real terminal, and a whiptail
+    # dialog here would wipe it before the user can read it.
     read -r -p "Press Enter to continue... " _ || true
 }
 
@@ -153,6 +155,7 @@ RADARR_LINE="" ; RADARR_OK=false
 SONARR_LINE="" ; SONARR_OK=false
 ENV_READY=false
 TOOLS_LINE=""
+PHASE2_READY=false ; PHASE2_NOTE=""
 
 # Query one app's /api/v3/system/status. Echoes "OK  vX  [instance]  url"
 # on success (return 0), or a short reason otherwise (return 1).
@@ -219,9 +222,23 @@ run_preflight() {
     command -v ffprobe >/dev/null 2>&1 || need_verify+=(ffprobe)
     local t="tools: "
     if (( ${#need_scan[@]} == 0 )); then t+="phase 1 ready"; else t+="phase 1 MISSING ${need_scan[*]}"; fi
-    if (( ${#need_verify[@]} == 0 )); then t+="  |  phase 2 ready"; else t+="  |  phase 2 missing ${need_verify[*]}"; fi
+    if (( ${#need_verify[@]} == 0 )); then t+="  |  phase 2 tools ready"; else t+="  |  phase 2 missing ${need_verify[*]}"; fi
     [[ "$HAVE_WHIPTAIL" == "true" ]] && t+="  |  whiptail" || t+="  |  plain menu"
     TOOLS_LINE="$t"
+
+    # faster-whisper (the phase 2 Python dependency): system python, or the
+    # local verify/venv. This is separate from the CLI tools above.
+    PHASE2_READY=false
+    if ! command -v python3 >/dev/null 2>&1; then
+        PHASE2_NOTE="faster-whisper: python3 missing"
+    elif python3 -c "import faster_whisper" >/dev/null 2>&1; then
+        PHASE2_READY=true; PHASE2_NOTE="faster-whisper: OK (system python3)"
+    elif [[ -x "$ROOT/verify/venv/bin/python" ]] \
+         && "$ROOT/verify/venv/bin/python" -c "import faster_whisper" >/dev/null 2>&1; then
+        PHASE2_READY=true; PHASE2_NOTE="faster-whisper: OK (verify/venv)"
+    else
+        PHASE2_NOTE="faster-whisper: NOT installed -- use 'Set up phase 2'"
+    fi
 
     # Radarr.
     RADARR_OK=false
@@ -267,10 +284,11 @@ verdict_summary() {
 
 # Echo the menu tag for the most sensible next step given the current state,
 # so the menu can pre-select it and label it "(recommended)".
-#   7 reconfigure   1 scan   2 verify   3 build report   4 serve
+#   8 reconfigure   1 scan   6 set up phase 2   2 verify   3 report   4 serve
 recommended_action() {
-    [[ "$ENV_READY" == "true" ]]                        || { echo 7; return; }
+    [[ "$ENV_READY" == "true" ]]                        || { echo 8; return; }
     [[ -f "$CSV" ]]                                     || { echo 1; return; }
+    [[ "$PHASE2_READY" == "true" ]]                     || { echo 6; return; }
     [[ -f "$VERIFIED_CSV" && ! "$CSV" -nt "$VERIFIED_CSV" ]] || { echo 2; return; }
     [[ -f "$HTML" && ! "$VERIFIED_CSV" -nt "$HTML" ]]   || { echo 3; return; }
     echo 4
@@ -283,7 +301,8 @@ recommended_hint() {
         2) echo "run 'Verify suspects (phase 2)' -- there is a newer phase 1 CSV" ;;
         3) echo "run 'Build HTML report' -- there are newer phase 2 results" ;;
         4) echo "everything is up to date -- 'Serve HTML report' to view it" ;;
-        7) echo "configure Radarr/Sonarr via 'Reconfigure (.env)'" ;;
+        6) echo "install faster-whisper via 'Set up phase 2' before verifying" ;;
+        8) echo "configure Radarr/Sonarr via 'Reconfigure (.env)'" ;;
         *) echo "" ;;
     esac
 }
@@ -292,10 +311,11 @@ status_text() {
     # whiptail shows PROJECT_BANNER as its backtitle already; repeat it here
     # so the plain-text menu carries the same identity line.
     [[ "$HAVE_WHIPTAIL" == "true" ]] || printf '%s\n\n' "$PROJECT_BANNER"
-    printf 'Radarr : %s\nSonarr : %s\n%s\n\nPhase 1 CSV : %s rows\nPhase 2     : %s\nHTML report : %s\n' \
+    printf 'Radarr : %s\nSonarr : %s\n%s\n%s\n\nPhase 1 CSV : %s rows\nPhase 2     : %s\nHTML report : %s\n' \
         "$RADARR_LINE" \
         "$SONARR_LINE" \
         "$TOOLS_LINE" \
+        "$PHASE2_NOTE" \
         "$(csv_row_count "$CSV")" \
         "$(verdict_summary)" \
         "$([[ -f "$HTML" ]] && echo "built ($HTML)" || echo "not built")"
@@ -337,6 +357,18 @@ Run 'Scan library (phase 1)' first."
         return
     fi
 
+    if [[ "$PHASE2_READY" != "true" ]]; then
+        info_box "faster-whisper is not installed, so phase 2 cannot run yet.
+
+  $PHASE2_NOTE
+
+Use the menu item 'Set up phase 2 (faster-whisper)': it creates
+verify/venv and installs the package, with your confirmation. Or install
+it yourself -- 'verify/verify-audio-language.sh --check' prints exactly
+what is missing."
+        return
+    fi
+
     local model
     model=$(ask_menu "small" "faster-whisper model (bigger = more accurate, slower):" \
         small  "balanced (default)" \
@@ -357,6 +389,53 @@ Run 'Scan library (phase 1)' first."
     log "Running phase 2 (verify) with model '$model'..."
     WHISPER_MODEL="$model" LIMIT="$limit" RETRY_ERRORS="$retry" \
         "$VERIFY_SH" "$CSV" "$VERIFIED_CSV" || err "phase 2 exited with an error."
+    pause
+}
+
+action_setup_phase2() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        info_box "python3 is not installed. Install it (and ffmpeg) first."
+        return
+    fi
+
+    log ""
+    log "Checking the phase 2 environment..."
+    if "$VERIFY_SH" --check; then
+        info_box "Phase 2 environment is already ready. Nothing to do."
+        run_preflight
+        pause
+        return
+    fi
+
+    local venv="$ROOT/verify/venv"
+    ask_yesno "Create $venv and 'pip install faster-whisper' now?
+(a few hundred MB, downloads CPU Torch etc.)" no || return
+
+    log ""
+    if [[ ! -x "$venv/bin/python" ]]; then
+        log "Creating virtual environment: $venv"
+        if ! python3 -m venv "$venv"; then
+            local pv
+            pv=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+            info_box "Could not create the venv (ensurepip / python3-venv missing).
+On Debian/Ubuntu install it first, then run this again:
+
+  sudo apt install -y python${pv:-3}-venv"
+            return
+        fi
+    fi
+
+    log "Installing faster-whisper into the venv..."
+    "$venv/bin/pip" install --upgrade pip && "$venv/bin/pip" install faster-whisper
+    local irc=$?
+
+    run_preflight
+    if [[ "$irc" -eq 0 && "$PHASE2_READY" == "true" ]]; then
+        log ""
+        log "Done. $PHASE2_NOTE"
+    else
+        err "the install did not finish cleanly (exit $irc); see the output above."
+    fi
     pause
 }
 
@@ -489,9 +568,10 @@ main() {
             3 "$(_lbl 3 'Build HTML report')" \
             4 "$(_lbl 4 'Serve HTML report')" \
             5 "$(_lbl 5 'Run full pipeline')" \
-            6 "Connection details" \
-            7 "$(_lbl 7 'Reconfigure (.env) + re-check')" \
-            8 "About / project page" \
+            6 "$(_lbl 6 'Set up phase 2 (faster-whisper)')" \
+            7 "Connection details" \
+            8 "$(_lbl 8 'Reconfigure (.env) + re-check')" \
+            9 "About / project page" \
             0 "Quit") || break   # whiptail Cancel / Esc
 
         case "${choice:-}" in
@@ -500,9 +580,10 @@ main() {
             3) action_report ;;
             4) action_serve ;;
             5) action_pipeline ;;
-            6) action_connection_details ;;
-            7) action_configure ;;
-            8) action_about ;;
+            6) action_setup_phase2 ;;
+            7) action_connection_details ;;
+            8) action_configure ;;
+            9) action_about ;;
             0|q|Q|"") break ;;
             *) err "unknown choice: $choice" ;;
         esac
