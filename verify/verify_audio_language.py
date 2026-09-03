@@ -57,6 +57,13 @@ SAMPLE_SECONDS = int(os.environ.get("SAMPLE_SECONDS", "60"))
 SAMPLE_OFFSET_PCT = float(os.environ.get("SAMPLE_OFFSET_PCT", "25"))
 MIN_FREE_SPACE_MB = int(os.environ.get("MIN_FREE_SPACE_MB", "500"))
 
+# Default report location: <repo>/reports/ (this file lives in <repo>/verify/).
+# Keeps phase 1, phase 2 and the HTML report pointed at the same directory
+# regardless of the current working directory.
+REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
+DEFAULT_INPUT = str(REPORTS_DIR / "missing-italian-audio.csv")
+DEFAULT_OUTPUT = str(REPORTS_DIR / "verified-language-results.csv")
+
 
 def check_disk_space(path: str, min_mb: int) -> None:
     usage = shutil.disk_usage(path)
@@ -177,8 +184,8 @@ def main():
             "  TEMP_DIR          temp dir for audio samples          (default: mktemp)\n"
         ),
     )
-    parser.add_argument("--input", default="missing-italian-audio.csv", help="CSV from find-missing-italian-audio.sh")
-    parser.add_argument("--output", default="verified-language-results.csv", help="Output CSV path")
+    parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV from find-missing-italian-audio.sh")
+    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output CSV path")
     parser.add_argument("--limit", type=int, default=0, help="Only process the first N NEW rows (0 = all)")
     parser.add_argument("--retry-errors", action="store_true",
                          help="Also reprocess rows that previously failed (FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)")
@@ -188,7 +195,13 @@ def main():
 
     if not os.path.isfile(args.input):
         print(f"ERROR: input file '{args.input}' not found.", file=sys.stderr)
+        print("Run verify/verify-audio-language.sh (or the orchestrator) first,", file=sys.stderr)
+        print("or pass --input with the correct path.", file=sys.stderr)
         sys.exit(1)
+
+    out_dir = os.path.dirname(os.path.abspath(args.output))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     temp_dir = os.environ.get("TEMP_DIR") or tempfile.mkdtemp(prefix="lang-check-")
     os.makedirs(temp_dir, exist_ok=True)

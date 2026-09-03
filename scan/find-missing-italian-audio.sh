@@ -11,8 +11,8 @@
 # Usage:
 #   ./scan/find-missing-italian-audio.sh [OUTPUT_CSV] [--refresh]
 #
-#   OUTPUT_CSV   where to write the report (default: ./missing-italian-audio.csv,
-#                relative to the current working directory)
+#   OUTPUT_CSV   where to write the report
+#                (default: <repo>/reports/missing-italian-audio.csv)
 #   --refresh    ignore the Sonarr per-series cache and re-fetch everything
 #
 # Sonarr is queried once per series (episodes with their file embedded), and
@@ -87,7 +87,8 @@ Usage:
   find-missing-italian-audio.sh -h | --help
 
 Arguments:
-  OUTPUT_CSV          report path (default: ./missing-italian-audio.csv).
+  OUTPUT_CSV          report path
+                      (default: <repo>/reports/missing-italian-audio.csv).
                       The file is deleted again if there are zero findings.
 
 Options:
@@ -182,7 +183,11 @@ RESCAN_TIMEOUT="${RESCAN_TIMEOUT:-300}"  # seconds to wait for a rescan command
 REFRESH="${REFRESH:-false}"
 [[ "$_refresh_flag" == "true" ]] && REFRESH=true
 
-OUTPUT_CSV="${1:-./missing-italian-audio.csv}"
+# Output CSV. Defaults to <repo>/reports/ (not the current directory) so that
+# phase 2 and the HTML report all read/write the same place no matter which
+# directory a script is launched from. An explicit path argument still wins.
+OUTPUT_CSV="${1:-$REPO_ROOT/reports/missing-italian-audio.csv}"
+mkdir -p "$(dirname -- "$OUTPUT_CSV")"
 
 # Sonarr per-series cache lives next to the output CSV. It records, per
 # series, a signature (episode file count + total size on disk as reported

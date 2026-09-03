@@ -22,8 +22,10 @@
 #   ./verify/verify-audio-language.sh -h | --help
 #
 # Arguments:
-#   INPUT_CSV          CSV from phase 1 (default: ./missing-italian-audio.csv)
-#   OUTPUT_CSV         verdict report   (default: ./verified-language-results.csv)
+#   INPUT_CSV   CSV from phase 1
+#               (default: <repo>/reports/missing-italian-audio.csv)
+#   OUTPUT_CSV  verdict report
+#               (default: <repo>/reports/verified-language-results.csv)
 #
 # Environment variables (see verify_audio_language.py --help for the rest):
 #   WHISPER_MODEL       tiny | base | small | medium            (default: small)
@@ -69,8 +71,8 @@ Usage:
   verify-audio-language.sh -h | --help
 
 Arguments:
-  INPUT_CSV          CSV from phase 1 (default: ./missing-italian-audio.csv)
-  OUTPUT_CSV         verdict report   (default: ./verified-language-results.csv)
+  INPUT_CSV   CSV from phase 1  (default: <repo>/reports/missing-italian-audio.csv)
+  OUTPUT_CSV  verdict report    (default: <repo>/reports/verified-language-results.csv)
 
 Environment variables:
   WHISPER_MODEL      tiny | base | small | medium            (default: small)
@@ -99,10 +101,15 @@ case "${1:-}" in
 esac
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." &> /dev/null && pwd)"
 PYTHON_SCRIPT="$SCRIPT_DIR/verify_audio_language.py"
 
-INPUT_CSV="${1:-./missing-italian-audio.csv}"
-OUTPUT_CSV="${2:-./verified-language-results.csv}"
+# Paths default to <repo>/reports/ so phase 1, phase 2 and the HTML report
+# all use the same location regardless of the current directory. Explicit
+# arguments still win.
+INPUT_CSV="${1:-$REPO_ROOT/reports/missing-italian-audio.csv}"
+OUTPUT_CSV="${2:-$REPO_ROOT/reports/verified-language-results.csv}"
+mkdir -p "$(dirname -- "$OUTPUT_CSV")"
 
 MIN_FREE_SPACE_MB="${MIN_FREE_SPACE_MB:-500}"
 

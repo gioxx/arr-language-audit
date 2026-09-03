@@ -42,16 +42,18 @@ Da qui un approccio in due fasi:
 
 ```
 arr-language-audit/
+├── arr-language-audit.sh        orchestratore interattivo (punto d'ingresso consigliato)
 ├── README.md
 ├── LICENSE                       MIT
 ├── .gitignore
 ├── .env.example                  template di configurazione fase 1 (copia in .env)
 ├── scan/
 │   └── find-missing-italian-audio.sh     fase 1 (bash + curl + jq)
-└── verify/
-    ├── verify-audio-language.sh          fase 2: launcher / controlli pre-volo
-    ├── verify_audio_language.py          fase 2: worker (ffmpeg + faster-whisper)
-    └── report.py                         fase 2: da CSV a report HTML (+ viewer opzionale)
+├── verify/
+│   ├── verify-audio-language.sh          fase 2: launcher / controlli pre-volo
+│   ├── verify_audio_language.py          fase 2: worker (ffmpeg + faster-whisper)
+│   └── report.py                         fase 2: da CSV a report HTML (+ viewer opzionale)
+└── reports/                     output (CSV, cache, HTML) — creata al primo run, git-ignored
 ```
 
 ## Prerequisiti
@@ -80,7 +82,23 @@ pacchetto apt `pythonX.Y-venv` corretto da installare.
 
 ## Avvio rapido
 
-Clona il repo ed esegui entrambe le fasi dalla radice del repo.
+Il modo più semplice è l'orchestratore interattivo: gestisce entrambe le fasi
+e il report da un unico menu, passando sempre percorsi espliciti, così non
+importa da quale cartella lo lanci.
+
+```bash
+cd arr-language-audit
+./arr-language-audit.sh
+```
+
+Menu: *Configure (.env)* → *Scan library (phase 1)* → *Verify suspects
+(phase 2)* → *Build / Serve HTML report*, oppure *Run full pipeline*. Usa
+`whiptail` se disponibile (dialoghi ncurses), altrimenti un menu numerato.
+Tutti gli output finiscono in `reports/`.
+
+Le sezioni seguenti descrivono i singoli script, se preferisci lanciarli a
+mano. Non serve più stare in una cartella precisa: i default puntano a
+`<repo>/reports/`, quindi fase 1 e fase 2 si trovano sempre.
 
 ### Fase 1 — elenca i file senza tag italiano
 
@@ -103,7 +121,7 @@ cp .env.example .env
 ./scan/find-missing-italian-audio.sh
 ```
 
-Output: `./missing-italian-audio.csv` con colonne
+Output: `reports/missing-italian-audio.csv` con colonne
 `App,Title,Year,Episode,AudioLanguages,Path`. Se non ci sono risultati, il file
 non viene lasciato sul disco.
 
@@ -132,8 +150,8 @@ Radarr non ha cache: `/api/v3/movie` restituisce già tutto in una richiesta.
 ./verify/verify-audio-language.sh
 ```
 
-Default: legge `./missing-italian-audio.csv`, scrive
-`./verified-language-results.csv` con colonne
+Default: legge `reports/missing-italian-audio.csv`, scrive
+`reports/verified-language-results.csv` con colonne
 `App,Title,Year,Episode,DeclaredAudioLanguages,DetectedLanguage,Confidence,Verdict,Path`.
 
 Se manca una dipendenza lo script stampa il comando di installazione esatto ed
@@ -168,8 +186,8 @@ titolo/percorso, colonne ordinabili, barra di riepilogo e pulsanti "copy path" /
 libreria standard, nessuna dipendenza aggiuntiva.
 
 ```bash
-./verify/report.py                       # legge ./verified-language-results.csv
-                                         # scrive ./verified-language-results.html
+./verify/report.py                       # legge reports/verified-language-results.csv
+                                         # scrive reports/verified-language-results.html
 ./verify/report.py results.csv -o out.html
 ```
 
@@ -318,16 +336,18 @@ So a two-phase approach:
 
 ```
 arr-language-audit/
+├── arr-language-audit.sh        interactive orchestrator (recommended entry point)
 ├── README.md
 ├── LICENSE                       MIT
 ├── .gitignore
 ├── .env.example                  phase 1 config template (copy to .env)
 ├── scan/
 │   └── find-missing-italian-audio.sh     phase 1 (bash + curl + jq)
-└── verify/
-    ├── verify-audio-language.sh          phase 2 launcher / pre-flight checks
-    ├── verify_audio_language.py          phase 2 worker (ffmpeg + faster-whisper)
-    └── report.py                         phase 2 CSV -> HTML report (+ optional viewer)
+├── verify/
+│   ├── verify-audio-language.sh          phase 2 launcher / pre-flight checks
+│   ├── verify_audio_language.py          phase 2 worker (ffmpeg + faster-whisper)
+│   └── report.py                         phase 2 CSV -> HTML report (+ optional viewer)
+└── reports/                     output (CSV, cache, HTML) — created on first run, git-ignored
 ```
 
 ## Requirements
@@ -357,7 +377,23 @@ right `pythonX.Y-venv` apt package to install.
 
 ## Quickstart
 
-Clone the repo and run both phases from the repo root.
+The easiest way is the interactive orchestrator: it drives both phases and
+the report from one menu, always passing explicit paths, so it does not
+matter which directory you run it from.
+
+```bash
+cd arr-language-audit
+./arr-language-audit.sh
+```
+
+Menu: *Configure (.env)* → *Scan library (phase 1)* → *Verify suspects
+(phase 2)* → *Build / Serve HTML report*, or *Run full pipeline*. It uses
+`whiptail` when available (ncurses dialogs) and falls back to a plain
+numbered prompt. All output lands in `reports/`.
+
+The sections below document each script for running them by hand. You no
+longer need to be in a specific directory: the defaults point at
+`<repo>/reports/`, so phase 1 and phase 2 always meet.
 
 ### Phase 1 — list files without an Italian tag
 
@@ -380,7 +416,7 @@ cp .env.example .env
 ./scan/find-missing-italian-audio.sh
 ```
 
-Output: `./missing-italian-audio.csv` with columns
+Output: `reports/missing-italian-audio.csv` with columns
 `App,Title,Year,Episode,AudioLanguages,Path`. If there are no findings the
 file is not left behind.
 
@@ -409,8 +445,8 @@ Radarr has no cache: `/api/v3/movie` already returns everything in one request.
 ./verify/verify-audio-language.sh
 ```
 
-Defaults: reads `./missing-italian-audio.csv`, writes
-`./verified-language-results.csv` with columns
+Defaults: reads `reports/missing-italian-audio.csv`, writes
+`reports/verified-language-results.csv` with columns
 `App,Title,Year,Episode,DeclaredAudioLanguages,DetectedLanguage,Confidence,Verdict,Path`.
 
 If a dependency is missing the script prints the exact install command and
@@ -445,8 +481,8 @@ search on title/path, sortable columns, a summary bar, and "copy path" /
 only, no extra dependencies.
 
 ```bash
-./verify/report.py                       # reads ./verified-language-results.csv
-                                         # writes ./verified-language-results.html
+./verify/report.py                       # reads reports/verified-language-results.csv
+                                         # writes reports/verified-language-results.html
 ./verify/report.py results.csv -o out.html
 ```
 

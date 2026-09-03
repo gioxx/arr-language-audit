@@ -16,7 +16,7 @@ Usage:
 
 Arguments:
     CSV                verified-language-results.csv from phase 2
-                       (default: ./verified-language-results.csv)
+                       (default: <repo>/reports/verified-language-results.csv)
 
 Options:
     -o, --output HTML  output HTML path
@@ -46,7 +46,12 @@ import secrets
 import socket
 import sys
 import threading
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+
+# Default location of the phase 2 CSV: <repo>/reports/ (this file is in
+# <repo>/verify/), so it does not matter which directory you run this from.
+DEFAULT_CSV = str(Path(__file__).resolve().parent.parent / "reports" / "verified-language-results.csv")
 
 # Columns we expect from verify_audio_language.py, in display order.
 COLUMNS = [
@@ -485,8 +490,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("csv", nargs="?", default="verified-language-results.csv",
-                        help="phase 2 CSV (default: ./verified-language-results.csv)")
+    parser.add_argument("csv", nargs="?", default=DEFAULT_CSV,
+                        help="phase 2 CSV (default: <repo>/reports/verified-language-results.csv)")
     parser.add_argument("-o", "--output", default=None,
                         help="output HTML path (default: CSV path with .html)")
     parser.add_argument("--serve", action="store_true",
@@ -502,6 +507,9 @@ def main() -> None:
     rows = read_rows(args.csv)
 
     out_path = args.output or (os.path.splitext(args.csv)[0] + ".html")
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     html_text = build_html(rows, args.csv)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html_text)
