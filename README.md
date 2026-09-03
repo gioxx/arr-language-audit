@@ -1,5 +1,268 @@
 # arr-language-audit
 
+🇮🇹 **Italiano** (questa sezione) · 🇬🇧 [**English version** ↓](#english)
+
+Un piccolo toolkit per trovare, nelle librerie **Radarr** / **Sonarr**, i file
+multimediali che **non** hanno una traccia audio in italiano, e poi *verificare*
+quelli sospetti ascoltando davvero l'audio con un modello vocale locale.
+
+Gira su Linux e macOS (bash + Python). Nessun file multimediale viene mai
+modificato: gli script producono solo report CSV. Correggere un tag, fare il
+remux o riscaricare resta una decisione manuale.
+
+> I controlli sono fissati sull'italiano perché è ciò che serve all'autore. La
+> logica è abbastanza semplice da adattare a un'altra lingua (vedi
+> [Adattare a un'altra lingua](#adattare-a-unaltra-lingua)).
+
+## Perché esiste
+
+Radarr e Sonarr espongono un campo `mediaInfo.audioLanguages` per ogni file. È
+comodo ma **non affidabile**:
+
+- può **mancare** (import vecchi, file mai ri-scansionati);
+- può essere **sbagliato** (release etichettata male, il tag del contenitore
+  dice `ita` ma l'audio reale è inglese, o viceversa);
+- riflette il **tag del contenitore**, non il parlato.
+
+Da qui un approccio in due fasi:
+
+1. **Fase 1 (veloce, solo API)** si fida del tag come primo filtro ed elenca
+   ogni file il cui tag non è esplicitamente italiano.
+2. **Fase 2 (lenta, analisi audio locale)** prende quell'elenco, estrae un breve
+   campione audio da ogni file ed esegue
+   [faster-whisper](https://github.com/SYSTRAN/faster-whisper) in locale (CPU,
+   nessun servizio esterno) per rilevare la lingua **realmente parlata**. Ogni
+   file riceve un verdetto:
+   - `MISTAGGED_IS_ITALIAN` — falso positivo; l'audio *è* italiano, era solo il
+     tag ad essere sbagliato. Correggi il tag, niente da scaricare.
+   - `CONFIRMED_NOT_ITALIAN` — problema reale; riscarica o fai il remux di una
+     traccia italiana.
+
+## Struttura del repository
+
+```
+arr-language-audit/
+├── README.md
+├── LICENSE                       MIT
+├── .gitignore
+├── .env.example                  template di configurazione fase 1 (copia in .env)
+├── scan/
+│   └── find-missing-italian-audio.sh     fase 1 (bash + curl + jq)
+└── verify/
+    ├── verify-audio-language.sh          fase 2: launcher / controlli pre-volo
+    ├── verify_audio_language.py          fase 2: worker (ffmpeg + faster-whisper)
+    └── report.py                         fase 2: da CSV a report HTML (+ viewer opzionale)
+```
+
+## Prerequisiti
+
+**Fase 1:** `bash`, `curl`, `jq` e accesso di rete alle API di Radarr/Sonarr.
+
+**Fase 2:** tutto quanto sopra, più:
+
+- `ffmpeg` / `ffprobe`
+- `python3` con `pip`
+- il pacchetto Python `faster-whisper` (lo installi tu — lo script non installa
+  mai nulla da solo; stampa i comandi esatti e si ferma)
+- **accesso diretto al filesystem dove risiedono i file media.** La fase 2 legge
+  i percorsi dei file dal CSV della fase 1 e apre quei file per campionarne
+  l'audio. Le sole API di Radarr/Sonarr **non bastano** per la fase 2: la
+  macchina che la esegue deve vedere gli stessi percorsi (stesso host, o la
+  libreria montata nella stessa posizione, ad es. via NFS/SMB).
+- spazio libero sufficiente nella directory temporanea per un breve campione WAV
+  alla volta (soglia di default: 500 MB).
+
+`faster-whisper` viene cercato prima nel `python3` di sistema, poi in un
+virtual environment locale in `verify/venv`. Su Debian/Ubuntu, dove il Python di
+sistema è "externally managed" (PEP 668), il launcher verifica anche che
+`python3 -m venv` funzioni davvero e, se manca `ensurepip`, ti indica il
+pacchetto apt `pythonX.Y-venv` corretto da installare.
+
+## Avvio rapido
+
+Clona il repo ed esegui entrambe le fasi dalla radice del repo.
+
+### Fase 1 — elenca i file senza tag italiano
+
+```bash
+cd arr-language-audit
+./scan/find-missing-italian-audio.sh
+```
+
+Al primo avvio interattivo senza configurazione, un wizard prova a rilevare
+automaticamente un Radarr locale (porta 7878) e un Sonarr locale (porta 8989)
+tramite l'endpoint non autenticato `/ping`, chiede solo la API key quando ne
+trova uno, e offre di salvare tutto in un file `.env` nella radice del repo. Se
+non rileva nulla, chiede l'URL completo.
+
+Preferisci configurarlo a mano:
+
+```bash
+cp .env.example .env
+# modifica .env: imposta RADARR_URL / RADARR_API_KEY / SONARR_URL / SONARR_API_KEY
+./scan/find-missing-italian-audio.sh
+```
+
+Output: `./missing-italian-audio.csv` con colonne
+`App,Title,Year,Episode,AudioLanguages,Path`. Se non ci sono risultati, il file
+non viene lasciato sul disco.
+
+Tag non aggiornati? Forza prima Radarr/Sonarr a rileggere ogni file dal disco:
+
+```bash
+FORCE_RESCAN=true ./scan/find-missing-italian-audio.sh
+```
+
+### Fase 2 — verifica cosa viene davvero parlato
+
+```bash
+./verify/verify-audio-language.sh
+```
+
+Default: legge `./missing-italian-audio.csv`, scrive
+`./verified-language-results.csv` con colonne
+`App,Title,Year,Episode,DeclaredAudioLanguages,DetectedLanguage,Confidence,Verdict,Path`.
+
+Se manca una dipendenza lo script stampa il comando di installazione esatto ed
+esce senza cambiare nulla. Un tipico primo setup su Debian/Ubuntu:
+
+```bash
+sudo apt install -y ffmpeg python3-venv
+python3 -m venv verify/venv
+"verify/venv/bin/pip" install --upgrade pip
+"verify/venv/bin/pip" install faster-whisper
+./verify/verify-audio-language.sh          # rileva e usa verify/venv automaticamente
+```
+
+L'esecuzione è riprendibile: interrompila quando vuoi e rilanciala — i file già
+presenti nel CSV di output vengono saltati (match sul percorso). Per riprovare
+solo quelli falliti, usa `RETRY_ERRORS=true`. Per buttare via l'output e
+ripartire da zero, usa `NO_RESUME=true`.
+
+Percorsi personalizzati:
+
+```bash
+./verify/verify-audio-language.sh /percorso/input.csv /percorso/output.csv
+```
+
+### Report della fase 2 (HTML)
+
+Il CSV è l'output canonico. `verify/report.py` lo trasforma in un singolo file
+HTML autonomo (CSS + JS inline, nessuna risorsa esterna, funziona offline) più
+facile da navigare: chip di filtro per verdetto, ricerca testuale su
+titolo/percorso, colonne ordinabili, barra di riepilogo e pulsanti "copy path" /
+"copy visible paths" per costruire una lista di file da riscaricare. Solo
+libreria standard, nessuna dipendenza aggiuntiva.
+
+```bash
+./verify/report.py                       # legge ./verified-language-results.csv
+                                         # scrive ./verified-language-results.html
+./verify/report.py results.csv -o out.html
+```
+
+Per consultarlo da un'altra macchina, aggiungi `--serve`: avvia un piccolo
+webserver, stampa l'URL e resta in attesa — premi **Invio** per fermarlo. Dopo
+non resta nulla in esecuzione (il file `.html` resta, come il CSV).
+
+```bash
+./verify/report.py --serve               # bind su 0.0.0.0, porta libera
+./verify/report.py --serve --port 8080
+```
+
+L'URL servito contiene un token di accesso casuale (`?k=...`); le richieste
+senza token valido ricevono `403`. Poiché il report contiene percorsi completi
+del filesystem, tratta l'URL come sensibile: su una rete non fidata preferisci un
+tunnel SSH con `--host 127.0.0.1`, oppure disattiva del tutto il controllo del
+token con `--no-token` se sai che la porta è al sicuro.
+
+| Opzione        | Default          | Significato |
+|----------------|------------------|-------------|
+| `-o, --output` | percorso CSV `.html` | Percorso dell'HTML di output |
+| `--serve`      | off              | Serve l'HTML e attende l'Invio |
+| `--host`       | `0.0.0.0`        | Indirizzo di bind quando serve |
+| `--port`       | `0` (porta libera) | Porta di bind quando serve |
+| `--no-token`   | off              | Serve senza il controllo del token `?k=` |
+
+## Configurazione
+
+### Variabili d'ambiente — fase 1
+
+Lette dall'ambiente, oppure da un file `.env` cercato (in ordine) in `scan/`,
+nella radice del repo, poi nella directory corrente — vince la prima occorrenza.
+
+| Variabile        | Default                  | Significato |
+|------------------|--------------------------|-------------|
+| `RADARR_URL`     | `http://localhost:7878`  | URL base di Radarr |
+| `RADARR_API_KEY` | —                        | API key di Radarr |
+| `SONARR_URL`     | `http://localhost:8989`  | URL base di Sonarr |
+| `SONARR_API_KEY` | —                        | API key di Sonarr |
+| `SKIP_RADARR`    | `false`                  | `true` per saltare del tutto Radarr |
+| `SKIP_SONARR`    | `false`                  | `true` per saltare del tutto Sonarr |
+| `FORCE_RESCAN`   | `false`                  | `true` per eseguire `RescanMovie` / `RescanSeries` prima di leggere `mediaInfo` |
+| `RESCAN_TIMEOUT` | `300`                    | Secondi di attesa per il completamento del comando di rescan |
+
+Il primo argomento posizionale sovrascrive il percorso del CSV di output:
+`./scan/find-missing-italian-audio.sh /tmp/report.csv`.
+
+### Variabili d'ambiente — fase 2
+
+| Variabile           | Default   | Significato |
+|---------------------|-----------|-------------|
+| `WHISPER_MODEL`     | `small`   | `tiny` \| `base` \| `small` \| `medium` — più grande = più accurato e più lento |
+| `SAMPLE_SECONDS`    | `60`      | Lunghezza del campione audio analizzato per file |
+| `SAMPLE_OFFSET_PCT` | `25`      | Da dove iniziare il campionamento, in percentuale sulla durata totale (salta le intro) |
+| `MIN_FREE_SPACE_MB` | `500`     | Spazio libero minimo richiesto nella directory temporanea |
+| `TEMP_DIR`          | `mktemp`  | Directory per i campioni WAV temporanei |
+| `LIMIT`             | —         | Processa solo i primi N nuovi file (utile per un test) |
+| `RETRY_ERRORS`      | `false`   | `true` per riprocessare anche le righe il cui verdetto precedente era un errore |
+| `NO_RESUME`         | `false`   | `true` per ignorare un CSV di output esistente e ripartire da zero |
+
+Entrambi gli script accettano anche `-h` / `--help`.
+
+## Verdetti di output (fase 2)
+
+| Verdetto                | Significato | Azione suggerita |
+|-------------------------|-------------|------------------|
+| `MISTAGGED_IS_ITALIAN`  | L'audio è italiano; il tag era sbagliato | Correggi il tag / mediaInfo, rescan |
+| `CONFIRMED_NOT_ITALIAN` | L'audio davvero non è italiano | Riscarica o fai il remux di una traccia italiana |
+| `FILE_NOT_FOUND`        | Il percorso dal CSV della fase 1 non è visibile su questa macchina | Monta la libreria, o esegui la fase 2 dove risiedono i file |
+| `EXTRACTION_FAILED`     | `ffmpeg` non è riuscito a produrre un campione | Ispeziona il file manualmente |
+| `DETECTION_FAILED`      | `faster-whisper` ha sollevato un errore sul campione | Riprova con `RETRY_ERRORS=true`, o con un modello più grande |
+
+`DetectedLanguage` è un codice ISO (`it`, `en`, `de`, …); `Confidence` è la
+probabilità di rilevamento lingua del modello (`0.00`–`1.00`).
+
+## Note e limiti
+
+- Il rilevamento lingua gira su un singolo campione di ~60 s. Film che si aprono
+  con un lungo tratto senza dialoghi, o che mescolano lingue, possono comunque
+  ingannarlo — regola `SAMPLE_SECONDS` / `SAMPLE_OFFSET_PCT`, o alza
+  `WHISPER_MODEL`.
+- Viene analizzata solo la **prima traccia audio / quella di default** nel
+  campione. Un file con traccia di default inglese più una traccia italiana
+  secondaria verrà segnalato come `CONFIRMED_NOT_ITALIAN` — cosa che, per
+  "l'audio di default non è italiano", è probabilmente corretta, ma è bene
+  saperlo.
+- Tutto è locale: nessun audio e nessun metadato lascia la tua macchina.
+
+## Adattare a un'altra lingua
+
+- **Fase 1:** modifica `ITALIAN_REGEX` in `scan/find-missing-italian-audio.sh`.
+- **Fase 2:** modifica `is_italian()` in `verify/verify_audio_language.py` e le
+  stringhe dei verdetti.
+
+## Licenza
+
+[MIT](LICENSE) © 2026 Giovanni Solone
+
+---
+
+<a id="english"></a>
+
+# arr-language-audit (English)
+
+🇬🇧 **English** (this section) · 🇮🇹 [**Versione italiana** ↑](#arr-language-audit)
+
 A small toolkit to find media files in your **Radarr** / **Sonarr** libraries
 that do **not** have an Italian audio track, and then to *verify* the
 suspicious ones by actually listening to the audio with a local speech model.
@@ -48,7 +311,8 @@ arr-language-audit/
 │   └── find-missing-italian-audio.sh     phase 1 (bash + curl + jq)
 └── verify/
     ├── verify-audio-language.sh          phase 2 launcher / pre-flight checks
-    └── verify_audio_language.py          phase 2 worker (ffmpeg + faster-whisper)
+    ├── verify_audio_language.py          phase 2 worker (ffmpeg + faster-whisper)
+    └── report.py                         phase 2 CSV -> HTML report (+ optional viewer)
 ```
 
 ## Requirements
@@ -142,6 +406,44 @@ Custom paths:
 ```bash
 ./verify/verify-audio-language.sh /path/to/input.csv /path/to/output.csv
 ```
+
+### Phase 2 report (HTML)
+
+The CSV is the canonical output. `verify/report.py` turns it into a single
+self-contained HTML file (inline CSS + JS, no external resources, works
+offline) that is easier to browse: filter chips per verdict, free-text
+search on title/path, sortable columns, a summary bar, and "copy path" /
+"copy visible paths" buttons to build a redownload list. Standard library
+only, no extra dependencies.
+
+```bash
+./verify/report.py                       # reads ./verified-language-results.csv
+                                         # writes ./verified-language-results.html
+./verify/report.py results.csv -o out.html
+```
+
+To consult it from another machine, add `--serve`: it starts a small
+webserver, prints the URL, and waits — press **Enter** to stop it. Nothing
+stays running afterwards (the `.html` file itself is kept, like the CSV).
+
+```bash
+./verify/report.py --serve               # binds 0.0.0.0 on a free port
+./verify/report.py --serve --port 8080
+```
+
+The served URL carries a random access token (`?k=...`); requests without a
+valid token get `403`. Since the report contains full filesystem paths,
+treat the URL as sensitive — on an untrusted network prefer an SSH tunnel
+and `--host 127.0.0.1`, or drop the token check entirely with `--no-token`
+if you know the port is safe.
+
+| Option        | Default        | Meaning |
+|---------------|----------------|---------|
+| `-o, --output`| CSV path `.html` | Output HTML path |
+| `--serve`     | off            | Serve the HTML and wait for Enter |
+| `--host`      | `0.0.0.0`      | Bind address when serving |
+| `--port`      | `0` (free port)| Bind port when serving |
+| `--no-token`  | off            | Serve without the `?k=` access check |
 
 ## Configuration
 
