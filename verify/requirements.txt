@@ -1,0 +1,6 @@
+# Phase 2 Python dependency.
+#
+# You install this yourself into verify/venv (see README); the scripts
+# never install anything automatically. It is pinned here so Dependabot
+# can open PRs when a new release is available.
+faster-whisper==1.2.1
