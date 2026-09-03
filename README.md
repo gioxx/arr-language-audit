@@ -91,10 +91,13 @@ cd arr-language-audit
 ./arr-language-audit.sh
 ```
 
-Menu: *Configure (.env)* → *Scan library (phase 1)* → *Verify suspects
-(phase 2)* → *Build / Serve HTML report*, oppure *Run full pipeline*. Usa
-`whiptail` se disponibile (dialoghi ncurses), altrimenti un menu numerato.
-Tutti gli output finiscono in `reports/`.
+All'avvio fa un pre-check: carica `.env`, verifica le dipendenze e interroga
+Radarr/Sonarr (`/api/v3/system/status`), così l'intestazione mostra cosa è
+connesso, quale versione e — in *Connection details* — le root folder con
+accessibilità e spazio libero. Menu: *Scan (fase 1)* → *Verify (fase 2)* →
+*Build / Serve HTML report* → *Run full pipeline*, con *Reconfigure (.env)* e
+*About* in fondo. Usa `whiptail` se disponibile (dialoghi ncurses), altrimenti
+un menu numerato. Tutti gli output finiscono in `reports/`.
 
 Le sezioni seguenti descrivono i singoli script, se preferisci lanciarli a
 mano. Non serve più stare in una cartella precisa: i default puntano a
@@ -386,10 +389,14 @@ cd arr-language-audit
 ./arr-language-audit.sh
 ```
 
-Menu: *Configure (.env)* → *Scan library (phase 1)* → *Verify suspects
-(phase 2)* → *Build / Serve HTML report*, or *Run full pipeline*. It uses
-`whiptail` when available (ncurses dialogs) and falls back to a plain
-numbered prompt. All output lands in `reports/`.
+On launch it runs a pre-flight: it loads `.env`, checks the tools each phase
+needs, and queries Radarr/Sonarr (`/api/v3/system/status`) so the header shows
+what is connected, which version, and — under *Connection details* — the root
+folders with their accessibility and free space. Menu: *Scan (phase 1)* →
+*Verify (phase 2)* → *Build / Serve HTML report* → *Run full pipeline*, with
+*Reconfigure (.env)* and *About* at the bottom. It uses `whiptail` when
+available (ncurses dialogs) and falls back to a plain numbered prompt. All
+output lands in `reports/`.
 
 The sections below document each script for running them by hand. You no
 longer need to be in a specific directory: the defaults point at

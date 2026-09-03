@@ -8,12 +8,14 @@
 #   phase 2  verify/verify-audio-language.sh      (ffmpeg + faster-whisper -> CSV)
 #   report   verify/report.py                     (CSV -> HTML, optional viewer)
 #
-# It always passes explicit paths under <repo>/reports/, so it does not
-# matter which directory you launch it from, and the phases always agree on
-# where the files are.
+# On launch it runs a pre-flight: loads .env, checks the tools each phase
+# needs, and actually queries Radarr/Sonarr (/api/v3/system/status) so the
+# menu can show what is connected, which version, and where the libraries
+# live. It always passes explicit paths under <repo>/reports/, so it does
+# not matter which directory you launch it from.
 #
-# The menu uses whiptail if it is installed (nicer, ncurses dialogs) and
-# falls back to a plain numbered prompt otherwise. Nothing is installed
+# The menu uses whiptail if it is installed (ncurses dialogs) and falls
+# back to a plain numbered prompt otherwise. Nothing is installed
 # automatically.
 #
 # Usage:
@@ -24,7 +26,7 @@
 
 # No 'errexit' here on purpose: this is an interactive loop where a menu
 # choice or a "no" answer routinely yields a non-zero status that must not
-# abort the session. Errors from the real work are handled explicitly below.
+# abort the session. Errors from the real work are handled explicitly.
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
@@ -41,6 +43,13 @@ ENV_FILE="$ROOT/.env"
 
 mkdir -p "$REPORTS_DIR"
 
+# Project identity, shown in the menu header / whiptail backtitle / About.
+PROJECT_NAME="arr-language-audit"
+PROJECT_URL="https://github.com/gioxx/arr-language-audit"
+PROJECT_VERSION="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || true)"
+[[ -z "$PROJECT_VERSION" ]] && PROJECT_VERSION="(version unknown)"
+PROJECT_BANNER="$PROJECT_NAME  $PROJECT_VERSION  -  $PROJECT_URL"
+
 log() { echo "$@" >&2; }
 err() { echo "ERROR: $*" >&2; }
 
@@ -54,19 +63,22 @@ esac
 HAVE_WHIPTAIL=false
 command -v whiptail >/dev/null 2>&1 && HAVE_WHIPTAIL=true
 
+# Common whiptail prefix: project banner on top, dialog title in the frame.
+WT=(whiptail --backtitle "$PROJECT_BANNER" --title "$PROJECT_NAME")
+
 # ---------------------------------------------------------------------------
-# Small ask_* helpers: whiptail when available, plain read otherwise. Each
-# echoes its result on stdout (ask_input / ask_menu) or returns 0/1
-# (ask_yesno), so the action functions below stay readable.
+# ask_* helpers: whiptail when available, plain read otherwise. Each echoes
+# its result (ask_input / ask_menu) or returns 0/1 (ask_yesno), so the
+# action functions stay readable.
 # ---------------------------------------------------------------------------
 
 ask_yesno() {
-    # ask_yesno "question" [default:yes|no]
+    # ask_yesno "question" [yes|no]   (default answer when the user just hits Enter)
     local q="$1" def="${2:-no}"
     if [[ "$HAVE_WHIPTAIL" == "true" ]]; then
         local flag=(--defaultno)
         [[ "$def" == "yes" ]] && flag=()
-        whiptail --title "arr-language-audit" --yesno "$q" "${flag[@]}" 10 70
+        "${WT[@]}" --yesno "$q" "${flag[@]}" 12 74
         return $?
     fi
     local hint="[y/N]"
@@ -78,10 +90,10 @@ ask_yesno() {
 }
 
 ask_input() {
-    # ask_input "prompt" "default" -> echoes the entered value (may be empty)
+    # ask_input "prompt" "default"  -> echoes entered value (may be empty)
     local prompt="$1" def="${2:-}"
     if [[ "$HAVE_WHIPTAIL" == "true" ]]; then
-        whiptail --title "arr-language-audit" --inputbox "$prompt" 10 70 "$def" 3>&1 1>&2 2>&3
+        "${WT[@]}" --inputbox "$prompt" 12 74 "$def" 3>&1 1>&2 2>&3
         return
     fi
     local a
@@ -94,20 +106,32 @@ ask_menu() {
     local title="$1"; shift
     if [[ "$HAVE_WHIPTAIL" == "true" ]]; then
         local count=$(( $# / 2 ))
-        whiptail --title "arr-language-audit" --menu "$title" 20 74 "$count" "$@" 3>&1 1>&2 2>&3
+        "${WT[@]}" --menu "$title" 24 78 "$count" "$@" 3>&1 1>&2 2>&3
         return
     fi
+    echo "" >&2
     echo "$title" >&2
-    local i=1 tag desc
-    local tags=()
+    echo "" >&2
     while (( $# )); do
-        tag="$1"; desc="$2"; shift 2
-        tags+=("$tag")
-        printf '  %s) %s\n' "$tag" "$desc" >&2
+        printf '  %s) %s\n' "$1" "$2" >&2
+        shift 2
     done
     local a
     read -r -p "Select: " a
     echo "$a"
+}
+
+info_box() {
+    # Show a block of text; whiptail msgbox or plain print + pause.
+    local text="$1"
+    if [[ "$HAVE_WHIPTAIL" == "true" ]]; then
+        "${WT[@]}" --scrolltext --msgbox "$text" 24 78
+    else
+        echo "" >&2
+        echo "$text" >&2
+        echo "" >&2
+        read -r -p "Press Enter to continue... " _ || true
+    fi
 }
 
 pause() {
@@ -116,11 +140,110 @@ pause() {
 }
 
 # ---------------------------------------------------------------------------
-# Status helpers
+# Pre-flight: environment + connectivity
+# ---------------------------------------------------------------------------
+
+# Filled in by run_preflight(). *_LINE is a human-readable status string;
+# *_OK is true only when the app answered an authenticated request.
+RADARR_LINE="" ; RADARR_OK=false
+SONARR_LINE="" ; SONARR_OK=false
+ENV_READY=false
+TOOLS_LINE=""
+
+# Query one app's /api/v3/system/status. Echoes "OK  vX  [instance]  url"
+# on success (return 0), or a short reason otherwise (return 1).
+probe_app() {
+    local url="$1" key="$2"
+    if [[ -z "$url" || -z "$key" || "$key" == YOUR_* ]]; then
+        echo "not configured"; return 1
+    fi
+    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        echo "unknown (need curl + jq to probe)"; return 1
+    fi
+    local body="" attempt
+    for attempt in 1 2 3; do
+        body=$(curl -sf -m 5 -H "X-Api-Key: $key" "$url/api/v3/system/status" 2>/dev/null) && break
+        body=""
+        sleep 1
+    done
+    if [[ -z "$body" ]]; then
+        echo "UNREACHABLE ($url) -- check URL / API key / that it is running"
+        return 1
+    fi
+    local ver inst
+    ver=$(jq -r '.version // "?"' <<< "$body" | tr -d '\r')
+    inst=$(jq -r '.instanceName // .appName // "?"' <<< "$body" | tr -d '\r')
+    echo "OK   v$ver   [$inst]   $url"
+    return 0
+}
+
+# List an app's root folders (path + accessibility + free space). Best effort.
+app_rootfolders() {
+    local url="$1" key="$2"
+    command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 0
+    curl -sf -m 5 -H "X-Api-Key: $key" "$url/api/v3/rootfolder" 2>/dev/null \
+        | jq -r '.[] | "    \(.path)  (accessible: \(.accessible // "?"), free: \(((.freeSpace // 0) / 1073741824) | floor) GiB)"' 2>/dev/null \
+        | tr -d '\r'
+}
+
+# Count active health warnings. Echoes a number or "?".
+app_health_count() {
+    local url="$1" key="$2"
+    command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || { echo "?"; return; }
+    curl -sf -m 5 -H "X-Api-Key: $key" "$url/api/v3/health" 2>/dev/null \
+        | jq -r 'length' 2>/dev/null | tr -d '\r' || echo "?"
+}
+
+run_preflight() {
+    # Load .env the same way the scan script does.
+    if [[ -f "$ENV_FILE" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        . "$ENV_FILE"
+        set +a
+    fi
+    RADARR_URL="${RADARR_URL:-}"       ; RADARR_API_KEY="${RADARR_API_KEY:-}"
+    SONARR_URL="${SONARR_URL:-}"       ; SONARR_API_KEY="${SONARR_API_KEY:-}"
+    SKIP_RADARR="${SKIP_RADARR:-false}"; SKIP_SONARR="${SKIP_SONARR:-false}"
+
+    # Tool readiness.
+    local need_scan=() need_verify=()
+    command -v curl    >/dev/null 2>&1 || need_scan+=(curl)
+    command -v jq      >/dev/null 2>&1 || need_scan+=(jq)
+    command -v python3 >/dev/null 2>&1 || need_verify+=(python3)
+    command -v ffmpeg  >/dev/null 2>&1 || need_verify+=(ffmpeg)
+    command -v ffprobe >/dev/null 2>&1 || need_verify+=(ffprobe)
+    local t="tools: "
+    if (( ${#need_scan[@]} == 0 )); then t+="phase 1 ready"; else t+="phase 1 MISSING ${need_scan[*]}"; fi
+    if (( ${#need_verify[@]} == 0 )); then t+="  |  phase 2 ready"; else t+="  |  phase 2 missing ${need_verify[*]}"; fi
+    [[ "$HAVE_WHIPTAIL" == "true" ]] && t+="  |  whiptail" || t+="  |  plain menu"
+    TOOLS_LINE="$t"
+
+    # Radarr.
+    RADARR_OK=false
+    if [[ "$SKIP_RADARR" == "true" ]]; then
+        RADARR_LINE="skipped (SKIP_RADARR=true)"
+    else
+        RADARR_LINE=$(probe_app "$RADARR_URL" "$RADARR_API_KEY") && RADARR_OK=true
+    fi
+
+    # Sonarr.
+    SONARR_OK=false
+    if [[ "$SKIP_SONARR" == "true" ]]; then
+        SONARR_LINE="skipped (SKIP_SONARR=true)"
+    else
+        SONARR_LINE=$(probe_app "$SONARR_URL" "$SONARR_API_KEY") && SONARR_OK=true
+    fi
+
+    ENV_READY=false
+    { [[ "$RADARR_OK" == "true" ]] || [[ "$SONARR_OK" == "true" ]]; } && ENV_READY=true
+}
+
+# ---------------------------------------------------------------------------
+# Status helpers for the menu header
 # ---------------------------------------------------------------------------
 
 csv_row_count() {
-    # data rows (excludes the header); "-" if the file is missing
     local f="$1"
     [[ -f "$f" ]] || { echo "-"; return; }
     local n
@@ -130,64 +253,59 @@ csv_row_count() {
 }
 
 verdict_summary() {
-    # "12 mistagged / 30 confirmed / 3 errors" from the verified CSV
     [[ -f "$VERIFIED_CSV" ]] || { echo "not run yet"; return; }
     local mis conf errs
-    mis=$(grep -c ',MISTAGGED_IS_ITALIAN,' "$VERIFIED_CSV" || true)
-    conf=$(grep -c ',CONFIRMED_NOT_ITALIAN,' "$VERIFIED_CSV" || true)
-    errs=$(grep -Ec ',(FILE_NOT_FOUND|EXTRACTION_FAILED|DETECTION_FAILED),' "$VERIFIED_CSV" || true)
+    mis=$(grep -c ',MISTAGGED_IS_ITALIAN,' "$VERIFIED_CSV" 2>/dev/null || true)
+    conf=$(grep -c ',CONFIRMED_NOT_ITALIAN,' "$VERIFIED_CSV" 2>/dev/null || true)
+    errs=$(grep -Ec ',(FILE_NOT_FOUND|EXTRACTION_FAILED|DETECTION_FAILED),' "$VERIFIED_CSV" 2>/dev/null || true)
     echo "${mis:-0} mistagged / ${conf:-0} confirmed not Italian / ${errs:-0} errors"
 }
 
 status_text() {
-    local cfg="missing"
-    [[ -f "$ENV_FILE" ]] && cfg="present"
-    printf 'Config .env: %s\nPhase 1 CSV: %s rows\nPhase 2:     %s\nHTML report: %s\n\nChoose an action:' \
-        "$cfg" \
+    # whiptail shows PROJECT_BANNER as its backtitle already; repeat it here
+    # so the plain-text menu carries the same identity line.
+    [[ "$HAVE_WHIPTAIL" == "true" ]] || printf '%s\n\n' "$PROJECT_BANNER"
+    printf 'Radarr : %s\nSonarr : %s\n%s\n\nPhase 1 CSV : %s rows\nPhase 2     : %s\nHTML report : %s\n' \
+        "$RADARR_LINE" \
+        "$SONARR_LINE" \
+        "$TOOLS_LINE" \
         "$(csv_row_count "$CSV")" \
         "$(verdict_summary)" \
-        "$([[ -f "$HTML" ]] && echo "$HTML" || echo "not built")"
+        "$([[ -f "$HTML" ]] && echo "built ($HTML)" || echo "not built")"
+    if [[ "$ENV_READY" != "true" ]]; then
+        printf '\n>> No Radarr/Sonarr reachable. Use "Reconfigure (.env)" first.\n'
+    fi
+    printf '\nChoose an action:'
 }
 
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
 
-action_configure() {
-    if [[ ! -f "$ENV_FILE" ]]; then
-        cp "$ROOT/.env.example" "$ENV_FILE"
-        chmod 600 "$ENV_FILE"
-        log "Created $ENV_FILE from .env.example."
-    fi
-    local editor="${EDITOR:-${VISUAL:-nano}}"
-    if command -v "$editor" >/dev/null 2>&1; then
-        "$editor" "$ENV_FILE"
-    else
-        log "No editor found (set \$EDITOR). Edit this file by hand:"
-        log "  $ENV_FILE"
-    fi
-    log "Tip: leaving RADARR_*/SONARR_* blank makes phase 1 run its"
-    log "auto-detect wizard on the next scan."
-    pause
-}
-
 action_scan() {
-    local refresh=false force=false
+    if [[ "$ENV_READY" != "true" ]]; then
+        ask_yesno "No Radarr/Sonarr reachable right now. Run the scan anyway?" no || return
+    fi
+
+    local force=false refresh=false
     ask_yesno "Force Radarr/Sonarr to rescan files on disk first (FORCE_RESCAN)? Slower." no && force=true
     ask_yesno "Ignore the Sonarr per-series cache and re-fetch every series (--refresh)?" no && refresh=true
 
-    log ""
-    log "Running phase 1 (scan)..."
     local args=("$CSV")
     [[ "$refresh" == "true" ]] && args+=(--refresh)
+
+    log ""
+    log "Running phase 1 (scan)..."
     FORCE_RESCAN="$force" "$SCAN_SH" "${args[@]}" || err "phase 1 exited with an error."
     pause
 }
 
 action_verify() {
     if [[ ! -f "$CSV" ]]; then
-        err "No phase 1 CSV at $CSV. Run 'Scan library' first."
-        pause
+        info_box "No phase 1 CSV yet at:
+  $CSV
+
+Run 'Scan library (phase 1)' first."
         return
     fi
 
@@ -197,29 +315,29 @@ action_verify() {
         tiny   "fastest, least accurate" \
         base   "fast" \
         medium "most accurate, slowest")
-    [[ -z "$model" ]] && model=small
+    [[ -z "$model" ]] && return   # cancelled
 
     local limit
     limit=$(ask_input "Process only the first N files (blank = all, for a quick test):" "")
 
     local retry=false
     if [[ -f "$VERIFIED_CSV" ]]; then
-        ask_yesno "Output already exists. Also retry rows that previously errored (RETRY_ERRORS)?" no && retry=true
+        ask_yesno "Output exists. Also retry rows that previously errored (RETRY_ERRORS)?" no && retry=true
     fi
 
     log ""
     log "Running phase 2 (verify) with model '$model'..."
-    WHISPER_MODEL="$model" \
-    LIMIT="${limit}" \
-    RETRY_ERRORS="$retry" \
+    WHISPER_MODEL="$model" LIMIT="$limit" RETRY_ERRORS="$retry" \
         "$VERIFY_SH" "$CSV" "$VERIFIED_CSV" || err "phase 2 exited with an error."
     pause
 }
 
 action_report() {
     if [[ ! -f "$VERIFIED_CSV" ]]; then
-        err "No phase 2 CSV at $VERIFIED_CSV. Run 'Verify suspects' first."
-        pause
+        info_box "No phase 2 CSV yet at:
+  $VERIFIED_CSV
+
+Run 'Verify suspects (phase 2)' first."
         return
     fi
     command -v python3 >/dev/null 2>&1 || { err "python3 not found."; pause; return; }
@@ -230,33 +348,98 @@ action_report() {
 
 action_serve() {
     if [[ ! -f "$VERIFIED_CSV" ]]; then
-        err "No phase 2 CSV at $VERIFIED_CSV. Run 'Verify suspects' first."
-        pause
+        info_box "No phase 2 CSV yet at:
+  $VERIFIED_CSV
+
+Run 'Verify suspects (phase 2)' first."
         return
     fi
     command -v python3 >/dev/null 2>&1 || { err "python3 not found."; pause; return; }
 
     local port
     port=$(ask_input "Port to serve on (blank = pick a free one):" "")
-
     local extra=()
     [[ -n "$port" ]] && extra=(--port "$port")
 
     log ""
     log "Starting the report webserver. Press Enter in this terminal to stop it."
-    # report.py builds the HTML, serves it, and blocks until Enter.
     python3 "$REPORT_PY" "$VERIFIED_CSV" --serve "${extra[@]}" || err "the report server exited with an error."
     pause
 }
 
 action_pipeline() {
-    log "Full pipeline: scan -> verify -> HTML report."
-    ask_yesno "Continue?" yes || return
+    ask_yesno "Full pipeline: scan -> verify -> HTML report. Continue?" yes || return
     action_scan
-    [[ -f "$CSV" ]] || { err "phase 1 produced no CSV; stopping."; return; }
+    [[ -f "$CSV" ]] || { info_box "Phase 1 produced no CSV; stopping the pipeline."; return; }
     action_verify
-    [[ -f "$VERIFIED_CSV" ]] || { err "phase 2 produced no CSV; stopping."; return; }
+    [[ -f "$VERIFIED_CSV" ]] || { info_box "Phase 2 produced no CSV; stopping the pipeline."; return; }
     action_report
+}
+
+action_connection_details() {
+    local out="Connection details"
+    out+=$'\n'"=================="$'\n\n'
+
+    out+="Radarr: $RADARR_LINE"$'\n'
+    if [[ "$RADARR_OK" == "true" ]]; then
+        out+="  health warnings: $(app_health_count "$RADARR_URL" "$RADARR_API_KEY")"$'\n'
+        out+="  root folders:"$'\n'
+        out+="$(app_rootfolders "$RADARR_URL" "$RADARR_API_KEY")"$'\n'
+    fi
+    out+=$'\n'
+
+    out+="Sonarr: $SONARR_LINE"$'\n'
+    if [[ "$SONARR_OK" == "true" ]]; then
+        out+="  health warnings: $(app_health_count "$SONARR_URL" "$SONARR_API_KEY")"$'\n'
+        out+="  root folders:"$'\n'
+        out+="$(app_rootfolders "$SONARR_URL" "$SONARR_API_KEY")"$'\n'
+    fi
+    out+=$'\n'"$TOOLS_LINE"$'\n'
+    out+=$'\n'"Reminder: phase 2 needs to SEE the root-folder paths above on"$'\n'
+    out+="this machine (same host, or the same mounts)."
+
+    info_box "$out"
+}
+
+action_about() {
+    info_box "$PROJECT_NAME
+$PROJECT_VERSION
+
+Find media files in Radarr/Sonarr libraries that have no Italian audio,
+then verify the real spoken language locally with faster-whisper. The
+scripts only produce CSV/HTML reports; no media file is ever modified.
+
+Project page : $PROJECT_URL
+License       : MIT
+Update        : run 'git pull' in $ROOT
+
+Two phases, all driven from this menu:
+  1  scan/find-missing-italian-audio.sh   Radarr/Sonarr API  -> reports/missing-italian-audio.csv
+  2  verify/verify-audio-language.sh      ffmpeg + whisper   -> reports/verified-language-results.csv
+     verify/report.py                     CSV -> HTML report (+ optional viewer)
+
+Each script also runs on its own; see its --help."
+}
+
+action_configure() {
+    if [[ ! -f "$ENV_FILE" ]]; then
+        cp "$ROOT/.env.example" "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+        log "Created $ENV_FILE from .env.example."
+    fi
+    local editor="${EDITOR:-${VISUAL:-}}"
+    if [[ -z "$editor" ]]; then
+        for e in nano vim vi; do command -v "$e" >/dev/null 2>&1 && { editor="$e"; break; }; done
+    fi
+    if [[ -n "$editor" ]] && command -v "$editor" >/dev/null 2>&1; then
+        "$editor" "$ENV_FILE"
+    else
+        info_box "No editor found (set \$EDITOR). Edit this file by hand:
+  $ENV_FILE"
+    fi
+    log "Re-checking Radarr/Sonarr..."
+    run_preflight
+    pause
 }
 
 # ---------------------------------------------------------------------------
@@ -264,24 +447,30 @@ action_pipeline() {
 # ---------------------------------------------------------------------------
 
 main() {
+    run_preflight
+
     while true; do
         local choice
         choice=$(ask_menu "$(status_text)" \
-            1 "Configure (.env)" \
-            2 "Scan library (phase 1)" \
-            3 "Verify suspects (phase 2)" \
-            4 "Build HTML report" \
-            5 "Serve HTML report" \
-            6 "Run full pipeline" \
+            1 "Scan library (phase 1)" \
+            2 "Verify suspects (phase 2)" \
+            3 "Build HTML report" \
+            4 "Serve HTML report" \
+            5 "Run full pipeline" \
+            6 "Connection details" \
+            7 "Reconfigure (.env) + re-check" \
+            8 "About / project page" \
             0 "Quit") || break   # whiptail Cancel / Esc
 
         case "${choice:-}" in
-            1) action_configure ;;
-            2) action_scan ;;
-            3) action_verify ;;
-            4) action_report ;;
-            5) action_serve ;;
-            6) action_pipeline ;;
+            1) action_scan ;;
+            2) action_verify ;;
+            3) action_report ;;
+            4) action_serve ;;
+            5) action_pipeline ;;
+            6) action_connection_details ;;
+            7) action_configure ;;
+            8) action_about ;;
             0|q|Q|"") break ;;
             *) err "unknown choice: $choice" ;;
         esac
