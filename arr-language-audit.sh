@@ -102,11 +102,15 @@ ask_input() {
 }
 
 ask_menu() {
-    # ask_menu "title" tag1 "desc1" tag2 "desc2" ...  -> echoes chosen tag
-    local title="$1"; shift
+    # ask_menu "default_tag" "title" tag1 "desc1" tag2 "desc2" ...  -> echoes chosen tag.
+    # "default_tag" is pre-selected in whiptail and used when the plain
+    # prompt gets an empty line.
+    local default_tag="$1" title="$2"; shift 2
     if [[ "$HAVE_WHIPTAIL" == "true" ]]; then
         local count=$(( $# / 2 ))
-        "${WT[@]}" --menu "$title" 24 78 "$count" "$@" 3>&1 1>&2 2>&3
+        local pre=()
+        [[ -n "$default_tag" ]] && pre=(--default-item "$default_tag")
+        "${WT[@]}" "${pre[@]}" --menu "$title" 24 78 "$count" "$@" 3>&1 1>&2 2>&3
         return
     fi
     echo "" >&2
@@ -117,8 +121,8 @@ ask_menu() {
         shift 2
     done
     local a
-    read -r -p "Select: " a
-    echo "$a"
+    read -r -p "Select [Enter = ${default_tag:-0}]: " a
+    echo "${a:-$default_tag}"
 }
 
 info_box() {
@@ -261,6 +265,29 @@ verdict_summary() {
     echo "${mis:-0} mistagged / ${conf:-0} confirmed not Italian / ${errs:-0} errors"
 }
 
+# Echo the menu tag for the most sensible next step given the current state,
+# so the menu can pre-select it and label it "(recommended)".
+#   7 reconfigure   1 scan   2 verify   3 build report   4 serve
+recommended_action() {
+    [[ "$ENV_READY" == "true" ]]                        || { echo 7; return; }
+    [[ -f "$CSV" ]]                                     || { echo 1; return; }
+    [[ -f "$VERIFIED_CSV" && ! "$CSV" -nt "$VERIFIED_CSV" ]] || { echo 2; return; }
+    [[ -f "$HTML" && ! "$VERIFIED_CSV" -nt "$HTML" ]]   || { echo 3; return; }
+    echo 4
+}
+
+# Human-readable one-liner for the recommended step.
+recommended_hint() {
+    case "$1" in
+        1) echo "run 'Scan library (phase 1)'" ;;
+        2) echo "run 'Verify suspects (phase 2)' -- there is a newer phase 1 CSV" ;;
+        3) echo "run 'Build HTML report' -- there are newer phase 2 results" ;;
+        4) echo "everything is up to date -- 'Serve HTML report' to view it" ;;
+        7) echo "configure Radarr/Sonarr via 'Reconfigure (.env)'" ;;
+        *) echo "" ;;
+    esac
+}
+
 status_text() {
     # whiptail shows PROJECT_BANNER as its backtitle already; repeat it here
     # so the plain-text menu carries the same identity line.
@@ -275,6 +302,7 @@ status_text() {
     if [[ "$ENV_READY" != "true" ]]; then
         printf '\n>> No Radarr/Sonarr reachable. Use "Reconfigure (.env)" first.\n'
     fi
+    printf '\nNext: %s\n' "$(recommended_hint "$(recommended_action)")"
     printf '\nChoose an action:'
 }
 
@@ -310,7 +338,7 @@ Run 'Scan library (phase 1)' first."
     fi
 
     local model
-    model=$(ask_menu "faster-whisper model (bigger = more accurate, slower):" \
+    model=$(ask_menu "small" "faster-whisper model (bigger = more accurate, slower):" \
         small  "balanced (default)" \
         tiny   "fastest, least accurate" \
         base   "fast" \
@@ -450,15 +478,19 @@ main() {
     run_preflight
 
     while true; do
-        local choice
-        choice=$(ask_menu "$(status_text)" \
-            1 "Scan library (phase 1)" \
-            2 "Verify suspects (phase 2)" \
-            3 "Build HTML report" \
-            4 "Serve HTML report" \
-            5 "Run full pipeline" \
+        local choice rec
+        rec=$(recommended_action)
+        # Append "(recommended)" to whichever item rec points at.
+        _lbl() { [[ "$1" == "$rec" ]] && echo "$2   (recommended)" || echo "$2"; }
+
+        choice=$(ask_menu "$rec" "$(status_text)" \
+            1 "$(_lbl 1 'Scan library (phase 1)')" \
+            2 "$(_lbl 2 'Verify suspects (phase 2)')" \
+            3 "$(_lbl 3 'Build HTML report')" \
+            4 "$(_lbl 4 'Serve HTML report')" \
+            5 "$(_lbl 5 'Run full pipeline')" \
             6 "Connection details" \
-            7 "Reconfigure (.env) + re-check" \
+            7 "$(_lbl 7 'Reconfigure (.env) + re-check')" \
             8 "About / project page" \
             0 "Quit") || break   # whiptail Cancel / Esc
 
