@@ -1,0 +1,21 @@
+# Secrets / local config -- keep only .env.example tracked
+*.env
+!.env.example
+
+# Reports produced by the scripts
+*.csv
+
+# Local Python virtual environment (created under verify/venv)
+venv/
+.venv/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+
+# Leftover temp sample dirs, if TEMP_DIR points into the repo
+lang-check-*/
+
+# OS cruft
+.DS_Store
+Thumbs.db
