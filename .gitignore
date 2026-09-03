@@ -6,6 +6,9 @@
 *.csv
 *.html
 
+# Sonarr per-series cache written by find-missing-italian-audio.sh
+*.cache.json
+
 # Local Python virtual environment (created under verify/venv)
 venv/
 .venv/

@@ -9,10 +9,16 @@
 # Requirements: bash, curl, jq
 #
 # Usage:
-#   ./scan/find-missing-italian-audio.sh [OUTPUT_CSV]
+#   ./scan/find-missing-italian-audio.sh [OUTPUT_CSV] [--refresh]
 #
 #   OUTPUT_CSV   where to write the report (default: ./missing-italian-audio.csv,
 #                relative to the current working directory)
+#   --refresh    ignore the Sonarr per-series cache and re-fetch everything
+#
+# Sonarr is queried once per series (episodes with their file embedded), and
+# a small cache file next to OUTPUT_CSV (<name>.cache.json) lets unchanged
+# series be skipped on the next run. Radarr is a single request and is not
+# cached. See "Sonarr cache" note near SONARR_CACHE_FILE below.
 #
 # On first run (interactive terminal, no saved config found), a setup
 # wizard walks you through configuring Radarr/Sonarr: it auto-detects a
@@ -39,6 +45,8 @@
 #                                                               (default: false)
 #   RESCAN_TIMEOUT      seconds to wait for a rescan command to finish
 #                                                               (default: 300)
+#   REFRESH             true to ignore the Sonarr per-series cache and
+#                       re-fetch every series (same as --refresh)  (default: false)
 #
 # .env file: looked up (in order) in scan/, the repo root, and the current
 # working directory. Format is KEY=value, one per line, no quotes, no
@@ -59,6 +67,12 @@ log()  { echo "$@" >&2; }
 warn() { echo "WARN: $*" >&2; }
 err()  { echo "ERROR: $*" >&2; }
 
+# jq wrapper for extracting scalar values / line lists: strips carriage
+# returns so results are clean everywhere (jq on Windows emits CRLF, which
+# otherwise sneaks a \r onto ids, paths, signatures, etc.). Use plain `jq`
+# for JSON-in/JSON-out steps where the CR sits harmlessly in whitespace.
+jqr() { jq "$@" | tr -d '\r'; }
+
 usage() {
     cat <<'EOF'
 Phase 1 of arr-language-audit -- find media files without an Italian audio tag.
@@ -69,12 +83,16 @@ file whose audioLanguages tag is not explicitly Italian. Nothing on disk
 is modified; the only output is the CSV report.
 
 Usage:
-  find-missing-italian-audio.sh [OUTPUT_CSV]
+  find-missing-italian-audio.sh [OUTPUT_CSV] [--refresh]
   find-missing-italian-audio.sh -h | --help
 
 Arguments:
   OUTPUT_CSV          report path (default: ./missing-italian-audio.csv).
                       The file is deleted again if there are zero findings.
+
+Options:
+  --refresh          ignore the Sonarr per-series cache and re-fetch every
+                     series (same as REFRESH=true)
 
 Environment variables (also read from a .env file, see below):
   RADARR_URL          Radarr base URL          (default: http://localhost:7878)
@@ -87,6 +105,12 @@ Environment variables (also read from a .env file, see below):
                       mediaInfo, so stale cached tags are refreshed from disk
                                                               (default: false)
   RESCAN_TIMEOUT      seconds to wait for a rescan to finish  (default: 300)
+  REFRESH            true to ignore the Sonarr per-series cache (default: false)
+
+Sonarr is fetched once per series (episodes with the file embedded). A
+cache file next to OUTPUT_CSV (<name>.cache.json) records a per-series
+signature (file count + size on disk); an unchanged series is not
+re-fetched on the next run. Radarr is one request and is not cached.
 
 .env file: looked up in order in scan/, the repo root, then the current
 directory; first match wins. Format is KEY=value, one per line, no quotes,
@@ -101,9 +125,21 @@ Exit codes:
 EOF
 }
 
-case "${1:-}" in
-    -h|--help) usage; exit 0 ;;
-esac
+# Parse CLI: an optional OUTPUT_CSV positional plus a few flags. The
+# --refresh flag is remembered here and applied after the .env file is
+# loaded, so an explicit flag always wins over an env/.env value.
+_refresh_flag=false
+_positional=()
+while (( $# )); do
+    case "$1" in
+        -h|--help)  usage; exit 0 ;;
+        --refresh)  _refresh_flag=true; shift ;;
+        --)         shift; while (( $# )); do _positional+=("$1"); shift; done ;;
+        -*)         err "unknown option: $1"; echo "Try --help." >&2; exit 1 ;;
+        *)          _positional+=("$1"); shift ;;
+    esac
+done
+set -- "${_positional[@]+"${_positional[@]}"}"
 
 # ---------------------------------------------------------------------------
 # CONFIG / .env LOADING
@@ -140,11 +176,27 @@ SKIP_SONARR="${SKIP_SONARR:-false}"
 FORCE_RESCAN="${FORCE_RESCAN:-false}"
 RESCAN_TIMEOUT="${RESCAN_TIMEOUT:-300}"  # seconds to wait for a rescan command
 
+# REFRESH may come from the environment or the .env file; the --refresh CLI
+# flag (parsed above) overrides it. When true, the Sonarr per-series cache
+# is ignored and every series is re-fetched.
+REFRESH="${REFRESH:-false}"
+[[ "$_refresh_flag" == "true" ]] && REFRESH=true
+
 OUTPUT_CSV="${1:-./missing-italian-audio.csv}"
 
-# Regex matching "Italian present" in the audioLanguages field
-# (covers "Italian", "ita", "it-IT", case-insensitive).
-ITALIAN_REGEX='(?i)(italian|ita|it-it)'
+# Sonarr per-series cache lives next to the output CSV. It records, per
+# series, a signature (episode file count + total size on disk as reported
+# by Sonarr) and the CSV rows that series produced. On the next run, a
+# series whose signature is unchanged is not re-fetched: its cached rows
+# are re-emitted as-is. Use --refresh (or REFRESH=true) to force a full
+# re-scan. Radarr needs no cache -- /api/v3/movie already embeds movieFile.
+SONARR_CACHE_FILE="${OUTPUT_CSV%.csv}.cache.json"
+
+# Matches "Italian audio present" in the audioLanguages field (covers
+# "Italian", "ita", "it-IT"). Plain POSIX ERE, used with `grep -iE`, so it
+# works with both GNU grep and the BSD grep on macOS (which has no -P);
+# case-insensitivity comes from grep -i.
+ITALIAN_REGEX='italian|ita|it-it'
 
 command -v jq   >/dev/null 2>&1 || { err "jq is required but not installed.";   exit 1; }
 command -v curl >/dev/null 2>&1 || { err "curl is required but not installed."; exit 1; }
@@ -252,7 +304,7 @@ wait_for_command() {
     local cmd_id
     cmd_id=$(curl -sf -X POST -H "X-Api-Key: $api_key" -H "Content-Type: application/json" \
         -d "{\"name\":\"$command_name\"}" \
-        "$base_url/api/v3/command" | jq -r '.id // empty')
+        "$base_url/api/v3/command" | jqr -r '.id // empty')
 
     if [[ -z "$cmd_id" ]]; then
         warn "failed to trigger $command_name."
@@ -265,7 +317,7 @@ wait_for_command() {
     local interval=5
     while (( elapsed < RESCAN_TIMEOUT )); do
         local status
-        status=$(curl -sf -H "X-Api-Key: $api_key" "$base_url/api/v3/command/$cmd_id" | jq -r '.status // empty')
+        status=$(curl -sf -H "X-Api-Key: $api_key" "$base_url/api/v3/command/$cmd_id" | jqr -r '.status // empty')
 
         if [[ "$status" == "completed" ]]; then
             log "  $command_name completed."
@@ -281,6 +333,45 @@ wait_for_command() {
 
     warn "$command_name did not complete within ${RESCAN_TIMEOUT}s, continuing anyway."
     return 1
+}
+
+# GET an *arr API URL, retrying a few times on transient curl failures
+# (a connection reset on a busy instance, a brief network blip). Echoes the
+# response body on success; returns non-zero once the last attempt fails.
+api_get() {
+    local url="$1" api_key="$2" tries="${3:-3}"
+    local attempt=1 body
+    while (( attempt <= tries )); do
+        if body=$(curl -sf -m 120 -H "X-Api-Key: $api_key" "$url"); then
+            printf '%s' "$body"
+            return 0
+        fi
+        (( attempt < tries )) && sleep 2
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+# Append the CSV rows a Sonarr series produced on a previous run (read from
+# the cache) to the output, bumping found_count. Sets _reused to the count.
+# Not run in a subshell, so the found_count update sticks.
+emit_cached_rows() {
+    local sid="$1" row
+    _reused=0
+    while IFS= read -r row; do
+        [[ -z "$row" ]] && continue
+        echo "$row" >> "$OUTPUT_CSV"
+        found_count=$((found_count + 1))
+        _reused=$((_reused + 1))
+    done < <(jqr -r --arg id "$sid" '.[$id].rows[]?' <<< "$sonarr_cache_json")
+}
+
+# Copy a series' previous cache entry (sig + rows) into the cache being rebuilt.
+carry_cache_entry() {
+    local sid="$1" entry
+    entry=$(jq -c --arg id "$sid" '.[$id]' <<< "$sonarr_cache_json")
+    sonarr_new_cache=$(jq -c --arg id "$sid" --argjson entry "$entry" \
+        '.[$id] = $entry' <<< "$sonarr_new_cache")
 }
 
 # CSV header
@@ -299,7 +390,7 @@ if [[ "$SKIP_RADARR" != "true" ]]; then
 
     log "Scanning Radarr library..."
 
-    movies_json=$(curl -sf -H "X-Api-Key: $RADARR_API_KEY" "$RADARR_URL/api/v3/movie") || {
+    movies_json=$(api_get "$RADARR_URL/api/v3/movie" "$RADARR_API_KEY") || {
         warn "Radarr scan failed (check URL/API key)."
         movies_json="[]"
     }
@@ -308,7 +399,7 @@ if [[ "$SKIP_RADARR" != "true" ]]; then
     while IFS=$'\t' read -r title year audioLangs path; do
         [[ -z "$title" ]] && continue
 
-        if ! grep -qiP "$ITALIAN_REGEX" <<< "$audioLangs"; then
+        if ! grep -qiE "$ITALIAN_REGEX" <<< "$audioLangs"; then
             found_count=$((found_count + 1))
             # Escape double quotes for CSV.
             title_csv=$(sed 's/"/""/g' <<< "$title")
@@ -316,7 +407,7 @@ if [[ "$SKIP_RADARR" != "true" ]]; then
             echo "Radarr,\"$title_csv\",$year,,\"$audioLangs\",\"$path_csv\"" >> "$OUTPUT_CSV"
             echo "[Radarr] $title ($year) -> audio: ${audioLangs:-<none>}"
         fi
-    done < <(jq -r '.[] | select(.hasFile == true) |
+    done < <(jqr -r '.[] | select(.hasFile == true) |
         [.title, .year, (.movieFile.mediaInfo.audioLanguages // ""), .movieFile.path] | @tsv' <<< "$movies_json")
 fi
 
@@ -331,44 +422,111 @@ if [[ "$SKIP_SONARR" != "true" ]]; then
 
     log "Scanning Sonarr library..."
 
-    series_json=$(curl -sf -H "X-Api-Key: $SONARR_API_KEY" "$SONARR_URL/api/v3/series") || {
+    if series_json=$(api_get "$SONARR_URL/api/v3/series" "$SONARR_API_KEY"); then
+        sonarr_fetch_ok=true
+    else
         warn "Sonarr scan failed (check URL/API key)."
         series_json="[]"
-    }
+        sonarr_fetch_ok=false
+    fi
 
-    series_ids=$(jq -r '.[].id' <<< "$series_json")
+    # Load the previous cache (unless --refresh). A malformed file is ignored.
+    if [[ "$REFRESH" == "true" ]]; then
+        sonarr_cache_json='{}'
+    elif [[ -f "$SONARR_CACHE_FILE" ]] && sonarr_cache_json=$(jq -e . "$SONARR_CACHE_FILE" 2>/dev/null); then
+        log "Loaded Sonarr cache: $SONARR_CACHE_FILE"
+    else
+        [[ -f "$SONARR_CACHE_FILE" ]] && warn "Sonarr cache $SONARR_CACHE_FILE is unreadable, ignoring it."
+        sonarr_cache_json='{}'
+    fi
+    sonarr_new_cache='{}'
 
-    for series_id in $series_ids; do
-        series_title=$(jq -r --arg id "$series_id" '.[] | select(.id == ($id | tonumber)) | .title' <<< "$series_json")
+    mapfile -t series_ids < <(jqr -r '.[].id' <<< "$series_json")
 
-        episodes_json=$(curl -sf -H "X-Api-Key: $SONARR_API_KEY" \
-            "$SONARR_URL/api/v3/episode?seriesId=$series_id") || {
-            warn "failed to fetch episodes for series '$series_title'."
+    for series_id in "${series_ids[@]+"${series_ids[@]}"}"; do
+        series_title=$(jqr -r --arg id "$series_id" '.[] | select(.id == ($id | tonumber)) | .title' <<< "$series_json")
+
+        # Signature = files on disk + their total size, straight from Sonarr's
+        # own per-series statistics. If both are unchanged since last run, the
+        # library almost certainly did not change and we can trust the cache.
+        sig=$(jqr -r --arg id "$series_id" \
+            '.[] | select(.id == ($id | tonumber)) |
+             "\(.statistics.episodeFileCount // 0):\(.statistics.sizeOnDisk // 0)"' <<< "$series_json")
+        cached_sig=$(jqr -r --arg id "$series_id" '.[$id].sig // empty' <<< "$sonarr_cache_json")
+
+        if [[ "$REFRESH" != "true" && -n "$cached_sig" && "$cached_sig" == "$sig" ]]; then
+            # Cache hit: re-emit the rows this series produced last time,
+            # without fetching its episodes again.
+            emit_cached_rows "$series_id"
+            log "  [cache] $series_title unchanged ($sig); reused $_reused flagged file(s)."
+            carry_cache_entry "$series_id"
+            continue
+        fi
+
+        # Cache miss (or --refresh): one request for the whole series, with
+        # the episode file embedded (includeEpisodeFile=true). This replaces
+        # the old one-request-per-episode-file loop; the mediaInfo and path
+        # come from the same EpisodeFileResource, so the result is identical.
+        episodes_json=$(api_get "$SONARR_URL/api/v3/episode?seriesId=$series_id&includeEpisodeFile=true" "$SONARR_API_KEY") || {
+            if [[ -n "$cached_sig" ]]; then
+                warn "episode fetch failed for '$series_title'; keeping its previous cache entry."
+                emit_cached_rows "$series_id"
+                carry_cache_entry "$series_id"
+            else
+                warn "episode fetch failed for '$series_title'; skipping it this run."
+            fi
             continue
         }
 
-        # Get episodeFileId + season/episode/title for downloaded episodes only.
-        while IFS=$'\t' read -r episodeFileId seasonNum epNum epTitle; do
+        series_rows=()
+        while IFS=$'\t' read -r episodeFileId seasonNum epNum epTitle audioLangs path; do
             [[ -z "$episodeFileId" || "$episodeFileId" == "0" ]] && continue
 
-            epfile_json=$(curl -sf -H "X-Api-Key: $SONARR_API_KEY" \
-                "$SONARR_URL/api/v3/episodefile/$episodeFileId") || continue
+            # Rare: an episode marked hasFile but with no embedded file object.
+            # Fall back to the single-file endpoint just for this one.
+            if [[ -z "$path" ]]; then
+                epfile_json=$(api_get "$SONARR_URL/api/v3/episodefile/$episodeFileId" "$SONARR_API_KEY" 2) || epfile_json=""
+                if [[ -n "$epfile_json" ]]; then
+                    audioLangs=$(jqr -r '.mediaInfo.audioLanguages // ""' <<< "$epfile_json")
+                    path=$(jqr -r '.path // ""' <<< "$epfile_json")
+                fi
+            fi
 
-            audioLangs=$(jq -r '.mediaInfo.audioLanguages // ""' <<< "$epfile_json")
-            path=$(jq -r '.path // ""' <<< "$epfile_json")
-
-            if ! grep -qiP "$ITALIAN_REGEX" <<< "$audioLangs"; then
+            if ! grep -qiE "$ITALIAN_REGEX" <<< "$audioLangs"; then
                 found_count=$((found_count + 1))
                 ep_label=$(printf "S%02dE%02d - %s" "$seasonNum" "$epNum" "$epTitle")
                 title_csv=$(sed 's/"/""/g' <<< "$series_title")
                 ep_csv=$(sed 's/"/""/g' <<< "$ep_label")
                 path_csv=$(sed 's/"/""/g' <<< "$path")
-                echo "Sonarr,\"$title_csv\",,\"$ep_csv\",\"$audioLangs\",\"$path_csv\"" >> "$OUTPUT_CSV"
+                row="Sonarr,\"$title_csv\",,\"$ep_csv\",\"$audioLangs\",\"$path_csv\""
+                echo "$row" >> "$OUTPUT_CSV"
                 echo "[Sonarr] $series_title - $ep_label -> audio: ${audioLangs:-<none>}"
+                series_rows+=("$row")
             fi
-        done < <(jq -r '.[] | select(.hasFile == true) |
-            [.episodeFileId, .seasonNumber, .episodeNumber, .title] | @tsv' <<< "$episodes_json")
+        done < <(jqr -r '.[] | select(.hasFile == true) |
+            [.episodeFileId, .seasonNumber, .episodeNumber, .title,
+             (.episodeFile.mediaInfo.audioLanguages // ""), (.episodeFile.path // "")] | @tsv' <<< "$episodes_json")
+
+        # Record this series in the rebuilt cache (empty rows array is fine:
+        # it means "checked, nothing flagged").
+        if (( ${#series_rows[@]} > 0 )); then
+            rows_json=$(printf '%s\n' "${series_rows[@]}" | jq -R . | jq -s .)
+        else
+            rows_json='[]'
+        fi
+        sonarr_new_cache=$(jq -c --arg id "$series_id" --arg sig "$sig" --argjson rows "$rows_json" \
+            '.[$id] = {sig: $sig, rows: $rows}' <<< "$sonarr_new_cache")
     done
+
+    # Persist the rebuilt cache, but only if the series list was actually
+    # fetched -- otherwise a transient API failure would wipe a good cache.
+    if [[ "$sonarr_fetch_ok" == "true" ]]; then
+        if echo "$sonarr_new_cache" | jq . > "$SONARR_CACHE_FILE" 2>/dev/null; then
+            log "Sonarr cache updated: $SONARR_CACHE_FILE"
+        else
+            warn "could not write Sonarr cache to $SONARR_CACHE_FILE."
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------------------

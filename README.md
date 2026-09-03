@@ -113,6 +113,19 @@ Tag non aggiornati? Forza prima Radarr/Sonarr a rileggere ogni file dal disco:
 FORCE_RESCAN=true ./scan/find-missing-italian-audio.sh
 ```
 
+**Cache Sonarr.** Sonarr viene interrogato una volta per serie (episodi con il
+file incluso nella risposta). Accanto al CSV viene scritto un file
+`missing-italian-audio.cache.json` che registra, per ogni serie, una firma
+(numero di file + dimensione su disco secondo Sonarr). Al run successivo una
+serie con firma invariata non viene ri-scaricata: le sue righe vengono
+riemesse dalla cache. Per forzare una scansione completa:
+
+```bash
+./scan/find-missing-italian-audio.sh --refresh      # oppure REFRESH=true
+```
+
+Radarr non ha cache: `/api/v3/movie` restituisce già tutto in una richiesta.
+
 ### Fase 2 — verifica cosa viene davvero parlato
 
 ```bash
@@ -200,9 +213,11 @@ nella radice del repo, poi nella directory corrente — vince la prima occorrenz
 | `SKIP_SONARR`    | `false`                  | `true` per saltare del tutto Sonarr |
 | `FORCE_RESCAN`   | `false`                  | `true` per eseguire `RescanMovie` / `RescanSeries` prima di leggere `mediaInfo` |
 | `RESCAN_TIMEOUT` | `300`                    | Secondi di attesa per il completamento del comando di rescan |
+| `REFRESH`        | `false`                  | `true` per ignorare la cache Sonarr e ri-scaricare ogni serie (come `--refresh`) |
 
 Il primo argomento posizionale sovrascrive il percorso del CSV di output:
-`./scan/find-missing-italian-audio.sh /tmp/report.csv`.
+`./scan/find-missing-italian-audio.sh /tmp/report.csv`. Il flag `--refresh`
+ignora la cache Sonarr per quel run.
 
 ### Variabili d'ambiente — fase 2
 
@@ -253,7 +268,7 @@ probabilità di rilevamento lingua del modello (`0.00`–`1.00`).
 
 ## Licenza
 
-[MIT](LICENSE) © 2026 Giovanni Solone
+[MIT](LICENSE) - 2026 Giovanni Solone
 
 ---
 
@@ -375,6 +390,19 @@ Stale tags? Force Radarr/Sonarr to re-read every file from disk first:
 FORCE_RESCAN=true ./scan/find-missing-italian-audio.sh
 ```
 
+**Sonarr cache.** Sonarr is queried once per series (episodes with the file
+embedded in the response). A `missing-italian-audio.cache.json` file is
+written next to the CSV, recording a per-series signature (file count + size
+on disk as reported by Sonarr). On the next run a series whose signature is
+unchanged is not re-fetched: its rows are re-emitted from the cache. Force a
+full re-scan with:
+
+```bash
+./scan/find-missing-italian-audio.sh --refresh      # or REFRESH=true
+```
+
+Radarr has no cache: `/api/v3/movie` already returns everything in one request.
+
 ### Phase 2 — verify what is actually spoken
 
 ```bash
@@ -462,9 +490,11 @@ Read from the environment, or from a `.env` file looked up (in order) in
 | `SKIP_SONARR`    | `false`                  | `true` to skip Sonarr entirely |
 | `FORCE_RESCAN`   | `false`                  | `true` to run `RescanMovie` / `RescanSeries` before reading `mediaInfo` |
 | `RESCAN_TIMEOUT` | `300`                    | Seconds to wait for a rescan command to finish |
+| `REFRESH`        | `false`                  | `true` to ignore the Sonarr cache and re-fetch every series (same as `--refresh`) |
 
 The first positional argument overrides the output CSV path:
-`./scan/find-missing-italian-audio.sh /tmp/report.csv`.
+`./scan/find-missing-italian-audio.sh /tmp/report.csv`. The `--refresh` flag
+ignores the Sonarr cache for that run.
 
 ### Phase 2 environment variables
 
@@ -513,4 +543,4 @@ model's language-detection probability (`0.00`–`1.00`).
 
 ## License
 
-[MIT](LICENSE) © 2026 Giovanni Solone
+[MIT](LICENSE) - 2026 Giovanni Solone
