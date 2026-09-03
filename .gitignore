@@ -4,6 +4,7 @@
 
 # Reports produced by the scripts
 *.csv
+*.html
 
 # Local Python virtual environment (created under verify/venv)
 venv/

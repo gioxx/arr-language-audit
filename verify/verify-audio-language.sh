@@ -317,3 +317,8 @@ if [[ "${NO_RESUME:-false}" == "true" ]]; then
 fi
 
 "$PYTHON_BIN" "$PYTHON_SCRIPT" --input "$INPUT_CSV" --output "$OUTPUT_CSV" "${EXTRA_ARGS[@]}"
+
+log ""
+log "Tip: build a browsable HTML report from the CSV with:"
+log "    $SCRIPT_DIR/report.py \"$OUTPUT_CSV\"            # writes an .html next to it"
+log "    $SCRIPT_DIR/report.py \"$OUTPUT_CSV\" --serve    # and view it from another machine"
