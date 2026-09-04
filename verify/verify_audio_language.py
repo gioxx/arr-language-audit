@@ -23,9 +23,11 @@ the last run (it was replaced, re-encoded or re-downloaded), even though
 its path is unchanged. Rows written before this behaviour existed carry no
 stored size/mtime and are reused as-is until verified again.
 
-Rows in the output whose path is no longer in the phase 1 CSV (file
-removed from the library) are carried over unchanged. Use the
-orchestrator's "Reset reports" action to wipe everything and start over.
+Rows in the output whose path is no longer in the phase 1 CSV: if the file
+also changed on disk (it was fixed), the stale verdict is dropped; if its
+signature still matches (the scan just had a narrower scope) or the file
+is gone, the row is kept. Use the orchestrator's "Reset reports" action to
+wipe everything and start over.
 
     --retry-errors   also reprocess rows that previously failed
                      (FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)
@@ -311,10 +313,28 @@ def main():
         else:
             to_verify.append(row)
 
-    # Previous verdicts whose file is no longer listed by phase 1 (removed
-    # from the library). Carried over untouched; "Reset reports" in the
-    # orchestrator is how you clear these.
-    orphan_rows = [norm_prev(r) for p, r in previous.items() if p not in input_paths]
+    # Previous verdicts whose file is no longer listed by phase 1. Two cases:
+    #  - the file changed on disk (signature differs) and is no longer
+    #    flagged: it was fixed, the old verdict is stale -> drop the row so
+    #    the report does not keep showing a wrong result.
+    #  - anything else (signature still matches, file gone, or a legacy row
+    #    with no signature): keep it. A matching signature usually means the
+    #    row is "orphaned" only because this scan had a narrower scope
+    #    (SKIP_RADARR / SKIP_SONARR, an app that was down), and re-running a
+    #    full scan should not cost hours of re-verification.
+    orphan_rows = []
+    dropped_stale = 0
+    for p, r in previous.items():
+        if p in input_paths:
+            continue
+        prev_size = (r.get("FileSize", "") or "").strip()
+        prev_mtime = (r.get("FileMtime", "") or "").strip()
+        cur_size, cur_mtime = file_signature(p)
+        if (prev_size and prev_mtime and cur_size is not None
+                and (str(cur_size) != prev_size or str(cur_mtime) != prev_mtime)):
+            dropped_stale += 1
+            continue
+        orphan_rows.append(norm_prev(r))
 
     if args.limit > 0:
         to_verify = to_verify[: args.limit]
@@ -323,6 +343,8 @@ def main():
         print(f"Reusing {len(kept_rows)} previous verdict(s) for unchanged files.", file=sys.stderr)
     if orphan_rows:
         print(f"Carrying over {len(orphan_rows)} row(s) whose file is no longer in the phase 1 CSV.", file=sys.stderr)
+    if dropped_stale:
+        print(f"Dropped {dropped_stale} stale row(s): file changed and is no longer flagged by phase 1.", file=sys.stderr)
     print(f"Loaded {len(all_rows)} suspect file(s) total, {len(to_verify)} to (re)verify now.", file=sys.stderr)
 
     # Always rewrite the output in full: kept + carried-over rows first, so a
@@ -405,6 +427,7 @@ def main():
 
     print("\n--- Summary ---", file=sys.stderr)
     print(f"Reused unchanged:             {len(kept_rows)}", file=sys.stderr)
+    print(f"Dropped (fixed, unflagged):   {dropped_stale}", file=sys.stderr)
     print(f"Mistagged (actually Italian): {mistagged_count}", file=sys.stderr)
     print(f"Confirmed not Italian:        {confirmed_foreign_count}", file=sys.stderr)
     print(f"Errors this run:              {error_count}", file=sys.stderr)

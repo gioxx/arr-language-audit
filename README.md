@@ -181,10 +181,12 @@ volta (l'hai sostituito, ricodificato o riscaricato), anche se il percorso è
 identico. Le righe scritte da versioni precedenti non hanno `FileSize`/`FileMtime`
 e vengono riusate così come sono finché non le riverifichi.
 
-Le righe il cui file non è più elencato dalla fase 1 (rimosso dalla libreria)
-vengono mantenute intatte. Per ripartire davvero da zero usa "Reset reports"
-nell'orchestratore, oppure `NO_RESUME=true` per rigenerare solo questo CSV. Per
-riprovare solo le righe fallite, usa `RETRY_ERRORS=true`.
+Se una riga ha un file che la fase 1 non elenca più: viene **rimossa** se quel
+file è anche cambiato su disco (l'hai sistemato — il verdetto vecchio sarebbe
+falso), altrimenti viene **mantenuta** (scan con scope ridotto per `SKIP_*` o
+un'app giù, oppure file sparito). Per ripartire davvero da zero usa "Reset
+reports" nell'orchestratore, oppure `NO_RESUME=true` per rigenerare solo questo
+CSV. Per riprovare solo le righe fallite, usa `RETRY_ERRORS=true`.
 
 Percorsi personalizzati:
 
@@ -493,8 +495,10 @@ re-downloaded it), even though its path is unchanged. Rows written by older
 versions have no `FileSize`/`FileMtime` and are reused as-is until verified
 again.
 
-Rows whose file is no longer listed by phase 1 (removed from the library) are
-kept untouched. To really start from scratch use "Reset reports" in the
+A row whose file is no longer listed by phase 1 is **dropped** if that file
+also changed on disk (you fixed it -- the old verdict would be wrong), and
+**kept** otherwise (a narrower scan scope from `SKIP_*` or a downed app, or a
+missing file). To really start from scratch use "Reset reports" in the
 orchestrator, or `NO_RESUME=true` to regenerate just this CSV. To retry only
 the rows that failed, use `RETRY_ERRORS=true`.
 

@@ -88,9 +88,10 @@ Environment variables:
   NO_RESUME         true to ignore an existing OUTPUT_CSV and start fresh
 
 Resume reuses verdicts for files whose size and mtime are unchanged; a file
-that was replaced since the last run is re-verified automatically. Rows whose
-file is no longer in the phase 1 CSV are kept. Use the orchestrator's
-"Reset reports" to wipe reports/ and start from scratch.
+that was replaced since the last run is re-verified automatically. A row whose
+file is no longer in the phase 1 CSV is dropped when that file also changed on
+disk (it was fixed), and kept otherwise (narrower scan scope, or file gone).
+Use the orchestrator's "Reset reports" to wipe reports/ and start from scratch.
 
 faster-whisper is looked for in the system python3 first, then in a local
 venv at ./venv (next to this script). If it is missing, the exact install
