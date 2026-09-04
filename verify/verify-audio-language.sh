@@ -34,12 +34,13 @@
 #   SAMPLE_OFFSET_PCT   where to start sampling, % of duration  (default: 25)
 #   MIN_FREE_SPACE_MB   minimum free space required, in MB      (default: 500)
 #   TEMP_DIR           directory for temporary audio samples   (default: mktemp)
-#   LIMIT              only process the first N new files       (for testing)
+#   LIMIT              only (re)verify the first N files needing it (testing)
 #   RETRY_ERRORS      true to also reprocess previously failed rows
 #   NO_RESUME         true to ignore an existing OUTPUT_CSV and start fresh
 #
-# Resume: if OUTPUT_CSV already exists, files already listed in it are
-# skipped (matched by path). Use RETRY_ERRORS=true to retry only the
+# Resume: if OUTPUT_CSV already exists, files already verified in it are
+# reused, unless their size/mtime changed since (replaced file) -- those
+# are re-verified automatically. Use RETRY_ERRORS=true to also retry the
 # failures; NO_RESUME=true to overwrite and start over.
 #
 # Exit codes:
@@ -82,9 +83,14 @@ Environment variables:
   SAMPLE_OFFSET_PCT  where to start sampling, % of duration  (default: 25)
   MIN_FREE_SPACE_MB  minimum free space required, in MB      (default: 500)
   TEMP_DIR          directory for temporary audio samples   (default: mktemp)
-  LIMIT             only process the first N new files       (for testing)
+  LIMIT             only (re)verify the first N files that need it (testing)
   RETRY_ERRORS      true to also reprocess previously failed rows
   NO_RESUME         true to ignore an existing OUTPUT_CSV and start fresh
+
+Resume reuses verdicts for files whose size and mtime are unchanged; a file
+that was replaced since the last run is re-verified automatically. Rows whose
+file is no longer in the phase 1 CSV are kept. Use the orchestrator's
+"Reset reports" to wipe reports/ and start from scratch.
 
 faster-whisper is looked for in the system python3 first, then in a local
 venv at ./venv (next to this script). If it is missing, the exact install

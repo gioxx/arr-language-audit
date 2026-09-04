@@ -98,7 +98,9 @@ accessibilità e spazio libero, e propone il passo successivo sensato
 (marcato *(recommended)* e preselezionato). Menu: *Scan (fase 1)* → *Verify
 (fase 2)* → *Build / Serve HTML report* → *Run full pipeline* → *Set up phase 2*
 (crea `verify/venv` e installa `faster-whisper`, con conferma), con
-*Connection details*, *Reconfigure (.env)* e *About* in fondo. Usa `whiptail` se disponibile (dialoghi ncurses), altrimenti
+*Connection details*, *Reconfigure (.env)*, *Reset reports* (cancella
+CSV/HTML/cache in `reports/` per ricominciare, con conferma) e *About* in
+fondo. Usa `whiptail` se disponibile (dialoghi ncurses), altrimenti
 un menu numerato. Tutti gli output finiscono in `reports/`.
 
 Le sezioni seguenti descrivono i singoli script, se preferisci lanciarli a
@@ -157,7 +159,9 @@ Radarr non ha cache: `/api/v3/movie` restituisce già tutto in una richiesta.
 
 Default: legge `reports/missing-italian-audio.csv`, scrive
 `reports/verified-language-results.csv` con colonne
-`App,Title,Year,Episode,DeclaredAudioLanguages,DetectedLanguage,Confidence,Verdict,Path`.
+`App,Title,Year,Episode,DeclaredAudioLanguages,DetectedLanguage,Confidence,Verdict,Path,FileSize,FileMtime`.
+`FileSize`/`FileMtime` sono la firma del file al momento della verifica: servono
+al resume per accorgersi che un file è stato sostituito (vedi sotto).
 
 Se manca una dipendenza lo script stampa il comando di installazione esatto ed
 esce senza cambiare nulla. Un tipico primo setup su Debian/Ubuntu:
@@ -171,9 +175,16 @@ python3 -m venv verify/venv
 ```
 
 L'esecuzione è riprendibile: interrompila quando vuoi e rilanciala — i file già
-presenti nel CSV di output vengono saltati (match sul percorso). Per riprovare
-solo quelli falliti, usa `RETRY_ERRORS=true`. Per buttare via l'output e
-ripartire da zero, usa `NO_RESUME=true`.
+verificati nel CSV di output vengono riusati. Un file viene **ri-verificato
+automaticamente** se la sua dimensione o il suo `mtime` sono cambiati dall'ultima
+volta (l'hai sostituito, ricodificato o riscaricato), anche se il percorso è
+identico. Le righe scritte da versioni precedenti non hanno `FileSize`/`FileMtime`
+e vengono riusate così come sono finché non le riverifichi.
+
+Le righe il cui file non è più elencato dalla fase 1 (rimosso dalla libreria)
+vengono mantenute intatte. Per ripartire davvero da zero usa "Reset reports"
+nell'orchestratore, oppure `NO_RESUME=true` per rigenerare solo questo CSV. Per
+riprovare solo le righe fallite, usa `RETRY_ERRORS=true`.
 
 Percorsi personalizzati:
 
@@ -398,7 +409,9 @@ folders with their accessibility and free space, and it suggests the next
 sensible step (tagged *(recommended)* and pre-selected). Menu: *Scan (phase 1)*
 → *Verify (phase 2)* → *Build / Serve HTML report* → *Run full pipeline* →
 *Set up phase 2* (creates `verify/venv` and installs `faster-whisper`, with
-confirmation), plus *Connection details*, *Reconfigure (.env)* and *About*. It uses `whiptail` when
+confirmation), plus *Connection details*, *Reconfigure (.env)*, *Reset reports*
+(deletes the CSV/HTML/cache files in `reports/` to start over, with
+confirmation) and *About*. It uses `whiptail` when
 available (ncurses dialogs) and falls back to a plain numbered prompt. All
 output lands in `reports/`.
 
@@ -458,7 +471,9 @@ Radarr has no cache: `/api/v3/movie` already returns everything in one request.
 
 Defaults: reads `reports/missing-italian-audio.csv`, writes
 `reports/verified-language-results.csv` with columns
-`App,Title,Year,Episode,DeclaredAudioLanguages,DetectedLanguage,Confidence,Verdict,Path`.
+`App,Title,Year,Episode,DeclaredAudioLanguages,DetectedLanguage,Confidence,Verdict,Path,FileSize,FileMtime`.
+`FileSize`/`FileMtime` record the file's signature at verification time; the
+resume logic uses them to notice a file was replaced (see below).
 
 If a dependency is missing the script prints the exact install command and
 exits without changing anything. A typical first-time setup on Debian/Ubuntu:
@@ -471,10 +486,17 @@ python3 -m venv verify/venv
 ./verify/verify-audio-language.sh          # detects and uses verify/venv automatically
 ```
 
-The run is resumable: stop it any time and run it again — files already in
-the output CSV are skipped (matched by path). To retry only the ones that
-failed, use `RETRY_ERRORS=true`. To throw the output away and start over, use
-`NO_RESUME=true`.
+The run is resumable: stop it any time and run it again — files already
+verified in the output CSV are reused. A file is **re-verified automatically**
+when its size or mtime changed since the last run (you replaced, re-encoded or
+re-downloaded it), even though its path is unchanged. Rows written by older
+versions have no `FileSize`/`FileMtime` and are reused as-is until verified
+again.
+
+Rows whose file is no longer listed by phase 1 (removed from the library) are
+kept untouched. To really start from scratch use "Reset reports" in the
+orchestrator, or `NO_RESUME=true` to regenerate just this CSV. To retry only
+the rows that failed, use `RETRY_ERRORS=true`.
 
 Custom paths:
 

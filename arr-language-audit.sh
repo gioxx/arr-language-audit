@@ -528,6 +528,33 @@ Two phases, all driven from this menu:
 Each script also runs on its own; see its --help."
 }
 
+action_reset() {
+    shopt -s nullglob
+    local files=( "$REPORTS_DIR"/*.csv "$REPORTS_DIR"/*.html "$REPORTS_DIR"/*.cache.json )
+    shopt -u nullglob
+
+    if (( ${#files[@]} == 0 )); then
+        info_box "Nothing to reset -- reports/ holds no CSV, HTML or cache files:
+  $REPORTS_DIR"
+        return
+    fi
+
+    local list
+    list=$(printf '  %s\n' "${files[@]##*/}")
+    ask_yesno "Delete these ${#files[@]} file(s) from reports/ and start completely over?
+
+$list
+This wipes the phase 1 / phase 2 CSVs, the HTML report and the Sonarr
+per-series cache. The next scan and verify run from scratch. It cannot
+be undone." no || return
+
+    rm -f -- "${files[@]}"
+    log ""
+    log "Removed ${#files[@]} file(s) from $REPORTS_DIR."
+    run_preflight
+    pause
+}
+
 action_configure() {
     if [[ ! -f "$ENV_FILE" ]]; then
         cp "$ROOT/.env.example" "$ENV_FILE"
@@ -571,6 +598,7 @@ main() {
             6 "$(_lbl 6 'Set up phase 2 (faster-whisper)')" \
             7 "Connection details" \
             8 "$(_lbl 8 'Reconfigure (.env) + re-check')" \
+            R "Reset reports (delete CSV/HTML/cache, start over)" \
             9 "About / project page" \
             0 "Quit") || break   # whiptail Cancel / Esc
 
@@ -583,6 +611,7 @@ main() {
             6) action_setup_phase2 ;;
             7) action_connection_details ;;
             8) action_configure ;;
+            R|r) action_reset ;;
             9) action_about ;;
             0|q|Q|"") break ;;
             *) err "unknown choice: $choice" ;;

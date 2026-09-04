@@ -16,9 +16,16 @@ dependency and disk-space checks first. You can also call it directly:
     python3 verify_audio_language.py --input missing-italian-audio.csv \
         --output verified-language-results.csv
 
-By default, if the output CSV already exists, files already listed in it
-are SKIPPED on subsequent runs (matched by file path) -- so you can stop
-and resume a long scan without re-analyzing files already checked.
+By default, if the output CSV already exists, files already verified in it
+are reused on subsequent runs, so you can stop and resume a long scan.
+A file is re-verified automatically when its size or mtime changed since
+the last run (it was replaced, re-encoded or re-downloaded), even though
+its path is unchanged. Rows written before this behaviour existed carry no
+stored size/mtime and are reused as-is until verified again.
+
+Rows in the output whose path is no longer in the phase 1 CSV (file
+removed from the library) are carried over unchanged. Use the
+orchestrator's "Reset reports" action to wipe everything and start over.
 
     --retry-errors   also reprocess rows that previously failed
                      (FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)
@@ -144,26 +151,64 @@ def is_italian(lang_code: str) -> bool:
     return lang_code.lower() in ("it", "ita")
 
 
-def load_processed_paths(output_path: str, retry_errors: bool) -> set:
-    """Returns the set of file paths already present in a previous run's
-    output CSV, so they can be skipped on this run. If retry_errors is True,
-    paths whose previous verdict was an error/failure are NOT included in
-    the skip set, so they get reprocessed."""
-    processed = set()
-    if not os.path.isfile(output_path):
-        return processed
+ERROR_VERDICTS = {"FILE_NOT_FOUND", "EXTRACTION_FAILED", "DETECTION_FAILED"}
 
-    error_verdicts = {"FILE_NOT_FOUND", "EXTRACTION_FAILED", "DETECTION_FAILED"}
+
+def file_signature(path: str) -> tuple[int | None, int | None]:
+    """(size_bytes, mtime_epoch_seconds) for path, or (None, None) if it
+    cannot be stat()'d. Comparing this against the value stored on the
+    previous run is how we notice a file was replaced even though its path
+    did not change."""
+    try:
+        st = os.stat(path)
+        return int(st.st_size), int(st.st_mtime)
+    except OSError:
+        return None, None
+
+
+def load_previous_rows(output_path: str) -> dict:
+    """path -> the previous run's output row (dict), for resume decisions.
+    Empty when there is no readable previous output."""
+    previous = {}
+    if not os.path.isfile(output_path):
+        return previous
     with open(output_path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            path = row.get("Path", "").strip()
-            verdict = row.get("Verdict", "")
-            if not path:
-                continue
-            if retry_errors and verdict in error_verdicts:
-                continue
-            processed.add(path)
-    return processed
+            path = (row.get("Path", "") or "").strip()
+            if path:
+                previous[path] = row
+    return previous
+
+
+def resume_decision(entry, cur_size, cur_mtime, retry_errors: bool) -> str:
+    """Decide what to do with an input row we have a previous verdict for.
+
+        entry         previous output row for this path, or None
+        cur_size      current file size in bytes, or None if the file is gone
+        cur_mtime     current file mtime (epoch seconds), or None if gone
+        retry_errors  reprocess rows whose previous verdict was an error
+
+    Returns 'verify' (run detection again and replace the old row) or
+    'keep' (reuse the previous verdict unchanged)."""
+    if entry is None:
+        return "verify"
+    if retry_errors and (entry.get("Verdict", "") or "") in ERROR_VERDICTS:
+        return "verify"
+
+    prev_size = (entry.get("FileSize", "") or "").strip()
+    prev_mtime = (entry.get("FileMtime", "") or "").strip()
+    if not prev_size or not prev_mtime:
+        # Legacy row from before signatures were recorded: fall back to the
+        # old path-only behaviour (keep). It gets a signature stamped on
+        # this run, so change detection works for it from now on.
+        return "keep"
+    if cur_size is None or cur_mtime is None:
+        # File not visible right now (unmounted share, transient error):
+        # do not churn, keep the previous verdict.
+        return "keep"
+    if str(cur_size) == prev_size and str(cur_mtime) == prev_mtime:
+        return "keep"
+    return "verify"
 
 
 def main():
@@ -186,7 +231,8 @@ def main():
     )
     parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV from find-missing-italian-audio.sh")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output CSV path")
-    parser.add_argument("--limit", type=int, default=0, help="Only process the first N NEW rows (0 = all)")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="Only (re)verify the first N files that need it (0 = all)")
     parser.add_argument("--retry-errors", action="store_true",
                          help="Also reprocess rows that previously failed (FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)")
     parser.add_argument("--no-resume", action="store_true",
@@ -207,50 +253,25 @@ def main():
     os.makedirs(temp_dir, exist_ok=True)
     check_disk_space(temp_dir, MIN_FREE_SPACE_MB)
 
-    with open(args.input, newline="", encoding="utf-8") as f:
-        all_rows = list(csv.DictReader(f))
-
-    resuming = False
-    if args.no_resume:
-        processed_paths = set()
-    else:
-        processed_paths = load_processed_paths(args.output, args.retry_errors)
-        resuming = len(processed_paths) > 0
-
-    rows = [r for r in all_rows if r.get("Path", "").strip() not in processed_paths]
-    skipped = len(all_rows) - len(rows)
-
-    if args.limit > 0:
-        rows = rows[: args.limit]
-
-    if skipped > 0:
-        print(f"Skipping {skipped} file(s) already present in '{args.output}' from a previous run.", file=sys.stderr)
-    print(f"Loaded {len(all_rows)} suspect file(s) total, {len(rows)} to process now.", file=sys.stderr)
-
-    if len(rows) == 0:
-        print("Nothing new to process.", file=sys.stderr)
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return
-
-    model = load_model()
-
     fieldnames = [
         "App", "Title", "Year", "Episode",
         "DeclaredAudioLanguages", "DetectedLanguage", "Confidence",
-        "Verdict", "Path",
+        "Verdict", "Path", "FileSize", "FileMtime",
     ]
-    write_header = not (resuming and os.path.isfile(args.output) and os.path.getsize(args.output) > 0)
-    out_mode = "a" if (resuming and not write_header) else "w"
-    out_f = open(args.output, out_mode, newline="", encoding="utf-8")
-    writer = csv.DictWriter(out_f, fieldnames=fieldnames)
-    if write_header:
-        writer.writeheader()
 
-    mistagged_count = 0
-    confirmed_foreign_count = 0
-    error_count = 0
+    def norm_prev(row, size=None, mtime=None):
+        # A row read back from a previous output CSV, reshaped to the current
+        # schema. Missing columns (older CSV) become "". A fresh signature is
+        # stamped on when the file is still readable, so legacy rows pick one
+        # up without being re-verified.
+        out = {k: (row.get(k, "") or "") for k in fieldnames}
+        if size is not None:
+            out["FileSize"] = str(size)
+        if mtime is not None:
+            out["FileMtime"] = str(mtime)
+        return out
 
-    def make_row(row, detected="", confidence="", verdict=""):
+    def make_row(row, detected="", confidence="", verdict="", size=None, mtime=None):
         return {
             "App": row.get("App", ""),
             "Title": row.get("Title", ""),
@@ -261,33 +282,104 @@ def main():
             "Confidence": confidence,
             "Verdict": verdict,
             "Path": row.get("Path", ""),
+            "FileSize": "" if size is None else str(size),
+            "FileMtime": "" if mtime is None else str(mtime),
         }
 
+    with open(args.input, newline="", encoding="utf-8") as f:
+        all_rows = list(csv.DictReader(f))
+
+    previous = {} if args.no_resume else load_previous_rows(args.output)
+    input_paths = {
+        (r.get("Path", "") or "").strip()
+        for r in all_rows if (r.get("Path", "") or "").strip()
+    }
+
+    # Split the input into "already known, unchanged" (reuse the verdict)
+    # and "needs (re)verification" (new file, or size/mtime changed).
+    kept_rows = []      # finished output rows, input order
+    to_verify = []      # input rows still needing detection, input order
+    for row in all_rows:
+        path = (row.get("Path", "") or "").strip()
+        if not path:
+            to_verify.append(row)          # worker will record FILE_NOT_FOUND
+            continue
+        cur_size, cur_mtime = file_signature(path)
+        entry = previous.get(path)
+        if resume_decision(entry, cur_size, cur_mtime, args.retry_errors) == "keep":
+            kept_rows.append(norm_prev(entry, cur_size, cur_mtime))
+        else:
+            to_verify.append(row)
+
+    # Previous verdicts whose file is no longer listed by phase 1 (removed
+    # from the library). Carried over untouched; "Reset reports" in the
+    # orchestrator is how you clear these.
+    orphan_rows = [norm_prev(r) for p, r in previous.items() if p not in input_paths]
+
+    if args.limit > 0:
+        to_verify = to_verify[: args.limit]
+
+    if kept_rows:
+        print(f"Reusing {len(kept_rows)} previous verdict(s) for unchanged files.", file=sys.stderr)
+    if orphan_rows:
+        print(f"Carrying over {len(orphan_rows)} row(s) whose file is no longer in the phase 1 CSV.", file=sys.stderr)
+    print(f"Loaded {len(all_rows)} suspect file(s) total, {len(to_verify)} to (re)verify now.", file=sys.stderr)
+
+    # Always rewrite the output in full: kept + carried-over rows first, so a
+    # crash during detection still leaves a complete, valid CSV.
+    out_f = open(args.output, "w", newline="", encoding="utf-8")
+    writer = csv.DictWriter(out_f, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in kept_rows:
+        writer.writerow(r)
+    for r in orphan_rows:
+        writer.writerow(r)
+    out_f.flush()
+
+    if len(to_verify) == 0:
+        out_f.close()
+        print("Nothing new to verify.", file=sys.stderr)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return
+
+    model = load_model()
+
+    mistagged_count = 0
+    confirmed_foreign_count = 0
+    error_count = 0
+
     try:
-        for i, row in enumerate(rows, start=1):
-            path = row.get("Path", "").strip()
+        for i, row in enumerate(to_verify, start=1):
+            path = (row.get("Path", "") or "").strip()
             title = row.get("Title", "")
-            print(f"[{i}/{len(rows)}] {title} ...", file=sys.stderr)
+            print(f"[{i}/{len(to_verify)}] {title} ...", file=sys.stderr)
 
             if not path or not os.path.isfile(path):
                 writer.writerow(make_row(row, verdict="FILE_NOT_FOUND"))
                 error_count += 1
+                out_f.flush()
                 continue
+
+            cur_size, cur_mtime = file_signature(path)
 
             check_disk_space(temp_dir, MIN_FREE_SPACE_MB)
             sample_path = os.path.join(temp_dir, f"sample_{i}.wav")
 
             if not extract_sample(path, sample_path):
-                writer.writerow(make_row(row, verdict="EXTRACTION_FAILED"))
+                writer.writerow(make_row(row, verdict="EXTRACTION_FAILED",
+                                         size=cur_size, mtime=cur_mtime))
                 error_count += 1
+                out_f.flush()
                 continue
 
             try:
                 lang, prob = detect_language(model, sample_path)
             except Exception as e:
                 print(f"  Whisper detection failed: {e}", file=sys.stderr)
-                writer.writerow(make_row(row, verdict="DETECTION_FAILED"))
+                writer.writerow(make_row(row, verdict="DETECTION_FAILED",
+                                         size=cur_size, mtime=cur_mtime))
                 error_count += 1
+                out_f.flush()
                 continue
             finally:
                 # Always clean up the sample immediately to keep disk usage minimal
@@ -304,16 +396,18 @@ def main():
 
             print(f"  -> detected: {lang} ({prob:.0%}) | declared: {declared} | {verdict}", file=sys.stderr)
 
-            writer.writerow(make_row(row, detected=lang, confidence=f"{prob:.2f}", verdict=verdict))
+            writer.writerow(make_row(row, detected=lang, confidence=f"{prob:.2f}",
+                                     verdict=verdict, size=cur_size, mtime=cur_mtime))
             out_f.flush()
     finally:
         out_f.close()
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     print("\n--- Summary ---", file=sys.stderr)
+    print(f"Reused unchanged:             {len(kept_rows)}", file=sys.stderr)
     print(f"Mistagged (actually Italian): {mistagged_count}", file=sys.stderr)
     print(f"Confirmed not Italian:        {confirmed_foreign_count}", file=sys.stderr)
-    print(f"Errors/skipped:               {error_count}", file=sys.stderr)
+    print(f"Errors this run:              {error_count}", file=sys.stderr)
     print(f"\nFull results written to: {args.output}", file=sys.stderr)
 
 
