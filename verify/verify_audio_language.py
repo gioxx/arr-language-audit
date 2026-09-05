@@ -18,16 +18,27 @@ dependency and disk-space checks first. You can also call it directly:
 
 By default, if the output CSV already exists, files already verified in it
 are reused on subsequent runs, so you can stop and resume a long scan.
+Rows are matched on (path, episode), not on the path alone: a single file
+holding a double episode is two Sonarr rows sharing one path, and each of
+them keeps its own verdict.
+
 A file is re-verified automatically when its size or mtime changed since
 the last run (it was replaced, re-encoded or re-downloaded), even though
 its path is unchanged. Rows written before this behaviour existed carry no
-stored size/mtime and are reused as-is until verified again.
+stored size/mtime and are reused as-is until verified again. An error row
+carrying no signature (typically FILE_NOT_FOUND from a run where the share
+was not mounted) is retried as soon as the file is visible again, and is
+never stamped with a signature it was not verified against.
 
-Rows in the output whose path is no longer in the phase 1 CSV: if the file
-also changed on disk (it was fixed), the stale verdict is dropped; if its
-signature still matches (the scan just had a narrower scope) or the file
-is gone, the row is kept. Use the orchestrator's "Reset reports" action to
-wipe everything and start over.
+Rows in the output whose (path, episode) is no longer in the phase 1 CSV:
+if the file also changed on disk (it was fixed), the stale verdict is
+dropped; if its signature still matches (the scan just had a narrower
+scope) or the file is gone, the row is kept. Use the orchestrator's
+"Reset reports" action to wipe everything and start over.
+
+--limit caps how many files are (re)verified in one run; the rows it cuts
+keep the verdict they already had, so a limited run never empties out the
+report.
 
     --retry-errors   also reprocess rows that previously failed
                      (FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)
@@ -82,6 +93,7 @@ from pathlib import Path
 from audit_common import (
     ERROR_VERDICTS,
     PHASE2_COLUMNS,
+    RETRYABLE_VERDICTS,
     VERDICT_CONFIRMED,
     VERDICT_DETECTION_FAILED,
     VERDICT_EXTRACTION_FAILED,
@@ -294,38 +306,57 @@ def file_signature(path: str) -> tuple[int | None, int | None]:
         return None, None
 
 
-def load_previous_rows(output_path: str) -> dict:
-    """path -> the previous run's output row (dict), for resume decisions.
-    Empty when there is no readable previous output."""
-    previous = {}
+def row_key(row: Mapping[str, str]) -> tuple[str, str]:
+    """(path, episode) -- what identifies a row across runs.
+
+    The path alone is not enough: a file holding a double episode appears in
+    the phase 1 CSV once per episode, and keying on the path made those two
+    rows overwrite each other on every resume."""
+    return ((row.get("Path") or "").strip(), (row.get("Episode") or "").strip())
+
+
+def load_previous_rows(output_path: str) -> dict[tuple[str, str], dict]:
+    """(path, episode) -> the previous run's output row (dict), for resume
+    decisions. Empty when there is no readable previous output."""
+    previous: dict[tuple[str, str], dict] = {}
     if not os.path.isfile(output_path):
         return previous
     with open(output_path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            path = (row.get("Path", "") or "").strip()
-            if path:
-                previous[path] = row
+            key = row_key(row)
+            if key[0]:
+                previous[key] = row
     return previous
 
 
 def resume_decision(entry, cur_size, cur_mtime, retry_errors: bool) -> str:
     """Decide what to do with an input row we have a previous verdict for.
 
-        entry         previous output row for this path, or None
+        entry         previous output row for this (path, episode), or None
         cur_size      current file size in bytes, or None if the file is gone
         cur_mtime     current file mtime (epoch seconds), or None if gone
-        retry_errors  reprocess rows whose previous verdict was an error
+        retry_errors  reprocess rows whose previous verdict is retryable
+                      (RETRYABLE_VERDICTS: the three error verdicts, plus
+                      LOW_CONFIDENCE once the detector produces it)
 
     Returns 'verify' (run detection again and replace the old row) or
     'keep' (reuse the previous verdict unchanged)."""
     if entry is None:
         return "verify"
-    if retry_errors and (entry.get("Verdict", "") or "") in ERROR_VERDICTS:
+    verdict = (entry.get("Verdict", "") or "").strip()
+    if retry_errors and verdict in RETRYABLE_VERDICTS:
         return "verify"
 
     prev_size = (entry.get("FileSize", "") or "").strip()
     prev_mtime = (entry.get("FileMtime", "") or "").strip()
     if not prev_size or not prev_mtime:
+        if verdict in ERROR_VERDICTS and cur_size is not None and cur_mtime is not None:
+            # An error row was never given a signature (FILE_NOT_FOUND is
+            # written without one, and so is every row from a run older than
+            # signatures). The file is readable again now, so the reason for
+            # the error may be gone: verify instead of carrying the failure
+            # forward for ever.
+            return "verify"
         # Legacy row from before signatures were recorded: fall back to the
         # old path-only behaviour (keep). It gets a signature stamped on
         # this run, so change detection works for it from now on.
@@ -334,9 +365,131 @@ def resume_decision(entry, cur_size, cur_mtime, retry_errors: bool) -> str:
         # File not visible right now (unmounted share, transient error):
         # do not churn, keep the previous verdict.
         return "keep"
-    if str(cur_size) == prev_size and str(cur_mtime) == prev_mtime:
-        return "keep"
-    return "verify"
+    unchanged = str(cur_size) == prev_size and str(cur_mtime) == prev_mtime
+    return "keep" if unchanged else "verify"
+
+
+def normalise_previous(row: Mapping[str, str], size=None, mtime=None) -> dict:
+    """A row read back from a previous output CSV, reshaped to the current
+    schema. Missing columns (older CSV) become "". A fresh signature is
+    stamped on when one is passed, so legacy rows pick one up without being
+    re-verified."""
+    out = {k: (row.get(k, "") or "") for k in PHASE2_COLUMNS}
+    if size is not None:
+        out["FileSize"] = str(size)
+    if mtime is not None:
+        out["FileMtime"] = str(mtime)
+    return out
+
+
+def make_row(row: Mapping[str, str], *, detected="", confidence="", verdict="",
+             size=None, mtime=None) -> dict:
+    """An output row for an input row this run verified (or failed to).
+
+    Keyword-only past `row`: six same-typed slots read as noise at the call
+    site, and a mistyped one would silently land in the wrong column."""
+    return {
+        "App": row.get("App", ""),
+        "Title": row.get("Title", ""),
+        "Year": row.get("Year", ""),
+        "Episode": row.get("Episode", ""),
+        "DeclaredAudioLanguages": row.get("AudioLanguages", ""),
+        "DetectedLanguage": detected,
+        "Confidence": confidence,
+        "Verdict": verdict,
+        "Path": row.get("Path", ""),
+        "FileSize": "" if size is None else str(size),
+        "FileMtime": "" if mtime is None else str(mtime),
+    }
+
+
+@dataclass
+class Plan:
+    """What a run has to do, decided before anything is opened for writing.
+
+    kept           finished output rows reused unchanged (input order)
+    to_verify      input rows needing detection (input order, already limited)
+    deferred       previous rows for the rows --limit cut from to_verify
+    orphans        previous rows whose key is no longer in the input
+    dropped_stale  previous rows discarded because the file was fixed
+    """
+
+    kept: list[dict]
+    to_verify: list[dict]
+    deferred: list[dict]
+    orphans: list[dict]
+    dropped_stale: int
+
+
+def plan_rows(input_rows, previous, *, retry_errors: bool, limit: int,
+              signature=file_signature) -> Plan:
+    """Split the input into reuse / re-verify / defer, and sort out the
+    previous rows the input no longer mentions.
+
+    Pure apart from `signature`, which is the only way it learns anything
+    about the disk -- and is called at most once per distinct path, however
+    many rows share it."""
+    cache: dict[str, tuple] = {}
+
+    def signature_of(path: str):
+        if path not in cache:
+            cache[path] = signature(path)
+        return cache[path]
+
+    kept = []
+    pending = []       # (input row, its previous row or None), input order
+    seen = set()
+    for row in input_rows:
+        key = row_key(row)
+        if not key[0]:
+            # No path at all: not a resume question. The detection loop
+            # records it as FILE_NOT_FOUND.
+            pending.append((row, None))
+            continue
+        seen.add(key)
+        cur_size, cur_mtime = signature_of(key[0])
+        entry = previous.get(key)
+        if resume_decision(entry, cur_size, cur_mtime, retry_errors) == "verify":
+            pending.append((row, entry))
+            continue
+        # A kept error row must not be stamped with a signature it was never
+        # verified against, or resume_decision can never retry it again.
+        if (entry.get("Verdict", "") or "").strip() in ERROR_VERDICTS:
+            kept.append(normalise_previous(entry))
+        else:
+            kept.append(normalise_previous(entry, cur_size, cur_mtime))
+
+    # --limit caps the work, not the report: a row cut from this run keeps
+    # the verdict it already had instead of disappearing from the output.
+    cut = pending[limit:] if limit > 0 else []
+    to_verify = [row for row, _ in (pending[:limit] if limit > 0 else pending)]
+    deferred = [normalise_previous(entry) for _row, entry in cut if entry is not None]
+
+    # Previous verdicts whose file is no longer listed by phase 1. Two cases:
+    #  - the file changed on disk (signature differs) and is no longer
+    #    flagged: it was fixed, the old verdict is stale -> drop the row so
+    #    the report does not keep showing a wrong result.
+    #  - anything else (signature still matches, file gone, or a legacy row
+    #    with no signature): keep it. A matching signature usually means the
+    #    row is "orphaned" only because this scan had a narrower scope
+    #    (SKIP_RADARR / SKIP_SONARR, an app that was down), and re-running a
+    #    full scan should not cost hours of re-verification.
+    orphans = []
+    dropped_stale = 0
+    for key, entry in previous.items():
+        if key in seen:
+            continue
+        prev_size = (entry.get("FileSize", "") or "").strip()
+        prev_mtime = (entry.get("FileMtime", "") or "").strip()
+        cur_size, cur_mtime = signature_of(key[0])
+        if (prev_size and prev_mtime and cur_size is not None
+                and (str(cur_size) != prev_size or str(cur_mtime) != prev_mtime)):
+            dropped_stale += 1
+            continue
+        orphans.append(normalise_previous(entry))
+
+    return Plan(kept=kept, to_verify=to_verify, deferred=deferred,
+                orphans=orphans, dropped_stale=dropped_stale)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -370,7 +523,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV from find-missing-italian-audio.sh")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output CSV path")
     parser.add_argument("--limit", type=int, default=0,
-                        help="Only (re)verify the first N files that need it (0 = all)")
+                        help="Only (re)verify the first N files that need it (0 = all); "
+                             "the rows it cuts keep the verdict they already had")
     parser.add_argument("--retry-errors", action="store_true",
                         help="Also reprocess rows that previously failed "
                              "(FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)")
@@ -423,105 +577,81 @@ def main(argv: list[str] | None = None) -> int:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def verify_one(row, model, cfg: Config, temp_dir: str, index: int) -> dict:
+    """Detect one file's spoken language and return its finished output row.
+
+    Every failure short of "the disk filled up" is a verdict, not an
+    exception: one unreadable file must never end the run."""
+    path = (row.get("Path", "") or "").strip()
+    if not path or not os.path.isfile(path):
+        return make_row(row, verdict=VERDICT_FILE_NOT_FOUND)
+
+    cur_size, cur_mtime = file_signature(path)
+
+    check_disk_space(temp_dir, cfg.min_free_space_mb)
+    sample_path = os.path.join(temp_dir, f"sample_{index}.wav")
+
+    if not extract_sample(path, sample_path, cfg):
+        return make_row(row, verdict=VERDICT_EXTRACTION_FAILED,
+                        size=cur_size, mtime=cur_mtime)
+
+    try:
+        lang, prob = detect_language(model, sample_path)
+    except Exception as e:  # noqa: BLE001
+        # Whisper can fail in many ways; each is a DETECTION_FAILED row.
+        log(f"  Whisper detection failed: {str(e)[:MAX_ERROR_CHARS]}")
+        return make_row(row, verdict=VERDICT_DETECTION_FAILED,
+                        size=cur_size, mtime=cur_mtime)
+    finally:
+        # Always clean up the sample immediately to keep disk usage minimal
+        if os.path.exists(sample_path):
+            os.remove(sample_path)
+
+    if lang is None:
+        # Silence, or VAD stripped everything: no language to compare.
+        log("  Whisper detection failed: no language identified.")
+        return make_row(row, verdict=VERDICT_DETECTION_FAILED,
+                        size=cur_size, mtime=cur_mtime)
+
+    declared = row.get("AudioLanguages", "")
+    verdict = VERDICT_MISTAGGED if is_italian(lang) else VERDICT_CONFIRMED
+    log(f"  -> detected: {lang} ({prob:.0%}) | declared: {declared} | {verdict}")
+    return make_row(row, detected=lang, confidence=f"{prob:.2f}", verdict=verdict,
+                    size=cur_size, mtime=cur_mtime)
+
+
+def _log_plan(plan: Plan, total: int) -> None:
+    if plan.kept:
+        log(f"Reusing {len(plan.kept)} previous verdict(s) for unchanged files.")
+    if plan.deferred:
+        log(f"Deferring {len(plan.deferred)} row(s) beyond --limit; their previous "
+            "verdicts are kept.")
+    if plan.orphans:
+        log(f"Carrying over {len(plan.orphans)} row(s) whose file is no longer "
+            "in the phase 1 CSV.")
+    if plan.dropped_stale:
+        log(f"Dropped {plan.dropped_stale} stale row(s): file changed and is no longer "
+            "flagged by phase 1.")
+    log(f"Loaded {total} suspect file(s) total, "
+        f"{len(plan.to_verify)} to (re)verify now.")
+
+
 def _run(args, cfg: Config, temp_dir: str) -> int:
     check_disk_space(temp_dir, cfg.min_free_space_mb)
-
-    fieldnames = list(PHASE2_COLUMNS)
-
-    def norm_prev(row, size=None, mtime=None):
-        # A row read back from a previous output CSV, reshaped to the current
-        # schema. Missing columns (older CSV) become "". A fresh signature is
-        # stamped on when the file is still readable, so legacy rows pick one
-        # up without being re-verified.
-        out = {k: (row.get(k, "") or "") for k in fieldnames}
-        if size is not None:
-            out["FileSize"] = str(size)
-        if mtime is not None:
-            out["FileMtime"] = str(mtime)
-        return out
-
-    def make_row(row, *, detected="", confidence="", verdict="", size=None, mtime=None):
-        return {
-            "App": row.get("App", ""),
-            "Title": row.get("Title", ""),
-            "Year": row.get("Year", ""),
-            "Episode": row.get("Episode", ""),
-            "DeclaredAudioLanguages": row.get("AudioLanguages", ""),
-            "DetectedLanguage": detected,
-            "Confidence": confidence,
-            "Verdict": verdict,
-            "Path": row.get("Path", ""),
-            "FileSize": "" if size is None else str(size),
-            "FileMtime": "" if mtime is None else str(mtime),
-        }
 
     with open(args.input, newline="", encoding="utf-8") as f:
         all_rows = list(csv.DictReader(f))
 
     previous = {} if args.no_resume else load_previous_rows(args.output)
-    input_paths = {
-        (r.get("Path", "") or "").strip()
-        for r in all_rows if (r.get("Path", "") or "").strip()
-    }
-
-    # Split the input into "already known, unchanged" (reuse the verdict)
-    # and "needs (re)verification" (new file, or size/mtime changed).
-    kept_rows = []      # finished output rows, input order
-    to_verify = []      # input rows still needing detection, input order
-    for row in all_rows:
-        path = (row.get("Path", "") or "").strip()
-        if not path:
-            to_verify.append(row)          # worker will record FILE_NOT_FOUND
-            continue
-        cur_size, cur_mtime = file_signature(path)
-        entry = previous.get(path)
-        if resume_decision(entry, cur_size, cur_mtime, args.retry_errors) == "keep":
-            kept_rows.append(norm_prev(entry, cur_size, cur_mtime))
-        else:
-            to_verify.append(row)
-
-    # Previous verdicts whose file is no longer listed by phase 1. Two cases:
-    #  - the file changed on disk (signature differs) and is no longer
-    #    flagged: it was fixed, the old verdict is stale -> drop the row so
-    #    the report does not keep showing a wrong result.
-    #  - anything else (signature still matches, file gone, or a legacy row
-    #    with no signature): keep it. A matching signature usually means the
-    #    row is "orphaned" only because this scan had a narrower scope
-    #    (SKIP_RADARR / SKIP_SONARR, an app that was down), and re-running a
-    #    full scan should not cost hours of re-verification.
-    orphan_rows = []
-    dropped_stale = 0
-    for p, r in previous.items():
-        if p in input_paths:
-            continue
-        prev_size = (r.get("FileSize", "") or "").strip()
-        prev_mtime = (r.get("FileMtime", "") or "").strip()
-        cur_size, cur_mtime = file_signature(p)
-        if (prev_size and prev_mtime and cur_size is not None
-                and (str(cur_size) != prev_size or str(cur_mtime) != prev_mtime)):
-            dropped_stale += 1
-            continue
-        orphan_rows.append(norm_prev(r))
-
-    if args.limit > 0:
-        to_verify = to_verify[: args.limit]
-
-    if kept_rows:
-        log(f"Reusing {len(kept_rows)} previous verdict(s) for unchanged files.")
-    if orphan_rows:
-        log(f"Carrying over {len(orphan_rows)} row(s) whose file is no longer "
-            "in the phase 1 CSV.")
-    if dropped_stale:
-        log(f"Dropped {dropped_stale} stale row(s): file changed and is no longer "
-            "flagged by phase 1.")
-    log(f"Loaded {len(all_rows)} suspect file(s) total, "
-        f"{len(to_verify)} to (re)verify now.")
+    plan = plan_rows(all_rows, previous, retry_errors=args.retry_errors,
+                     limit=args.limit)
+    _log_plan(plan, len(all_rows))
 
     # The model is loaded BEFORE the output is opened for writing: opening it
     # truncates the previous run's verdicts, and a missing package or a failed
     # model download must not cost hours of already-done work.
     model = None
-    if to_verify:
+    if plan.to_verify:
         try:
             model = load_model(cfg)
         except (ImportError, OSError) as e:
@@ -530,8 +660,9 @@ def _run(args, cfg: Config, temp_dir: str) -> int:
             log(f"'{args.output}' was left untouched.")
             return EXIT_ERROR
 
-    # Always rewrite the output in full: kept + carried-over rows first, so a
-    # crash during detection still leaves a complete, valid CSV.
+    # Always rewrite the output in full: every row we already have a verdict
+    # for goes out first, so a crash during detection still leaves a
+    # complete, valid CSV.
     # SIM115: deliberately not a context manager -- the handle lives for the
     # whole detection loop and is flushed after every row, so an abort leaves a
     # complete file behind. It is closed in the finally below.
@@ -539,92 +670,38 @@ def _run(args, cfg: Config, temp_dir: str) -> int:
         out_f = open(args.output, "w", newline="", encoding="utf-8")  # noqa: SIM115
     except OSError as e:
         raise WorkerError(f"cannot write '{args.output}': {e}") from e
+    counts: dict[str, int] = {}
     try:
-        writer = csv.DictWriter(out_f, fieldnames=fieldnames)
+        writer = csv.DictWriter(out_f, fieldnames=list(PHASE2_COLUMNS))
         writer.writeheader()
-        for r in kept_rows:
-            writer.writerow(r)
-        for r in orphan_rows:
+        for r in plan.kept + plan.deferred + plan.orphans:
             writer.writerow(r)
         out_f.flush()
 
-        if not to_verify:
+        if not plan.to_verify:
             log("Nothing new to verify.")
             return EXIT_OK
 
-        mistagged_count = 0
-        confirmed_foreign_count = 0
-        error_count = 0
-
-        def record_error(row, verdict, size=None, mtime=None):
-            """One file this run could not verify: a row on disk, a bump in
-            the count, flushed so an abort leaves a complete CSV behind."""
-            nonlocal error_count
-            writer.writerow(make_row(row, verdict=verdict, size=size, mtime=mtime))
-            error_count += 1
+        for i, row in enumerate(plan.to_verify, start=1):
+            log(f"[{i}/{len(plan.to_verify)}] {row.get('Title', '')} ...")
+            out_row = verify_one(row, model, cfg, temp_dir, i)
+            writer.writerow(out_row)
+            # Flushed after every row so an abort leaves a complete CSV behind.
             out_f.flush()
-
-        for i, row in enumerate(to_verify, start=1):
-            path = (row.get("Path", "") or "").strip()
-            title = row.get("Title", "")
-            log(f"[{i}/{len(to_verify)}] {title} ...")
-
-            if not path or not os.path.isfile(path):
-                record_error(row, VERDICT_FILE_NOT_FOUND)
-                continue
-
-            cur_size, cur_mtime = file_signature(path)
-
-            check_disk_space(temp_dir, cfg.min_free_space_mb)
-            sample_path = os.path.join(temp_dir, f"sample_{i}.wav")
-
-            if not extract_sample(path, sample_path, cfg):
-                record_error(row, VERDICT_EXTRACTION_FAILED, cur_size, cur_mtime)
-                continue
-
-            try:
-                lang, prob = detect_language(model, sample_path)
-            except Exception as e:  # noqa: BLE001
-                # Whisper can fail in many ways; each is a DETECTION_FAILED row.
-                log(f"  Whisper detection failed: {str(e)[:MAX_ERROR_CHARS]}")
-                record_error(row, VERDICT_DETECTION_FAILED, cur_size, cur_mtime)
-                continue
-            finally:
-                # Always clean up the sample immediately to keep disk usage minimal
-                if os.path.exists(sample_path):
-                    os.remove(sample_path)
-
-            if lang is None:
-                # Silence, or VAD stripped everything: no language to compare.
-                log("  Whisper detection failed: no language identified.")
-                record_error(row, VERDICT_DETECTION_FAILED, cur_size, cur_mtime)
-                continue
-
-            declared = row.get("AudioLanguages", "")
-            if is_italian(lang):
-                verdict = VERDICT_MISTAGGED
-                mistagged_count += 1
-            else:
-                verdict = VERDICT_CONFIRMED
-                confirmed_foreign_count += 1
-
-            log(f"  -> detected: {lang} ({prob:.0%}) | declared: {declared} | {verdict}")
-
-            writer.writerow(make_row(row, detected=lang, confidence=f"{prob:.2f}",
-                                     verdict=verdict, size=cur_size, mtime=cur_mtime))
-            out_f.flush()
+            counts[out_row["Verdict"]] = counts.get(out_row["Verdict"], 0) + 1
     finally:
         out_f.close()
 
+    error_count = sum(n for v, n in counts.items() if v in ERROR_VERDICTS)
     log("\n--- Summary ---")
-    log(f"Reused unchanged:             {len(kept_rows)}")
-    log(f"Dropped (fixed, unflagged):   {dropped_stale}")
-    log(f"Mistagged (actually Italian): {mistagged_count}")
-    log(f"Confirmed not Italian:        {confirmed_foreign_count}")
+    log(f"Reused unchanged:             {len(plan.kept)}")
+    log(f"Dropped (fixed, unflagged):   {plan.dropped_stale}")
+    log(f"Mistagged (actually Italian): {counts.get(VERDICT_MISTAGGED, 0)}")
+    log(f"Confirmed not Italian:        {counts.get(VERDICT_CONFIRMED, 0)}")
     log(f"Errors this run:              {error_count}")
     log(f"\nFull results written to: {args.output}")
 
-    if error_count == len(to_verify):
+    if error_count == len(plan.to_verify):
         log("ERROR: every file errored this run -- nothing was verified.")
         log("Check that the media paths are mounted and readable.")
         return EXIT_ALL_FAILED
