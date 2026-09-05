@@ -40,15 +40,20 @@
 # case. Non-interactive runs (cron, CI, piped input) skip the wizard and
 # rely purely on environment variables / an existing .env file.
 #
+# The report is written to "<OUTPUT_CSV>.tmp.<pid>" and moved into place only
+# by a run that completed. A run that could not list an enabled app, or that
+# was interrupted, therefore leaves the previous report exactly as it was: a
+# half-scanned library must never overwrite a good report.
+#
 # Environment variables (also read from a .env file, see usage()):
 #   RADARR_URL RADARR_API_KEY SKIP_RADARR
 #   SONARR_URL SONARR_API_KEY SKIP_SONARR
-#   FORCE_RESCAN RESCAN_TIMEOUT REFRESH
+#   FORCE_RESCAN RESCAN_TIMEOUT RESCAN_POLL_INTERVAL REFRESH
 #
 # Exit codes:
-#   0   completed (with or without findings)
+#   0   completed (with or without findings); the report was replaced
 #   1   missing dependency (jq / curl) or bad arguments
-#   2   an enabled app could not be listed; the CSV holds what was scanned
+#   2   an enabled app could not be listed; any previous report is untouched
 
 set -euo pipefail
 
@@ -71,6 +76,17 @@ US=$'\x1f'
 ITALIAN_REGEX='(^|[^a-z])(italian|ita|it-it)([^a-z]|$)'
 
 CSV_HEADER='App,Title,Year,Episode,AudioLanguages,Path'
+
+# What the wizard accepts. A base URL with a space in it is not a typo the
+# operator can be talked out of later: curl would reject it on every run, so it
+# is refused at the prompt. An API key is what both apps generate -- letters and
+# digits -- and anything else is a paste that picked up quotes or whitespace.
+WIZARD_URL_REGEX='^https?://[^[:space:]]+$'
+WIZARD_KEY_REGEX='^[A-Za-z0-9]+$'
+
+# The keys the wizard may write, and the only lines it writes.
+WIZARD_ENV_KEYS="RADARR_URL RADARR_API_KEY SKIP_RADARR \
+SONARR_URL SONARR_API_KEY SKIP_SONARR"
 
 # --- jq programs -----------------------------------------------------------
 #
@@ -236,7 +252,12 @@ Environment variables (also read from a .env file, see below):
                       the tags leaves the per-series signature untouched, and
                       a cache hit would hide exactly what was rescanned for
                                                               (default: false)
-  RESCAN_TIMEOUT      seconds to wait for a rescan to finish  (default: 300)
+  RESCAN_TIMEOUT      seconds to wait for a rescan to finish. A rescan that
+                      reports failed, aborted, cancelled or orphaned is not
+                      waited out; the scan warns and carries on
+                                                              (default: 900)
+  RESCAN_POLL_INTERVAL
+                      seconds between two rescan status polls (default: 5)
   REFRESH             true to ignore the Sonarr per-series cache
                                                               (default: false)
 
@@ -249,19 +270,29 @@ written by another version is discarded and rebuilt. Radarr is one request
 and is not cached.
 
 .env file: looked up in <repo>/.env, then <repo>/scan/.env; first match wins.
-The current working directory is deliberately not searched. A value already
-in the environment wins over the file, the file wins over the defaults above,
-and --refresh wins over both. Format is KEY=value, one per line. See
-.env.example in the repo root.
+The current working directory is deliberately not searched -- running the
+audit from a directory someone else can write must not change what it does.
+ALA_DOTENV_FILE, when set and non-empty, replaces that search with the file it
+names, and reports "no .env" rather than falling back if that file is absent.
+
+A value already in the environment wins over the file, the file wins over the
+defaults above, and --refresh wins over both. Format is KEY=value, one per
+line. See .env.example in the repo root.
 
 On first interactive run with no config, a wizard auto-detects local
-Radarr/Sonarr via the unauthenticated /ping endpoint and can save a .env.
+Radarr/Sonarr via the unauthenticated /ping endpoint and can save a .env with
+permissions 600. ARR_ASSUME_TTY=1 runs it without a terminal; ARR_LOCALHOST
+(default "localhost") is the host the /ping probe tries.
 
 Exit codes:
-  0   completed (with or without findings)
-  1   missing dependency (jq / curl) or bad arguments
-  2   an enabled app could not be listed after retries; the other app was
-      still scanned and the CSV holds everything that was
+  0   completed (with or without findings). The report is built in
+      "<OUTPUT_CSV>.tmp.<pid>" and moved into place here, so a reader never
+      sees a partial file.
+  1   missing dependency (jq / curl) or bad arguments.
+  2   an enabled app could not be listed after retries. The temporary file is
+      discarded, so a previous report survives untouched rather than being
+      replaced by a half-scanned one; with no previous report, none is
+      written. The findings that were made are still on stdout.
 EOF
 }
 
@@ -315,8 +346,20 @@ load_config() {
     SKIP_RADARR="${SKIP_RADARR:-false}"
     SKIP_SONARR="${SKIP_SONARR:-false}"
     FORCE_RESCAN="${FORCE_RESCAN:-false}"
-    RESCAN_TIMEOUT="${RESCAN_TIMEOUT:-300}"
+    RESCAN_TIMEOUT="${RESCAN_TIMEOUT:-900}"
+    RESCAN_POLL_INTERVAL="${RESCAN_POLL_INTERVAL:-5}"
     REFRESH="${REFRESH:-false}"
+
+    # Both are used in arithmetic and one of them bounds a loop: a value that
+    # is not a number, or a zero interval, would spin forever.
+    if [[ ! "$RESCAN_TIMEOUT" =~ ^[0-9]+$ ]]; then
+        warn "RESCAN_TIMEOUT is not a whole number of seconds; using 900."
+        RESCAN_TIMEOUT=900
+    fi
+    if [[ ! "$RESCAN_POLL_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+        warn "RESCAN_POLL_INTERVAL must be at least 1 second; using 5."
+        RESCAN_POLL_INTERVAL=5
+    fi
 
     if [[ "$REFRESH_FLAG" == "true" ]]; then
         REFRESH=true
@@ -326,6 +369,7 @@ load_config() {
     # the very thing the rescan was asked for.
     if is_true "$FORCE_RESCAN"; then
         REFRESH=true
+        log "FORCE_RESCAN implies --refresh"
     fi
 }
 
@@ -342,25 +386,63 @@ apply_defaults() {
 # SETUP WIZARD
 # ---------------------------------------------------------------------------
 
-is_interactive() { [[ -t 0 && -t 1 ]]; }
+# is_interactive -- may the wizard prompt? A terminal on both ends, or an
+# explicit ARR_ASSUME_TTY=1 for a caller that drives the prompts itself.
+is_interactive() {
+    [[ "${ARR_ASSUME_TTY:-}" == "1" ]] && return 0
+    [[ -t 0 && -t 1 ]]
+}
 
 # The unauthenticated /ping endpoint both apps expose: a local instance can be
-# detected without an API key.
+# detected without an API key. ARR_LOCALHOST is what "local" means, so a test
+# can point the probe somewhere that is not the developer's own Radarr.
 probe_local_port() {
     local port="$1"
-    curl -sf -m 2 "http://localhost:$port/ping" 2>/dev/null |
+    curl -sf -m 2 "http://${ARR_LOCALHOST:-localhost}:$port/ping" 2>/dev/null |
         grep -q '"status"[[:space:]]*:[[:space:]]*"OK"'
 }
 
+# ask <out-var> <prompt> <regex> <default> <secret> <hint> -- read one value,
+# validate it, and re-prompt exactly once before giving up with rc 1. One
+# retry, not a loop: a scripted stdin that keeps answering wrongly must end,
+# and a human who has typed the same mistake twice wants to go and look it up.
+ask() {
+    local out_var="$1" prompt="$2" regex="$3" default="$4" secret="$5" hint="$6"
+    local attempt=1 value
+
+    while [[ "$attempt" -le 2 ]]; do
+        value=""
+        if [[ -n "$secret" ]]; then
+            # The prompt goes to stderr on its own: -s means the answer never
+            # reaches the terminal, so nothing closes the line.
+            read -r -s -p "$prompt" value || value=""
+            echo "" >&2
+        else
+            read -r -p "$prompt" value || value=""
+        fi
+        [[ -n "$value" ]] || value="$default"
+        if [[ "$value" =~ $regex ]]; then
+            printf -v "$out_var" '%s' "$value"
+            return 0
+        fi
+        # The value itself is never echoed back: one of the two this function
+        # asks for is an API key.
+        warn "$hint"
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
 # prompt_app_config <label> <port> <url-var> <key-var> <skip-var> -- fills the
-# named variables in for one app.
+# named variables in for one app. rc 1 when a value was rejected twice, which
+# is what abandons the save.
 prompt_app_config() {
     local app_label="$1" default_port="$2" url_var="$3" key_var="$4" skip_var="$5"
-    local ans detected_url="" input_url input_key
+    local ans detected_url="" url_prompt url_value key_value
 
-    echo ""
-    echo "--- $app_label setup ---"
-    read -r -p "Configure $app_label? [Y/n]: " ans
+    log ""
+    log "--- $app_label setup ---"
+    read -r -p "Configure $app_label? [Y/n]: " ans || ans=""
     if [[ "${ans:-Y}" =~ ^[Nn] ]]; then
         printf -v "$skip_var" "true"
         return 0
@@ -368,29 +450,51 @@ prompt_app_config() {
 
     log "Looking for a local $app_label instance on port $default_port..."
     if probe_local_port "$default_port"; then
-        detected_url="http://localhost:$default_port"
+        detected_url="http://${ARR_LOCALHOST:-localhost}:$default_port"
         log "  Found: $detected_url"
     else
         log "  Not detected automatically."
     fi
 
     if [[ -n "$detected_url" ]]; then
-        read -r -p "$app_label URL [$detected_url]: " input_url
-        printf -v "$url_var" "%s" "${input_url:-$detected_url}"
+        url_prompt="$app_label URL [$detected_url]: "
     else
-        read -r -p "Enter the full $app_label URL (e.g. http://192.168.1.10:$default_port): " input_url
-        printf -v "$url_var" "%s" "$input_url"
+        url_prompt="Enter the full $app_label URL (e.g. http://192.168.1.10:$default_port): "
     fi
+    ask url_value "$url_prompt" "$WIZARD_URL_REGEX" "$detected_url" "" \
+        "not a usable URL: it must start with http:// or https:// and hold no spaces." ||
+        return 1
+    printf -v "$url_var" '%s' "$(normalize_url "$url_value")"
 
-    read -r -s -p "$app_label API key: " input_key
-    echo ""
-    printf -v "$key_var" "%s" "$input_key"
+    ask key_value "$app_label API key: " "$WIZARD_KEY_REGEX" "" secret \
+        "not a usable API key: letters and digits only, and it may not be empty." ||
+        return 1
+    printf -v "$key_var" '%s' "$key_value"
 }
 
-# run_wizard -- interactive first-run setup. A no-op unless stdin and stdout
-# are both a terminal and something an enabled app needs is missing.
+# write_env_file -- the allow-listed keys, one KEY=value per line.
+#
+# The redirection is INSIDE the subshell, after the umask: "( ... ) > file"
+# opens the file before the umask runs and the key would exist world-readable
+# for as long as the write takes. The chmod after it covers the other case --
+# ">" keeps an existing file's mode, which umask has no say over.
+write_env_file() {
+    local key
+    (
+        umask 077
+        {
+            for key in $WIZARD_ENV_KEYS; do
+                printf '%s=%s\n' "$key" "${!key:-}"
+            done
+        } > "$ENV_FILE"
+    )
+    chmod 600 "$ENV_FILE"
+}
+
+# run_wizard -- interactive first-run setup. A no-op unless the session is
+# interactive and something an enabled app needs is missing.
 run_wizard() {
-    local need_radarr=false need_sonarr=false save_ans
+    local need_radarr=false need_sonarr=false save_ans ok=true
 
     is_interactive || return 0
 
@@ -402,27 +506,29 @@ run_wizard() {
     fi
     [[ "$need_radarr" == "true" || "$need_sonarr" == "true" ]] || return 0
 
-    echo "No complete configuration found -- starting interactive setup."
+    log "No complete configuration found -- starting interactive setup."
     if [[ "$need_radarr" == "true" ]]; then
-        prompt_app_config "Radarr" 7878 RADARR_URL RADARR_API_KEY SKIP_RADARR
+        prompt_app_config "Radarr" 7878 RADARR_URL RADARR_API_KEY SKIP_RADARR ||
+            ok=false
     fi
-    if [[ "$need_sonarr" == "true" ]]; then
-        prompt_app_config "Sonarr" 8989 SONARR_URL SONARR_API_KEY SKIP_SONARR
+    if [[ "$ok" == "true" && "$need_sonarr" == "true" ]]; then
+        prompt_app_config "Sonarr" 8989 SONARR_URL SONARR_API_KEY SKIP_SONARR ||
+            ok=false
     fi
 
-    echo ""
-    read -r -p "Save this configuration to $ENV_FILE for next time? [y/N]: " save_ans
+    # A rejected value stops the save, not the run: the scan goes on and fails
+    # its own API call, which says more than a .env full of something that
+    # cannot work.
+    if [[ "$ok" != "true" ]]; then
+        warn "configuration not saved: a value was rejected twice."
+        return 0
+    fi
+
+    log ""
+    read -r -p "Save this configuration to $ENV_FILE for next time? [y/N]: " save_ans ||
+        save_ans=""
     if [[ "${save_ans:-N}" =~ ^[Yy] ]]; then
-        {
-            echo "RADARR_URL=$RADARR_URL"
-            echo "RADARR_API_KEY=$RADARR_API_KEY"
-            echo "SKIP_RADARR=$SKIP_RADARR"
-            echo ""
-            echo "SONARR_URL=$SONARR_URL"
-            echo "SONARR_API_KEY=$SONARR_API_KEY"
-            echo "SKIP_SONARR=$SKIP_SONARR"
-        } > "$ENV_FILE"
-        chmod 600 "$ENV_FILE"
+        write_env_file
         log "Configuration saved to $ENV_FILE (permissions restricted to your user)."
     fi
 }
@@ -434,9 +540,18 @@ run_wizard() {
 # wait_for_command <url> <key> <command> -- queue a RescanMovie/RescanSeries
 # and poll /api/v3/command/<id> until it settles, so the app re-reads the
 # files on disk instead of serving cached mediaInfo.
+#
+# Each poll is a single attempt (arr_get ... 1): retrying a status read three
+# times inside a loop that is already a retry only makes the timeout mean
+# three different things, and -m still bounds each one.
+#
+# rc 0 only for "completed". Every other terminal state, and the timeout, warn
+# and return 1: the caller carries on with whatever mediaInfo the app has, on
+# the grounds that a stale tag is still worth reporting.
 wait_for_command() {
     local base_url="$1" api_key="$2" command_name="$3"
-    local cmd_id body status elapsed=0 interval=5
+    local cmd_id body status elapsed=0
+    local interval="${RESCAN_POLL_INTERVAL:-5}"
 
     if ! body=$(arr_post "$base_url/api/v3/command" "$api_key" \
         "{\"name\":\"$command_name\"}"); then
@@ -456,14 +571,19 @@ wait_for_command() {
         if body=$(arr_get "$base_url/api/v3/command/$cmd_id" "$api_key" 1); then
             status=$(printf '%s' "$body" | jq -r '.status // empty' | tr -d '\r')
         fi
-        if [[ "$status" == "completed" ]]; then
-            log "  $command_name completed."
-            return 0
-        fi
-        if [[ "$status" == "failed" ]]; then
-            warn "$command_name reported status 'failed'."
-            return 1
-        fi
+        case "$status" in
+            completed)
+                log "  $command_name completed."
+                return 0
+                ;;
+            failed | aborted | cancelled | orphaned)
+                # Terminal, and it will not become "completed" by waiting:
+                # polling on to the timeout would cost RESCAN_TIMEOUT seconds
+                # to learn what this poll already said.
+                warn "$command_name reported status '$status'."
+                return 1
+                ;;
+        esac
         sleep "$interval"
         elapsed=$((elapsed + interval))
     done
@@ -737,32 +857,45 @@ scan_sonarr() {
 # SUMMARY
 # ---------------------------------------------------------------------------
 
-# report_summary -- rc 2 when an enabled app could not be listed.
-report_summary() {
+# failed_apps -- the enabled apps whose list fetch failed, "" if none. The
+# order is fixed so the message does not depend on which one failed first.
+failed_apps() {
     local failed=""
 
     if [[ "$radarr_failed" == "true" ]]; then failed="Radarr"; fi
     if [[ "$sonarr_failed" == "true" ]]; then
         if [[ -n "$failed" ]]; then failed="$failed, Sonarr"; else failed="Sonarr"; fi
     fi
+    printf '%s\n' "$failed"
+}
+
+# report_summary <failed-apps> <kept-previous> -- the closing lines. main owns
+# the exit code and the file, this only says what happened.
+report_summary() {
+    local failed="$1" kept="$2"
 
     log ""
     if [[ -n "$failed" ]]; then
         # Never "nothing was found": nothing was found *here*, and the part of
-        # the library nobody reached is exactly the part nobody checked.
+        # the library nobody reached is exactly the part nobody checked. The
+        # rows are on stdout; they are deliberately not on disk, because a
+        # half-scanned library replacing a complete report is a silent
+        # regression in the report nobody would notice.
         log "Found $found_count file(s) without Italian audio in what was scanned."
-        log "Results exported to $OUTPUT_CSV"
-        log "scan incomplete: $failed unreachable"
-        return 2
+        if [[ "$kept" == "true" ]]; then
+            log "scan incomplete: $failed unreachable; previous report kept"
+        else
+            log "scan incomplete: $failed unreachable; no report written"
+        fi
+        return 0
     fi
 
     if [[ "$found_count" -eq 0 ]]; then
         log "No files missing Italian audio were found."
-        log "Results exported to $OUTPUT_CSV"
     else
         log "Found $found_count file(s) without Italian audio."
-        log "Results exported to $OUTPUT_CSV"
     fi
+    log "Results exported to $OUTPUT_CSV"
     return 0
 }
 
@@ -774,6 +907,12 @@ cleanup() {
     if [[ -n "${TMP_DIR:-}" ]]; then
         rm -rf "$TMP_DIR"
         TMP_DIR=""
+    fi
+    # The half-written report. main clears OUT_TMP once it has moved it into
+    # place, so a completed run has nothing here to remove.
+    if [[ -n "${OUT_TMP:-}" ]]; then
+        rm -f -- "$OUT_TMP"
+        OUT_TMP=""
     fi
     return 0
 }
@@ -791,7 +930,7 @@ on_signal() {
 }
 
 main() {
-    local rc=0
+    local rc=0 failed kept=false
 
     parse_args "$@"
     require jq curl
@@ -811,6 +950,18 @@ main() {
     # statistics) and the rows that series produced last time.
     SONARR_CACHE_FILE="${OUTPUT_CSV%.csv}.cache.json"
 
+    # Was there a report before this run? It decides what an incomplete run
+    # has to say for itself, and it is read before anything is written.
+    if [[ -f "$OUTPUT_CSV" ]]; then
+        kept=true
+    fi
+
+    # The report is built beside its destination -- same directory, so the move
+    # is a rename and never a copy across filesystems -- and moved into place
+    # only by a run that completed. A reader therefore sees either the previous
+    # report or the new one, never half of either.
+    OUT_TMP="$OUTPUT_CSV.tmp.$$"
+
     TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ala-scan.XXXXXX")"
     trap cleanup EXIT
     trap 'on_signal INT' INT
@@ -820,7 +971,7 @@ main() {
 
     # Zero findings still leaves a report: a header-only CSV says "this ran and
     # found nothing", where a missing file says nothing at all.
-    CSV_TARGET="$OUTPUT_CSV"
+    CSV_TARGET="$OUT_TMP"
     printf '%s\n' "$CSV_HEADER" > "$CSV_TARGET"
 
     found_count=0
@@ -834,7 +985,18 @@ main() {
         scan_sonarr
     fi
 
-    report_summary || rc=$?
+    failed="$(failed_apps)"
+    if [[ -n "$failed" ]]; then
+        rm -f -- "$OUT_TMP"
+        rc=2
+    else
+        # "--": OUTPUT_CSV comes from the command line and may start with a
+        # dash. Both paths are in the same directory, so this is atomic.
+        mv -f -- "$OUT_TMP" "$OUTPUT_CSV"
+    fi
+    OUT_TMP=""
+
+    report_summary "$failed" "$kept"
     return "$rc"
 }
 

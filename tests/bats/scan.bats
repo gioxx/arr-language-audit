@@ -26,10 +26,12 @@ setup() {
     OUT="$BATS_TEST_TMPDIR/report.csv"
     CACHE="$BATS_TEST_TMPDIR/report.cache.json"
 
-    # No sleeping between retries, and an explicit configuration so a .env in
-    # the developer's checkout cannot change what these tests exercise
-    # (load_dotenv leaves a set, non-empty variable alone).
+    # No sleeping between retries, and ALA_DOTENV_FILE pointed at a file that
+    # does not exist, so a .env in the developer's checkout is never read.
+    # A test that wants a .env points ALA_DOTENV_FILE at its own (S25, S26,
+    # S33, S37); S27 unsets it to exercise the default search order.
     export ARR_RETRY_DELAY=0
+    export ALA_DOTENV_FILE="$BATS_TEST_TMPDIR/absent.env"
     export SKIP_RADARR=false SKIP_SONARR=false
     export REFRESH=false FORCE_RESCAN=false RESCAN_TIMEOUT=300
 }
@@ -97,6 +99,46 @@ assert_csv_has() {
         cat "$OUT" >&2
         return 1
     fi
+}
+
+# file_mode <path> -- the permission bits as three octal digits, on BSD and on
+# GNU stat alike.
+file_mode() {
+    stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"
+}
+
+# tmp_leftovers -- how many "<report>.tmp.<pid>" files survive next to $OUT. A
+# run that failed or was interrupted must leave none.
+tmp_leftovers() {
+    local dir
+    dir="$(dirname -- "$OUT")"
+    ls -1 "$dir" 2>/dev/null | grep -c '\.tmp\.[0-9]*$' || true
+}
+
+# command_posts <app> -- the bodies of every POST /<app>/api/v3/command, joined
+# with "|" so a test can assert on all of them at once.
+command_posts() {
+    "${REAL_JQ:-jq}" -s -r --arg app "$1" \
+        '[.[] | select(.method == "POST")
+              | select(.path == "/" + $app + "/api/v3/command") | .body]
+         | join("|")' "$FAKE_ARR_LOG"
+}
+
+# fake_env <path> -- a .env built from the committed .env.example with the fake
+# server's URLs and keys substituted in. Proves .env.example itself parses.
+fake_env() {
+    sed -e "s|^RADARR_URL=.*|RADARR_URL=$RADARR_URL|" \
+        -e "s|^RADARR_API_KEY=.*|RADARR_API_KEY=$RADARR_API_KEY|" \
+        -e "s|^SONARR_URL=.*|SONARR_URL=$SONARR_URL|" \
+        -e "s|^SONARR_API_KEY=.*|SONARR_API_KEY=$SONARR_API_KEY|" \
+        "$ROOT/.env.example" > "$1"
+}
+
+# forget_arr_env -- drop the connection settings start_fake_arr exported, so a
+# .env under test is the only place they can come from.
+forget_arr_env() {
+    unset RADARR_URL RADARR_API_KEY SONARR_URL SONARR_API_KEY
+    unset SKIP_RADARR SKIP_SONARR REFRESH FORCE_RESCAN RESCAN_TIMEOUT
 }
 
 # --------------------------------------------------------------------------
@@ -506,6 +548,450 @@ EOF
 }
 
 # --------------------------------------------------------------------------
+# S9-S11: a failed list fetch, retries, and the report that survives it
+# --------------------------------------------------------------------------
+
+@test "S9: a 401 from Radarr exits 2, keeps the report and still scans Sonarr" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+
+    # A complete run first, so there is a report worth protecting.
+    run_scan
+    assert_success
+    cp "$OUT" "$BATS_TEST_TMPDIR/before.csv"
+    : > "$FAKE_ARR_LOG"
+
+    # REFRESH so Sonarr really is re-scanned and prints its hit lines, rather
+    # than replaying the cache silently.
+    export RADARR_API_KEY="not-the-key" REFRESH=true
+
+    run_scan
+    assert_failure 2
+    assert_stderr_contains "Radarr scan failed"
+    assert_stderr_contains "scan incomplete: Radarr unreachable; previous report kept"
+    refute_stderr_contains "No files missing Italian audio were found."
+
+    # One app failing does not stop the other.
+    [[ "$output" == *'[Sonarr] Northbound - S01E01 - Due North -> audio: English'* ]] || {
+        printf 'Sonarr was not scanned; stdout was:\n%s\n' "$output" >&2
+        return 1
+    }
+    run arr_request_count "/sonarr/api/v3/series"
+    assert_output "1"
+
+    # And the report on disk is exactly the one the previous run left.
+    run cmp -s "$BATS_TEST_TMPDIR/before.csv" "$OUT"
+    assert_success
+    run tmp_leftovers
+    assert_output "0"
+}
+
+@test "S10: a persistent 500 is tried three times and the previous report survives" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    export SKIP_SONARR=true
+
+    run_scan
+    assert_success
+    cp "$OUT" "$BATS_TEST_TMPDIR/before.csv"
+    : > "$FAKE_ARR_LOG"
+
+    # More scheduled failures than there are attempts: every one gets a 500.
+    arr_control '{"fail_count": {"/radarr/api/v3/movie": 9}}'
+
+    run_scan
+    assert_failure 2
+    assert_stderr_contains "scan incomplete: Radarr unreachable; previous report kept"
+
+    # Three attempts, not one and not forever.
+    run arr_request_count "/radarr/api/v3/movie"
+    assert_output "3"
+
+    # Byte for byte the previous report, and no temporary file left behind.
+    run cmp -s "$BATS_TEST_TMPDIR/before.csv" "$OUT"
+    assert_success
+    run tmp_leftovers
+    assert_output "0"
+}
+
+@test "S10 twin: with no previous report a failed run writes none at all" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    export SKIP_SONARR=true
+    arr_control '{"fail_count": {"/radarr/api/v3/movie": 9}}'
+
+    run_scan
+    assert_failure 2
+    assert_stderr_contains "scan incomplete: Radarr unreachable; no report written"
+    refute_stderr_contains "previous report kept"
+
+    [ ! -f "$OUT" ]
+    run tmp_leftovers
+    assert_output "0"
+}
+
+@test "S11: two 500s then a 200 is a success, in three requests" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    export SKIP_SONARR=true
+    arr_control '{"fail_count": {"/radarr/api/v3/movie": 2}}'
+
+    run_scan
+    assert_success
+
+    run arr_request_count "/radarr/api/v3/movie"
+    assert_output "3"
+    assert_csv_has 'Radarr,"Salt and Iron",2018,,"English","/media/movies/Salt and Iron (2018)/Salt and Iron (2018).mkv"'
+}
+
+# --------------------------------------------------------------------------
+# S22-S24, S36: FORCE_RESCAN and the command poll
+# --------------------------------------------------------------------------
+
+@test "S22: FORCE_RESCAN rescans both apps and defeats the Sonarr cache" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+
+    run_scan
+    assert_success
+    : > "$FAKE_ARR_LOG"
+
+    export FORCE_RESCAN=true
+
+    run_scan
+    assert_success
+
+    assert_stderr_contains "FORCE_RESCAN implies --refresh"
+    assert_stderr_contains "RescanMovie completed."
+    assert_stderr_contains "RescanSeries completed."
+
+    run command_posts radarr
+    assert_output '{"name":"RescanMovie"}'
+    run command_posts sonarr
+    assert_output '{"name":"RescanSeries"}'
+
+    run arr_request_count "/radarr/api/v3/command/42"
+    [ "$output" -ge 1 ] || {
+        printf 'the command was never polled (%s GETs)\n' "$output" >&2
+        return 1
+    }
+
+    # The signature has not moved, and the series is fetched anyway: a rescan
+    # rewrites tags without changing the file count or the size on disk, so a
+    # cache hit would hide exactly what the rescan was asked for.
+    run episode_requests 1
+    assert_output "1"
+    refute_stderr_contains "[cache]"
+}
+
+@test "S23: RESCAN_TIMEOUT=0 gives up at once and still writes the report" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    export SKIP_SONARR=true FORCE_RESCAN=true RESCAN_TIMEOUT=0
+
+    local started elapsed
+    started="$(date +%s)"
+    run_scan
+    assert_success
+    elapsed=$(( $(date +%s) - started ))
+
+    assert_stderr_contains "RescanMovie did not complete within 0s"
+    [ "$elapsed" -lt 2 ] || {
+        printf 'a zero timeout still slept: %ss\n' "$elapsed" >&2
+        return 1
+    }
+
+    run arr_request_count "/radarr/api/v3/command/42"
+    assert_output "0"
+    assert_csv_has 'Radarr,"Salt and Iron",2018,,"English","/media/movies/Salt and Iron (2018)/Salt and Iron (2018).mkv"'
+}
+
+@test "S24: a rescan that reports 'failed' warns and the scan continues" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    export SKIP_SONARR=true FORCE_RESCAN=true
+    arr_control '{"command_status": ["failed"]}'
+
+    run_scan
+    assert_success
+
+    assert_stderr_contains "RescanMovie reported status 'failed'."
+    assert_csv_has 'Radarr,"Salt and Iron",2018,,"English","/media/movies/Salt and Iron (2018)/Salt and Iron (2018).mkv"'
+}
+
+@test "S36: a rescan that reports 'aborted' warns and the scan continues" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    export SKIP_SONARR=true FORCE_RESCAN=true
+    arr_control '{"command_status": ["aborted"]}'
+
+    run_scan
+    assert_success
+
+    assert_stderr_contains "RescanMovie reported status 'aborted'."
+    assert_csv_has 'Radarr,"Salt and Iron",2018,,"English","/media/movies/Salt and Iron (2018)/Salt and Iron (2018).mkv"'
+}
+
+# --------------------------------------------------------------------------
+# S25-S27: where the configuration comes from
+# --------------------------------------------------------------------------
+
+@test "S25: the .env supplies the configuration and the environment overrides it" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+
+    local envfile="$BATS_TEST_TMPDIR/dot.env"
+    fake_env "$envfile"
+    grep -qx 'FORCE_RESCAN=false' "$envfile"
+
+    forget_arr_env
+    export ALA_DOTENV_FILE="$envfile"
+    export FORCE_RESCAN=true
+
+    run_scan
+    assert_success
+
+    # The URLs and the keys came from the file...
+    run arr_request_count "/radarr/api/v3/movie"
+    assert_output "1"
+    run arr_request_count "/sonarr/api/v3/series"
+    assert_output "1"
+
+    # ...and the environment beat the file's FORCE_RESCAN=false.
+    run command_posts radarr
+    assert_output '{"name":"RescanMovie"}'
+
+    # The committed .env.example parses without a single complaint.
+    refute_stderr_contains "ignoring"
+}
+
+@test "S26: a command substitution in a .env value is inert and arrives literally" {
+    local marker="$BATS_TEST_TMPDIR/pwned"
+    local evil="\$(touch $marker)key"
+
+    export FAKE_RADARR_KEY="$evil"
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+
+    local envfile="$BATS_TEST_TMPDIR/evil.env"
+    printf 'RADARR_URL=%s\n' "$RADARR_URL" > "$envfile"
+    printf 'RADARR_API_KEY=%s\n' "$evil" >> "$envfile"
+
+    forget_arr_env
+    export SKIP_SONARR=true
+    export ALA_DOTENV_FILE="$envfile"
+
+    run_scan
+    assert_success
+
+    # Nothing ran.
+    [ ! -e "$marker" ]
+
+    # key_ok is the server comparing what arrived against the literal string,
+    # so a true here is the key crossing curl unexpanded and unmangled.
+    run "$REAL_JQ" -s -r \
+        '[.[] | select(.path == "/radarr/api/v3/movie") | .key_ok] | join(",")' \
+        "$FAKE_ARR_LOG"
+    assert_output "true"
+}
+
+@test "S27: <repo>/.env beats <repo>/scan/.env and a .env in the CWD is ignored" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+
+    # A copy of the repository layout: the script derives its root from
+    # lib/common.sh, so these two files are the whole tree it needs.
+    local repo="$BATS_TEST_TMPDIR/repo" cwd="$BATS_TEST_TMPDIR/elsewhere"
+    local script="$repo/scan/find-missing-italian-audio.sh"
+    mkdir -p "$repo/lib" "$repo/scan" "$cwd"
+    cp "$ROOT/lib/common.sh" "$repo/lib/common.sh"
+    cp "$SCAN" "$script"
+
+    printf 'RADARR_URL=%s\nRADARR_API_KEY=%s\n' "$RADARR_URL" "$RADARR_API_KEY" \
+        > "$repo/.env"
+    printf 'RADARR_URL=%s\nRADARR_API_KEY=%s\n' "$RADARR_URL" "wrong-scan-key" \
+        > "$repo/scan/.env"
+    printf 'RADARR_URL=%s\nRADARR_API_KEY=%s\n' "$RADARR_URL" "wrong-cwd-key" \
+        > "$cwd/.env"
+
+    forget_arr_env
+    unset ALA_DOTENV_FILE
+    export SKIP_SONARR=true
+
+    # The root file wins over scan/, and the .env in the working directory --
+    # a directory someone else may be able to write -- is never a candidate.
+    run --separate-stderr "$BASH_UNDER_TEST" -c \
+        'cd "$1" && exec "$2" "$3" "$4"' bash "$cwd" "$BASH_UNDER_TEST" \
+        "$script" "$OUT"
+    assert_success
+    assert_csv_has 'Radarr,"Salt and Iron",2018,,"English","/media/movies/Salt and Iron (2018)/Salt and Iron (2018).mkv"'
+
+    # With the root file gone scan/.env is next, and its key is the wrong one.
+    rm -f "$repo/.env"
+    run --separate-stderr "$BASH_UNDER_TEST" -c \
+        'cd "$1" && exec "$2" "$3" "$4"' bash "$cwd" "$BASH_UNDER_TEST" \
+        "$script" "$OUT"
+    assert_failure 2
+    assert_stderr_contains "Radarr scan failed"
+}
+
+# --------------------------------------------------------------------------
+# S28-S29: the command line and the non-interactive contract
+# --------------------------------------------------------------------------
+
+@test "S28: an unknown option exits 1 and -- ends the options" {
+    run --separate-stderr "$BASH_UNDER_TEST" "$SCAN" --bogus
+    assert_failure 1
+    assert_stderr_contains "unknown option: --bogus"
+
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    export SKIP_SONARR=true
+
+    # A report whose name begins with two dashes is an argument, not a flag,
+    # and every command it is handed to has to be told so.
+    run --separate-stderr "$BASH_UNDER_TEST" -c \
+        'cd "$1" && exec "$2" "$3" -- --weird.csv' bash \
+        "$BATS_TEST_TMPDIR" "$BASH_UNDER_TEST" "$SCAN"
+    assert_success
+
+    [ -f "$BATS_TEST_TMPDIR/--weird.csv" ]
+    run grep -c 'Salt and Iron' "$BATS_TEST_TMPDIR/--weird.csv"
+    assert_output "1"
+}
+
+@test "S29: with no configuration and no terminal the wizard never runs" {
+    forget_arr_env
+    export ARR_TIMEOUT=2
+
+    local started elapsed
+    started="$(date +%s)"
+    run --separate-stderr "$BASH_UNDER_TEST" "$SCAN" "$OUT" < /dev/null
+    elapsed=$(( $(date +%s) - started ))
+
+    assert_failure 2
+    refute_stderr_contains "starting interactive setup"
+    assert_stderr_contains "scan incomplete: Radarr, Sonarr unreachable"
+    [ ! -f "$OUT" ]
+    [ "$elapsed" -lt 30 ] || {
+        printf 'a run with nothing configured took %ss\n' "$elapsed" >&2
+        return 1
+    }
+}
+
+# --------------------------------------------------------------------------
+# S31-S32: CRLF responses and where the output lands
+# --------------------------------------------------------------------------
+
+@test "S31: CRLF responses leave no carriage return in the report or the cache" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    arr_control '{"crlf": true}'
+
+    run_scan
+    assert_success
+
+    run "$REAL_PYTHON3" -c \
+        'import sys; sys.exit(1 if b"\r" in open(sys.argv[1], "rb").read() else 0)' \
+        "$OUT"
+    assert_success
+    run "$REAL_PYTHON3" -c \
+        'import sys; sys.exit(1 if b"\r" in open(sys.argv[1], "rb").read() else 0)' \
+        "$CACHE"
+    assert_success
+
+    run "$REAL_JQ" -r 'keys | join(",")' "$CACHE"
+    assert_output "1,2,__meta"
+    run "$REAL_JQ" -r '."1".sig' "$CACHE"
+    assert_output "10:123456"
+}
+
+@test "S32: a report path in a new directory is created and the cache lands beside it" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+
+    OUT="$BATS_TEST_TMPDIR/new/deeper/report.csv"
+    CACHE="$BATS_TEST_TMPDIR/new/deeper/report.cache.json"
+    [ ! -d "$BATS_TEST_TMPDIR/new" ]
+
+    run_scan
+    assert_success
+
+    [ -f "$OUT" ]
+    [ -f "$CACHE" ]
+    assert_csv_has 'Radarr,"Salt and Iron",2018,,"English","/media/movies/Salt and Iron (2018)/Salt and Iron (2018).mkv"'
+    run tmp_leftovers
+    assert_output "0"
+}
+
+# --------------------------------------------------------------------------
+# S33, S37: the first-run wizard
+# --------------------------------------------------------------------------
+
+@test "S33: the wizard writes a 0600 .env from scripted answers" {
+    # The wizard accepts letters and digits only, which is what Radarr and
+    # Sonarr generate; the fake's default "radarr-key" would be refused.
+    export FAKE_RADARR_KEY=radarrkey
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+
+    local envfile="$BATS_TEST_TMPDIR/wizard.env" url="$RADARR_URL"
+    : > "$envfile"
+
+    forget_arr_env
+    export SKIP_SONARR=true
+    export ALA_DOTENV_FILE="$envfile"
+    # ARR_ASSUME_TTY drives the wizard without a terminal; ARR_LOCALHOST keeps
+    # the probe off whatever the developer may be running on port 7878.
+    export ARR_ASSUME_TTY=1 ARR_LOCALHOST=127.0.0.1
+
+    printf 'y\n%s\nradarrkey\ny\n' "$url" > "$BATS_TEST_TMPDIR/answers"
+    run --separate-stderr "$BASH_UNDER_TEST" "$SCAN" "$OUT" \
+        < "$BATS_TEST_TMPDIR/answers"
+    assert_success
+    # Saved before the next `run` overwrites $output.
+    local hit_lines="$output"
+
+    # A file holding an API key is readable by its owner and nobody else.
+    run file_mode "$envfile"
+    assert_output "600"
+
+    run grep -cxF "RADARR_URL=$url" "$envfile"
+    assert_output "1"
+    run grep -cxF "RADARR_API_KEY=radarrkey" "$envfile"
+    assert_output "1"
+
+    # Every line the wizard writes is an allow-listed KEY=value.
+    run grep -cvE '^([A-Z_]+=.*)?$' "$envfile"
+    assert_output "0"
+
+    # The wizard talks on stderr only: stdout is still just the hit lines.
+    [ -n "$hit_lines" ]
+    local line
+    while IFS= read -r line; do
+        if [[ ! "$line" =~ ^\[(Radarr|Sonarr)\]\  ]]; then
+            printf 'unexpected stdout line: %s\n' "$line" >&2
+            return 1
+        fi
+    done <<< "$hit_lines"
+
+    # And the configuration it saved is the one the next run reads back.
+    : > "$FAKE_ARR_LOG"
+    run --separate-stderr "$BASH_UNDER_TEST" "$SCAN" "$OUT" < /dev/null
+    assert_success
+    run arr_request_count "/radarr/api/v3/movie"
+    assert_output "1"
+}
+
+@test "S37: the wizard rejects a URL with a space and saves nothing" {
+    local envfile="$BATS_TEST_TMPDIR/wizard.env"
+    : > "$envfile"
+
+    forget_arr_env
+    export SKIP_SONARR=true
+    export ALA_DOTENV_FILE="$envfile"
+    export ARR_ASSUME_TTY=1 ARR_LOCALHOST=127.0.0.1 ARR_TIMEOUT=2
+
+    # One re-prompt, then the save is abandoned rather than writing a value
+    # that would only fail later.
+    printf 'y\nhttp://has a space\nstill not a url\n' \
+        > "$BATS_TEST_TMPDIR/answers"
+    run --separate-stderr "$BASH_UNDER_TEST" "$SCAN" "$OUT" \
+        < "$BATS_TEST_TMPDIR/answers"
+
+    assert_failure 2
+    assert_stderr_contains "not a usable URL"
+    assert_stderr_contains "configuration not saved"
+
+    [ ! -s "$envfile" ]
+}
+
+# --------------------------------------------------------------------------
 # S30: the stdout contract
 # --------------------------------------------------------------------------
 
@@ -712,6 +1198,8 @@ EOF
     refute_stderr_contains "Results exported to"
     refute_stderr_contains "No files missing Italian audio were found."
     [ ! -f "$OUT" ]
+    run tmp_leftovers
+    assert_output "0"
 }
 
 @test "S40: a real SIGINT stops a running scan and removes its temp directory" {
@@ -769,10 +1257,13 @@ EOF
     run grep -c "Results exported to" "$BATS_TEST_TMPDIR/s40.err"
     assert_failure
 
-    # The report holds its header and no half-written row: the scan was
-    # interrupted before it could flag anything.
-    run cat "$OUT"
-    assert_output "App,Title,Year,Episode,AudioLanguages,Path"
+    # An interrupted run publishes nothing. The report is built in a temporary
+    # file and only moved into place by a run that completed, and the signal
+    # handler removes that file: there was no previous report here, so there is
+    # no report at all, and no half-written one either.
+    [ ! -f "$OUT" ]
+    run tmp_leftovers
+    assert_output "0"
 }
 
 @test "S40 twin: on_signal cleans up and exits 130 without falling through" {

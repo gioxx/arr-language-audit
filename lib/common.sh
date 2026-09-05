@@ -43,7 +43,7 @@ ALA_ROOT="$(cd "$ALA_LIB_DIR/.." && pwd)"
 # .env is configuration, not a way to reach PATH, LD_PRELOAD or IFS.
 ALA_DOTENV_KEYS="RADARR_URL RADARR_API_KEY SKIP_RADARR \
 SONARR_URL SONARR_API_KEY SKIP_SONARR \
-FORCE_RESCAN RESCAN_TIMEOUT REFRESH \
+FORCE_RESCAN RESCAN_TIMEOUT RESCAN_POLL_INTERVAL REFRESH \
 WHISPER_MODEL SAMPLE_SECONDS SAMPLE_OFFSET_PCT \
 MIN_FREE_SPACE_MB MIN_CONFIDENCE WHISPER_THREADS \
 TEMP_DIR LIMIT RETRY_ERRORS NO_RESUME PYTHON_BIN"
@@ -119,8 +119,19 @@ normalize_url() {
 # find_dotenv -- echo the first .env the repository provides, rc 1 if none.
 # The working directory is deliberately not a candidate: running the audit from
 # a directory someone else can write must not change its configuration.
+#
+# ALA_DOTENV_FILE overrides the search entirely, and reports "no .env" when it
+# names a file that does not exist rather than falling back to the search. That
+# is the point: it is how the test suite -- and an operator running one-off
+# against a different configuration -- takes the repository's own .env out of
+# the picture, and a silent fallback would quietly put it back.
 find_dotenv() {
     local candidate
+    if [[ -n "${ALA_DOTENV_FILE:-}" ]]; then
+        [[ -f "$ALA_DOTENV_FILE" ]] || return 1
+        printf '%s\n' "$ALA_DOTENV_FILE"
+        return 0
+    fi
     for candidate in "$ALA_ROOT/.env" "$ALA_ROOT/scan/.env"; do
         if [[ -f "$candidate" ]]; then
             printf '%s\n' "$candidate"

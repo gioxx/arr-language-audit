@@ -183,6 +183,36 @@ ERROR: broken"
     assert_output ""
 }
 
+@test "ALA_DOTENV_FILE overrides the search, and only when the file exists" {
+    make_fake_repo
+    write_env "$FAKE_ROOT/.env" "LIMIT=1"
+    write_env "$BATS_TEST_TMPDIR/chosen.env" "LIMIT=7"
+
+    # The override wins over a .env the search would otherwise have found.
+    export ALA_DOTENV_FILE="$BATS_TEST_TMPDIR/chosen.env"
+    lib_run 'find_dotenv'
+    assert_success
+    assert_output "$BATS_TEST_TMPDIR/chosen.env"
+
+    lib_run 'load_dotenv "$(find_dotenv)"; printf "%s\n" "$LIMIT"'
+    assert_success
+    assert_output "7"
+
+    # Pointed at a file that does not exist it reports "no .env" rather than
+    # falling back to the repository's: a test that neutralises the developer's
+    # .env must not have it quietly reinstated.
+    export ALA_DOTENV_FILE="$BATS_TEST_TMPDIR/absent.env"
+    lib_run 'find_dotenv'
+    assert_failure 1
+    assert_output ""
+
+    # Empty is "not set": the search order is back.
+    export ALA_DOTENV_FILE=""
+    lib_run 'find_dotenv'
+    assert_success
+    assert_output "$FAKE_ROOT/.env"
+}
+
 # --------------------------------------------------------------- load_dotenv --
 
 @test "load_dotenv never executes command substitution in a value" {
