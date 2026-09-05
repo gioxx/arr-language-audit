@@ -362,23 +362,34 @@ def detect_language(model, wav_path: str) -> tuple[str | None, float]:
     dedicated detect_language() takes a second window when the first one comes
     back under language_detection_threshold, which is what a sample opening on
     music or on a silent title card needs. transcribe() stays as the fallback
-    for a faster-whisper too old to have the method."""
-    if hasattr(model, "detect_language"):
-        result = model.detect_language(
-            audio=wav_path,
-            vad_filter=True,
-            language_detection_segments=2,
-            language_detection_threshold=0.5,
-        )
-        language, probability = result[0], result[1]
-    else:
-        _segments, info = model.transcribe(
-            wav_path, beam_size=1, best_of=1, vad_filter=True
-        )
-        # Force generator evaluation is not needed: info.language is populated
-        # after the initial language-detection pass, before segment decoding.
-        language, probability = info.language, info.language_probability
-    return language, float(probability or 0.0)
+    for a faster-whisper too old to have the method -- the package is not
+    pinned, so "too old" has to include a build whose detect_language() does
+    not take these keywords, not only one that lacks the method entirely."""
+    detect = getattr(model, "detect_language", None)
+    if detect is not None:
+        try:
+            result = detect(
+                audio=wav_path,
+                vad_filter=True,
+                language_detection_segments=2,
+                language_detection_threshold=0.5,
+            )
+        except TypeError:
+            # A signature mismatch is version drift, which is what the
+            # fallback below is for; without this the whole library would
+            # come back DETECTION_FAILED. Deliberately TypeError only and
+            # deliberately once: a detector that really failed must stay
+            # failed, and verify_one turns that into one error row.
+            pass
+        else:
+            return result[0], float(result[1] or 0.0)
+
+    _segments, info = model.transcribe(
+        wav_path, beam_size=1, best_of=1, vad_filter=True
+    )
+    # Force generator evaluation is not needed: info.language is populated
+    # after the initial language-detection pass, before segment decoding.
+    return info.language, float(info.language_probability or 0.0)
 
 
 def classify(lang: str | None, prob: float, min_confidence: float) -> str:

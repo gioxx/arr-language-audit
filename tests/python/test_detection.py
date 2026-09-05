@@ -143,6 +143,34 @@ def test_probe_media_asks_ffprobe_exactly_once(shim_path, monkeypatch, tmp_path)
     assert len(log.read_text(encoding="utf-8").splitlines()) == 1
 
 
+def test_probe_media_asks_ffprobe_for_both_sections(monkeypatch):
+    """The contract with a tool no test here can run: assert the whole argv.
+
+    Every flag in it is load-bearing and silently so. Drop -show_format and
+    ffprobe stops emitting format.duration, so every file is sampled from
+    offset 0 instead of 25% in -- no error, no changed verdict count, nothing
+    to notice. Drop -select_streams a and the array positions stop being the
+    indices `-map 0:a:<n>` counts. Exact equality, deliberately: this argv
+    should not drift without someone deciding to change it."""
+    probe_json = json.dumps({
+        "format": {"duration": "600"},
+        "streams": [{"index": 0, "codec_type": "audio", "disposition": {"default": 1}}],
+    })
+    recorder = Recorder(payload=None, stdout=probe_json)
+    monkeypatch.setattr(vam.subprocess, "run", recorder)
+
+    assert vam.probe_media("/media/a.mkv") == vam.MediaProbe(600.0, 0)
+
+    assert recorder.calls == [[
+        "ffprobe", "-v", "error",
+        "-select_streams", "a",
+        "-show_streams",
+        "-show_format",
+        "-of", "json",
+        "/media/a.mkv",
+    ]]
+
+
 def test_probe_media_garbage_output_is_no_probe(monkeypatch):
     """Y8: garbage from ffprobe means 'unknown', not a crash."""
     monkeypatch.setattr(vam.subprocess, "run",
@@ -271,6 +299,67 @@ def test_detect_language_falls_back_to_transcribe(fake_wav, whisper_script, monk
     assert faster_whisper.WhisperModel.detect_calls == []
 
 
+class _Info:
+    def __init__(self, language, probability):
+        self.language = language
+        self.language_probability = probability
+
+
+class _LegacyDetectModel:
+    """A faster-whisper that HAS detect_language() but not today's signature.
+
+    The narrow signature is the point: Python raises the TypeError at the call
+    site, exactly as a real older build would, so nothing here has to
+    impersonate the error."""
+
+    def __init__(self, transcribed=("en", 0.42)):
+        self.transcribe_calls = []
+        self.transcribed = transcribed
+
+    def detect_language(self, audio=None, vad_filter=False):
+        # Unreachable while the worker passes the windowing keywords; if it
+        # ever stops, this answer makes the test fail rather than pass.
+        return "xx", 1.0, []
+
+    def transcribe(self, wav_path, **kwargs):
+        self.transcribe_calls.append(wav_path)
+        return iter(()), _Info(*self.transcribed)
+
+
+class _BrokenDetectModel:
+    """A detector that really failed, as opposed to one that is out of date."""
+
+    def __init__(self):
+        self.transcribe_calls = []
+
+    def detect_language(self, **kwargs):
+        raise RuntimeError("CUDA out of memory")
+
+    def transcribe(self, wav_path, **kwargs):
+        self.transcribe_calls.append(wav_path)
+        return iter(()), _Info("it", 0.99)
+
+
+def test_detect_language_falls_back_on_a_signature_mismatch():
+    """faster-whisper is not pinned anywhere in this repo. A build whose
+    detect_language() predates the windowing keywords must reach the
+    fallback, not turn every file in the library into DETECTION_FAILED."""
+    model = _LegacyDetectModel()
+
+    assert vam.detect_language(model, "/tmp/s.wav") == ("en", 0.42)
+    assert model.transcribe_calls == ["/tmp/s.wav"]
+
+
+def test_detect_language_does_not_swallow_a_real_detector_failure():
+    """The fallback is for version drift only: a detector that blew up stays
+    blown up, and verify_one records it as one DETECTION_FAILED row."""
+    model = _BrokenDetectModel()
+
+    with pytest.raises(RuntimeError):
+        vam.detect_language(model, "/tmp/s.wav")
+    assert model.transcribe_calls == []
+
+
 def test_detect_language_coerces_a_missing_probability(fake_wav, whisper_script):
     """D8, through the detection API this time."""
     whisper_script({"/media/x.mkv": ["it", None]})
@@ -335,6 +424,13 @@ def test_e2e_low_confidence_is_kept_then_retried(tmp_path, shim_path, whisper_sc
     # A plain resume leaves it alone: it was listened to, unlike an error row.
     assert vam.main(["--input", inp, "--output", out]) == 0
     assert faster_whisper.WhisperModel.calls == [path]
+    # ... and run 2 rewrites the output in full, so the row has to have
+    # survived that rewrite, not merely have escaped re-detection.
+    _header, kept = read_rows(out)
+    assert len(kept) == 1
+    assert kept[0]["Verdict"] == audit_common.VERDICT_LOW_CONFIDENCE
+    assert kept[0]["Confidence"] == "0.70"
+    assert kept[0]["DetectedLanguage"] == "en"
 
     whisper_script({path: ["en", 0.95]})
     assert vam.main(["--input", inp, "--output", out, "--retry-errors"]) == 0

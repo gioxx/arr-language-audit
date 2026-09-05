@@ -7,23 +7,35 @@
 #   FAKE_STREAMS     JSON array of stream objects, e.g.
 #                      [{"index":1,"codec_type":"audio","disposition":{"default":0}},
 #                       {"index":2,"codec_type":"audio","disposition":{"default":1}}]
-#                    Default: one default-disposition audio stream. Only
-#                    printed when the caller asked for streams, i.e. passed
-#                    -show_streams or -show_entries ...stream=... ; with
+#                    Default: one default-disposition audio stream. With
 #                    -select_streams a, non-audio streams are filtered out
 #                    exactly as the real ffprobe would.
 #   FAKE_FFPROBE_LOG file to append argv to, one invocation per line.
+#
+# Each section is printed ONLY when the caller asked for it -- "format" for
+# -show_format or -show_entries format=..., "streams" for -show_streams or
+# -show_entries ...stream=... -- because a permissive shim answers a caller
+# that forgot a flag, and then no test can notice the flag going missing.
 set -u
 
 input=""
 prev=""
+want_format=0
 want_streams=0
 audio_only=0
 for arg in "$@"; do
     case "$arg" in
+        -show_format) want_format=1 ;;
         -show_streams) want_streams=1 ;;
-        *stream=*|*stream_disposition=*) want_streams=1 ;;
     esac
+    if [[ "$prev" == "-show_entries" ]]; then
+        case "$arg" in
+            *format=*) want_format=1 ;;
+        esac
+        case "$arg" in
+            *stream=*|*stream_disposition=*) want_streams=1 ;;
+        esac
+    fi
     if [[ "$prev" == "-select_streams" && "$arg" == a* ]]; then
         audio_only=1
     fi
@@ -45,14 +57,22 @@ if [[ -n "${FAKE_DURATIONS:-}" ]]; then
 fi
 
 if (( want_streams == 0 )); then
-    printf '{"format":{"duration":"%s"}}\n' "$duration"
+    if (( want_format == 1 )); then
+        printf '{"format":{"duration":"%s"}}\n' "$duration"
+    else
+        # Real ffprobe asked for nothing prints an empty object.
+        printf '{}\n'
+    fi
     exit 0
 fi
 
 default_streams='[{"index":0,"codec_type":"audio","disposition":{"default":1}}]'
 printf '%s' "${FAKE_STREAMS:-$default_streams}" \
-    | "${REAL_JQ:-jq}" -c --arg d "$duration" --argjson audio_only "$audio_only" \
+    | "${REAL_JQ:-jq}" -c --arg d "$duration" \
+        --argjson want_format "$want_format" --argjson audio_only "$audio_only" \
         'if $audio_only == 1
          then map(select((.codec_type // "audio") == "audio"))
          else . end
-         | {format: {duration: $d}, streams: .}'
+         | {streams: .} as $streams
+         | (if $want_format == 1 then {format: {duration: $d}} else {} end)
+           + $streams'

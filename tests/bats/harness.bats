@@ -162,6 +162,30 @@ probe_streams() {
     assert_output '{"format":{"duration":"42"}}'
 }
 
+@test "ffprobe shim prints only the sections it was asked for" {
+    make_bin
+    install_shim ffprobe
+
+    export FAKE_DURATIONS='{"/media/x.mkv": 42}'
+
+    # Strict on purpose: a shim that answers a caller which forgot a flag is a
+    # shim no test can use to notice the flag going missing. The phase 2
+    # worker needs BOTH sections, and dropping -show_format would silently
+    # make every duration unknown in production.
+    run ffprobe -v error -select_streams a -show_streams -of json /media/x.mkv
+    assert_success
+    refute_output --partial '"format"'
+    assert_output --partial '"streams"'
+
+    run ffprobe -v error -show_format -of json /media/x.mkv
+    assert_success
+    assert_output '{"format":{"duration":"42"}}'
+
+    run ffprobe -v error -of json /media/x.mkv
+    assert_success
+    assert_output '{}'
+}
+
 @test "whiptail shim returns the scripted answer and exit status" {
     make_bin
     install_shim whiptail
