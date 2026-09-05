@@ -41,14 +41,27 @@ Verdicts written to the output CSV:
                             real fix: redownload or remux an Italian track.
     FILE_NOT_FOUND          path from the phase 1 CSV does not exist here.
     EXTRACTION_FAILED       ffmpeg could not produce an audio sample.
-    DETECTION_FAILED        faster-whisper raised while analyzing the sample.
+    DETECTION_FAILED        faster-whisper raised while analyzing the sample,
+                            or could not name a language at all.
+
+Exit codes:
+    0   finished (including "nothing new to verify")
+    1   usage, configuration, input or disk-space problem, or the model
+        could not be loaded (the previous output CSV is left untouched)
+    3   every file this run tried to verify errored
+    130 interrupted (Ctrl-C); the CSV written so far stays valid
 
 Environment variables (optional):
     WHISPER_MODEL       tiny | base | small | medium (default: small)
+    WHISPER_THREADS     CPU threads for the model (default: all cores)
     SAMPLE_SECONDS      length of the audio sample to analyze (default: 60)
     SAMPLE_OFFSET_PCT   where to start sampling, as % of duration (default: 25)
     MIN_FREE_SPACE_MB   minimum free space required in temp dir (default: 500)
-    TEMP_DIR           directory for temporary audio samples (default: mktemp)
+    TEMP_DIR            PARENT directory for the run's scratch directory
+                        (default: the system temp dir). A private
+                        'lang-check-XXXX' directory is created inside it and
+                        only that directory is ever removed -- the directory
+                        you point TEMP_DIR at is never deleted.
 """
 
 from __future__ import annotations
@@ -61,12 +74,21 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
-SAMPLE_SECONDS = int(os.environ.get("SAMPLE_SECONDS", "60"))
-SAMPLE_OFFSET_PCT = float(os.environ.get("SAMPLE_OFFSET_PCT", "25"))
-MIN_FREE_SPACE_MB = int(os.environ.get("MIN_FREE_SPACE_MB", "500"))
+from audit_common import (
+    ERROR_VERDICTS,
+    PHASE2_COLUMNS,
+    VERDICT_CONFIRMED,
+    VERDICT_DETECTION_FAILED,
+    VERDICT_EXTRACTION_FAILED,
+    VERDICT_FILE_NOT_FOUND,
+    VERDICT_MISTAGGED,
+    check_python_floor,
+    log,
+)
 
 # Default report location: <repo>/reports/ (this file lives in <repo>/verify/).
 # Keeps phase 1, phase 2 and the HTML report pointed at the same directory
@@ -75,17 +97,103 @@ REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_INPUT = str(REPORTS_DIR / "missing-italian-audio.csv")
 DEFAULT_OUTPUT = str(REPORTS_DIR / "verified-language-results.csv")
 
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_ALL_FAILED = 3
+EXIT_INTERRUPTED = 130
+
+# How much of a tool's complaint is worth keeping in the log.
+MAX_ERROR_CHARS = 200
+
+
+class WorkerError(Exception):
+    """Anything that stops the run with exit 1 and a message for the user.
+
+    Helpers raise instead of calling sys.exit, so main() stays the only place
+    that decides an exit code -- and so the tests can call them directly."""
+
+
+class ConfigError(WorkerError):
+    """An environment variable does not hold a usable value."""
+
+
+class DiskSpaceError(WorkerError):
+    """Not enough free space left in the scratch directory."""
+
+
+@dataclass(frozen=True)
+class Config:
+    """Everything the run takes from the environment, read once in main()."""
+
+    whisper_model: str = "small"
+    sample_seconds: int = 60
+    sample_offset_pct: float = 25.0
+    min_free_space_mb: int = 500
+    temp_parent: str | None = None
+    # Not consulted yet: the low-confidence verdict arrives with the switch to
+    # the dedicated detection API. Parsed here so the launcher can already
+    # export it and so a typo is reported at start-up rather than later.
+    min_confidence: float = 0.6
+    whisper_threads: int = 0
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> Config:
+        """Build a Config from `env` (default: os.environ).
+
+        An unset variable and one exported empty ("SAMPLE_SECONDS=") mean the
+        same thing: use the default. Anything else that is not a usable value
+        raises ConfigError, which main() reports as exit 1."""
+        source: Mapping[str, str] = os.environ if env is None else env
+
+        def text(name: str) -> str:
+            return (source.get(name) or "").strip()
+
+        kinds = {int: "whole number", float: "number"}
+
+        def number(name: str, default, cast, low=None, high=None):
+            raw = text(name)
+            if not raw:
+                return default
+            try:
+                value = cast(raw)
+            except (TypeError, ValueError):
+                raise ConfigError(
+                    f"{name} must be a {kinds[cast]}, got '{raw}'."
+                ) from None
+            if (low is not None and value < low) or (high is not None and value > high):
+                bounds = f"{low}..{high}" if high is not None else f">= {low}"
+                raise ConfigError(f"{name} must be {bounds}, got '{raw}'.")
+            return value
+
+        return cls(
+            whisper_model=text("WHISPER_MODEL") or "small",
+            sample_seconds=number("SAMPLE_SECONDS", 60, int, low=1),
+            sample_offset_pct=number("SAMPLE_OFFSET_PCT", 25.0, float, low=0.0, high=100.0),
+            min_free_space_mb=number("MIN_FREE_SPACE_MB", 500, int, low=0),
+            temp_parent=text("TEMP_DIR") or None,
+            min_confidence=number("MIN_CONFIDENCE", 0.6, float, low=0.0, high=1.0),
+            whisper_threads=number("WHISPER_THREADS", 0, int, low=0),
+        )
+
+
+def make_temp_dir(cfg: Config) -> str:
+    """A private scratch directory for this run's audio samples.
+
+    TEMP_DIR (cfg.temp_parent) is only ever the PARENT: a user pointing it at
+    /tmp or at a scratch share must get their directory back untouched, so the
+    only thing this program ever removes is the directory it created here."""
+    if cfg.temp_parent:
+        os.makedirs(cfg.temp_parent, exist_ok=True)
+    return tempfile.mkdtemp(prefix="lang-check-", dir=cfg.temp_parent)
+
 
 def check_disk_space(path: str, min_mb: int) -> None:
     usage = shutil.disk_usage(path)
     free_mb = usage.free / (1024 * 1024)
     if free_mb < min_mb:
-        print(
-            f"ERROR: only {free_mb:.0f} MB free in '{path}', "
-            f"need at least {min_mb} MB. Aborting.",
-            file=sys.stderr,
+        raise DiskSpaceError(
+            f"only {free_mb:.0f} MB free in '{path}', need at least {min_mb} MB."
         )
-        sys.exit(1)
 
 
 def get_duration_seconds(file_path: str) -> float | None:
@@ -106,22 +214,25 @@ def get_duration_seconds(file_path: str) -> float | None:
         return None
 
 
-def extract_sample(file_path: str, out_wav: str) -> bool:
+def extract_sample(file_path: str, out_wav: str, cfg: Config) -> bool:
     duration = get_duration_seconds(file_path)
     if duration is None or duration <= 0:
         start = 0
     else:
-        start = max(0, duration * (SAMPLE_OFFSET_PCT / 100.0))
+        start = max(0, duration * (cfg.sample_offset_pct / 100.0))
         # don't start so late that there's not enough left to sample
-        start = min(start, max(0, duration - SAMPLE_SECONDS))
+        start = min(start, max(0, duration - cfg.sample_seconds))
 
     try:
         subprocess.run(
             [
-                "ffmpeg", "-y",
+                "ffmpeg",
+                "-nostdin",
+                "-loglevel", "error",
+                "-y",
                 "-ss", str(start),
                 "-i", file_path,
-                "-t", str(SAMPLE_SECONDS),
+                "-t", str(cfg.sample_seconds),
                 "-vn",
                 "-acodec", "pcm_s16le",
                 "-ar", "16000",
@@ -132,34 +243,42 @@ def extract_sample(file_path: str, out_wav: str) -> bool:
         )
         return os.path.exists(out_wav) and os.path.getsize(out_wav) > 0
     except subprocess.CalledProcessError as e:
-        print(f"  ffmpeg failed for '{file_path}': {e.stderr.strip()[:200]}", file=sys.stderr)
+        detail = (e.stderr or "").strip()[:MAX_ERROR_CHARS]
+        log(f"  ffmpeg failed for '{file_path}': {detail}")
         return False
     except Exception as e:  # noqa: BLE001
         # One unreadable file must not end the run: report it and carry on.
-        print(f"  ffmpeg failed for '{file_path}': {e}", file=sys.stderr)
+        log(f"  ffmpeg failed for '{file_path}': {str(e)[:MAX_ERROR_CHARS]}")
         return False
 
 
-def load_model():
+def load_model(cfg: Config):
     # Imported here on purpose: loading faster_whisper costs seconds, and the
     # script must run --help (and fail cleanly) without the package installed.
     from faster_whisper import WhisperModel  # noqa: PLC0415
-    print(f"Loading Whisper model '{WHISPER_MODEL}' (CPU)...", file=sys.stderr)
-    return WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+
+    threads = cfg.whisper_threads or os.cpu_count() or 4
+    log(f"Loading Whisper model '{cfg.whisper_model}' (CPU, {threads} thread(s))...")
+    return WhisperModel(
+        cfg.whisper_model, device="cpu", compute_type="int8", cpu_threads=threads
+    )
 
 
-def detect_language(model, wav_path: str) -> tuple[str, float]:
+def detect_language(model, wav_path: str) -> tuple[str | None, float]:
+    """(language, probability) for a sample. The language is None when the
+    detector could not name one -- the caller turns that into a verdict."""
     _segments, info = model.transcribe(wav_path, beam_size=1, best_of=1, vad_filter=True)
     # Force generator evaluation is not needed: info.language is populated
     # after the initial language-detection pass, before segment decoding.
-    return info.language, info.language_probability
+    return info.language, float(info.language_probability or 0.0)
 
 
-def is_italian(lang_code: str) -> bool:
+def is_italian(lang_code: str | None) -> bool:
+    """True only for a language code that names Italian. A missing code
+    (the detector gave up) is not Italian and is not an error here."""
+    if not lang_code:
+        return False
     return lang_code.lower() in ("it", "ita")
-
-
-ERROR_VERDICTS = {"FILE_NOT_FOUND", "EXTRACTION_FAILED", "DETECTION_FAILED"}
 
 
 def file_signature(path: str) -> tuple[int | None, int | None]:
@@ -219,7 +338,7 @@ def resume_decision(entry, cur_size, cur_mtime, retry_errors: bool) -> str:
     return "verify"
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Verify the real spoken language of suspect media files (phase 2 of arr-language-audit).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -229,12 +348,21 @@ def main():
             "  CONFIRMED_NOT_ITALIAN  really not Italian; redownload or remux needed\n"
             "  FILE_NOT_FOUND / EXTRACTION_FAILED / DETECTION_FAILED   see script header\n"
             "\n"
+            "Exit codes:\n"
+            "  0   finished (including 'nothing new to verify')\n"
+            "  1   usage, configuration, input, disk space, or model loading failed\n"
+            "  3   every file this run tried to verify errored\n"
+            "  130 interrupted\n"
+            "\n"
             "Environment variables:\n"
             "  WHISPER_MODEL      tiny | base | small | medium        (default: small)\n"
+            "  WHISPER_THREADS    CPU threads for the model           (default: all cores)\n"
             "  SAMPLE_SECONDS     audio sample length, seconds        (default: 60)\n"
             "  SAMPLE_OFFSET_PCT  sampling start, % of duration       (default: 25)\n"
             "  MIN_FREE_SPACE_MB  minimum free space in temp dir, MB  (default: 500)\n"
-            "  TEMP_DIR          temp dir for audio samples          (default: mktemp)\n"
+            "  TEMP_DIR           parent for the run's scratch dir    (default: system temp)\n"
+            "                     never deleted; only the 'lang-check-*' directory\n"
+            "                     created inside it is removed\n"
         ),
     )
     parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV from find-missing-italian-audio.sh")
@@ -242,31 +370,61 @@ def main():
     parser.add_argument("--limit", type=int, default=0,
                         help="Only (re)verify the first N files that need it (0 = all)")
     parser.add_argument("--retry-errors", action="store_true",
-                         help="Also reprocess rows that previously failed "
-                              "(FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)")
+                        help="Also reprocess rows that previously failed "
+                             "(FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)")
     parser.add_argument("--no-resume", action="store_true",
-                         help="Ignore any existing output file and start fresh (overwrites it)")
-    args = parser.parse_args()
+                        help="Ignore any existing output file and start fresh (overwrites it)")
+    return parser
 
-    if not os.path.isfile(args.input):
-        print(f"ERROR: input file '{args.input}' not found.", file=sys.stderr)
-        print("Run verify/verify-audio-language.sh (or the orchestrator) first,", file=sys.stderr)
-        print("or pass --input with the correct path.", file=sys.stderr)
-        sys.exit(1)
 
-    out_dir = os.path.dirname(os.path.abspath(args.output))
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+def main(argv: list[str] | None = None) -> int:
+    check_python_floor()
+    args = build_parser().parse_args(argv)
 
-    temp_dir = os.environ.get("TEMP_DIR") or tempfile.mkdtemp(prefix="lang-check-")
-    os.makedirs(temp_dir, exist_ok=True)
-    check_disk_space(temp_dir, MIN_FREE_SPACE_MB)
+    temp_dir = None
+    try:
+        # The environment is read only now: a broken SAMPLE_SECONDS must not
+        # stop --help from working.
+        cfg = Config.from_env()
 
-    fieldnames = [
-        "App", "Title", "Year", "Episode",
-        "DeclaredAudioLanguages", "DetectedLanguage", "Confidence",
-        "Verdict", "Path", "FileSize", "FileMtime",
-    ]
+        if not os.path.isfile(args.input):
+            raise WorkerError(
+                f"input file '{args.input}' not found.\n"
+                "Run verify/verify-audio-language.sh (or the orchestrator) first,\n"
+                "or pass --input with the correct path."
+            )
+
+        out_dir = os.path.dirname(os.path.abspath(args.output))
+        if out_dir:
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except OSError as e:
+                raise WorkerError(
+                    f"cannot create the output directory '{out_dir}': {e}"
+                ) from e
+
+        try:
+            temp_dir = make_temp_dir(cfg)
+        except OSError as e:
+            raise WorkerError(f"cannot create a scratch directory: {e}") from e
+
+        return _run(args, cfg, temp_dir)
+    except WorkerError as e:
+        log(f"ERROR: {e}")
+        return EXIT_ERROR
+    except KeyboardInterrupt:
+        log("\nInterrupted. The results written so far are complete and valid.")
+        return EXIT_INTERRUPTED
+    finally:
+        # Only ever the directory make_temp_dir() created, never TEMP_DIR.
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _run(args, cfg: Config, temp_dir: str) -> int:
+    check_disk_space(temp_dir, cfg.min_free_space_mb)
+
+    fieldnames = list(PHASE2_COLUMNS)
 
     def norm_prev(row, size=None, mtime=None):
         # A row read back from a previous output CSV, reshaped to the current
@@ -347,61 +505,73 @@ def main():
         to_verify = to_verify[: args.limit]
 
     if kept_rows:
-        print(f"Reusing {len(kept_rows)} previous verdict(s) for unchanged files.", file=sys.stderr)
+        log(f"Reusing {len(kept_rows)} previous verdict(s) for unchanged files.")
     if orphan_rows:
-        print(f"Carrying over {len(orphan_rows)} row(s) whose file is no longer "
-              "in the phase 1 CSV.", file=sys.stderr)
+        log(f"Carrying over {len(orphan_rows)} row(s) whose file is no longer "
+            "in the phase 1 CSV.")
     if dropped_stale:
-        print(f"Dropped {dropped_stale} stale row(s): file changed and is no longer "
-              "flagged by phase 1.", file=sys.stderr)
-    print(f"Loaded {len(all_rows)} suspect file(s) total, "
-          f"{len(to_verify)} to (re)verify now.", file=sys.stderr)
+        log(f"Dropped {dropped_stale} stale row(s): file changed and is no longer "
+            "flagged by phase 1.")
+    log(f"Loaded {len(all_rows)} suspect file(s) total, "
+        f"{len(to_verify)} to (re)verify now.")
+
+    # The model is loaded BEFORE the output is opened for writing: opening it
+    # truncates the previous run's verdicts, and a missing package or a failed
+    # model download must not cost hours of already-done work.
+    model = None
+    if to_verify:
+        try:
+            model = load_model(cfg)
+        except (ImportError, OSError) as e:
+            log(f"ERROR: could not load the Whisper model: {e}")
+            log("Install faster_whisper (see the launcher script) and run again.")
+            log(f"'{args.output}' was left untouched.")
+            return EXIT_ERROR
 
     # Always rewrite the output in full: kept + carried-over rows first, so a
     # crash during detection still leaves a complete, valid CSV.
     # SIM115: deliberately not a context manager -- the handle lives for the
     # whole detection loop and is flushed after every row, so an abort leaves a
-    # complete file behind. It is closed at the end of main().
-    out_f = open(args.output, "w", newline="", encoding="utf-8")  # noqa: SIM115
-    writer = csv.DictWriter(out_f, fieldnames=fieldnames)
-    writer.writeheader()
-    for r in kept_rows:
-        writer.writerow(r)
-    for r in orphan_rows:
-        writer.writerow(r)
-    out_f.flush()
-
-    if len(to_verify) == 0:
-        out_f.close()
-        print("Nothing new to verify.", file=sys.stderr)
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return
-
-    model = load_model()
-
-    mistagged_count = 0
-    confirmed_foreign_count = 0
-    error_count = 0
-
+    # complete file behind. It is closed in the finally below.
     try:
+        out_f = open(args.output, "w", newline="", encoding="utf-8")  # noqa: SIM115
+    except OSError as e:
+        raise WorkerError(f"cannot write '{args.output}': {e}") from e
+    try:
+        writer = csv.DictWriter(out_f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in kept_rows:
+            writer.writerow(r)
+        for r in orphan_rows:
+            writer.writerow(r)
+        out_f.flush()
+
+        if not to_verify:
+            log("Nothing new to verify.")
+            return EXIT_OK
+
+        mistagged_count = 0
+        confirmed_foreign_count = 0
+        error_count = 0
+
         for i, row in enumerate(to_verify, start=1):
             path = (row.get("Path", "") or "").strip()
             title = row.get("Title", "")
-            print(f"[{i}/{len(to_verify)}] {title} ...", file=sys.stderr)
+            log(f"[{i}/{len(to_verify)}] {title} ...")
 
             if not path or not os.path.isfile(path):
-                writer.writerow(make_row(row, verdict="FILE_NOT_FOUND"))
+                writer.writerow(make_row(row, verdict=VERDICT_FILE_NOT_FOUND))
                 error_count += 1
                 out_f.flush()
                 continue
 
             cur_size, cur_mtime = file_signature(path)
 
-            check_disk_space(temp_dir, MIN_FREE_SPACE_MB)
+            check_disk_space(temp_dir, cfg.min_free_space_mb)
             sample_path = os.path.join(temp_dir, f"sample_{i}.wav")
 
-            if not extract_sample(path, sample_path):
-                writer.writerow(make_row(row, verdict="EXTRACTION_FAILED",
+            if not extract_sample(path, sample_path, cfg):
+                writer.writerow(make_row(row, verdict=VERDICT_EXTRACTION_FAILED,
                                          size=cur_size, mtime=cur_mtime))
                 error_count += 1
                 out_f.flush()
@@ -411,8 +581,8 @@ def main():
                 lang, prob = detect_language(model, sample_path)
             except Exception as e:  # noqa: BLE001
                 # Whisper can fail in many ways; each is a DETECTION_FAILED row.
-                print(f"  Whisper detection failed: {e}", file=sys.stderr)
-                writer.writerow(make_row(row, verdict="DETECTION_FAILED",
+                log(f"  Whisper detection failed: {str(e)[:MAX_ERROR_CHARS]}")
+                writer.writerow(make_row(row, verdict=VERDICT_DETECTION_FAILED,
                                          size=cur_size, mtime=cur_mtime))
                 error_count += 1
                 out_f.flush()
@@ -422,31 +592,45 @@ def main():
                 if os.path.exists(sample_path):
                     os.remove(sample_path)
 
+            if lang is None:
+                # Silence, or VAD stripped everything: no language to compare.
+                log("  Whisper detection failed: no language identified.")
+                writer.writerow(make_row(row, verdict=VERDICT_DETECTION_FAILED,
+                                         size=cur_size, mtime=cur_mtime))
+                error_count += 1
+                out_f.flush()
+                continue
+
             declared = row.get("AudioLanguages", "")
             if is_italian(lang):
-                verdict = "MISTAGGED_IS_ITALIAN"
+                verdict = VERDICT_MISTAGGED
                 mistagged_count += 1
             else:
-                verdict = "CONFIRMED_NOT_ITALIAN"
+                verdict = VERDICT_CONFIRMED
                 confirmed_foreign_count += 1
 
-            print(f"  -> detected: {lang} ({prob:.0%}) | declared: {declared} | {verdict}", file=sys.stderr)
+            log(f"  -> detected: {lang} ({prob:.0%}) | declared: {declared} | {verdict}")
 
             writer.writerow(make_row(row, detected=lang, confidence=f"{prob:.2f}",
                                      verdict=verdict, size=cur_size, mtime=cur_mtime))
             out_f.flush()
     finally:
         out_f.close()
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
-    print("\n--- Summary ---", file=sys.stderr)
-    print(f"Reused unchanged:             {len(kept_rows)}", file=sys.stderr)
-    print(f"Dropped (fixed, unflagged):   {dropped_stale}", file=sys.stderr)
-    print(f"Mistagged (actually Italian): {mistagged_count}", file=sys.stderr)
-    print(f"Confirmed not Italian:        {confirmed_foreign_count}", file=sys.stderr)
-    print(f"Errors this run:              {error_count}", file=sys.stderr)
-    print(f"\nFull results written to: {args.output}", file=sys.stderr)
+    log("\n--- Summary ---")
+    log(f"Reused unchanged:             {len(kept_rows)}")
+    log(f"Dropped (fixed, unflagged):   {dropped_stale}")
+    log(f"Mistagged (actually Italian): {mistagged_count}")
+    log(f"Confirmed not Italian:        {confirmed_foreign_count}")
+    log(f"Errors this run:              {error_count}")
+    log(f"\nFull results written to: {args.output}")
+
+    if error_count == len(to_verify):
+        log("ERROR: every file errored this run -- nothing was verified.")
+        log("Check that the media paths are mounted and readable.")
+        return EXIT_ALL_FAILED
+    return EXIT_OK
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
