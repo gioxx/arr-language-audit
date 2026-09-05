@@ -638,6 +638,18 @@ ERROR: broken"
     assert_output --partial "faster_whisper"
 }
 
+@test "find_phase2_python looks in the venv directory it is given" {
+    make_fake_repo
+    make_bin
+    install_shim python3
+    fake_python "$BATS_TEST_TMPDIR/elsewhere/venv/bin/python"
+    export FAKE_PY_HAS_FW=0
+
+    lib_run 'find_phase2_python "$BATS_TEST_TMPDIR/elsewhere/venv"'
+    assert_success
+    assert_output "$BATS_TEST_TMPDIR/elsewhere/venv/bin/python"
+}
+
 # --------------------------------------------------------------- static gate --
 
 @test "shellcheck is clean on the library at -S warning" {

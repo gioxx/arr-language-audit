@@ -300,11 +300,14 @@ python_has_faster_whisper() {
     "$bin" -I -c 'import faster_whisper' >/dev/null 2>&1
 }
 
-# find_phase2_python -- echo the interpreter to run phase 2 with, rc 1 if none
-# has faster_whisper. PYTHON_BIN wins when it is usable; when it is not, say so
-# rather than silently running something the operator did not ask for.
+# find_phase2_python [VENV_DIR] -- echo the interpreter to run phase 2 with,
+# rc 1 if none has faster_whisper. PYTHON_BIN wins when it is usable; when it is
+# not, say so rather than silently running something the operator did not ask
+# for. VENV_DIR defaults to <repo>/verify/venv; the launcher passes the venv
+# beside ITSELF, so a copy of the tree (a test, an operator's second checkout)
+# finds its own venv rather than the one next to this library.
 find_phase2_python() {
-    local venv_python="$ALA_ROOT/verify/venv/bin/python"
+    local venv_python="${1:-$ALA_ROOT/verify/venv}/bin/python"
 
     if [[ -n "${PYTHON_BIN:-}" ]]; then
         if python_has_faster_whisper "$PYTHON_BIN"; then

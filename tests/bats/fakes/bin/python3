@@ -9,7 +9,21 @@
 #   FAKE_PY_ARGLOG   file the worker invocation (`python3 .../foo.py ...`) is
 #                    appended to, with the environment the worker reads.
 #   FAKE_PY_EXIT     exit status of that worker invocation; default 0.
+#
+# The same file is also copied to <repo>/verify/venv/bin/python. There it reads
+# FAKE_PY_HAS_FW_VENV and FAKE_PY_ARGLOG_VENV instead, so a test can give the
+# venv interpreter a different answer than the system one -- which is the whole
+# point of the launcher's venv-first discovery.
 set -u
+
+has_fw="${FAKE_PY_HAS_FW:-1}"
+arglog="${FAKE_PY_ARGLOG:-}"
+case "$0" in
+    */venv/*)
+        has_fw="${FAKE_PY_HAS_FW_VENV:-$has_fw}"
+        arglog="${FAKE_PY_ARGLOG_VENV:-$arglog}"
+        ;;
+esac
 
 version="${FAKE_PY_VERSION:-3.12.0}"
 major_minor="${version%.*}"
@@ -81,7 +95,7 @@ done
 if [[ -n "$snippet" ]]; then
     case "$snippet" in
         *faster_whisper*)
-            if [[ "${FAKE_PY_HAS_FW:-1}" == "1" ]]; then
+            if [[ "$has_fw" == "1" ]]; then
                 exit 0
             fi
             echo "ModuleNotFoundError: No module named 'faster_whisper'" >&2
@@ -107,10 +121,12 @@ fi
 # python3 <script>.py ... ------------------------------------------------
 for arg in "$@"; do
     if [[ "$arg" == *.py ]]; then
-        if [[ -n "${FAKE_PY_ARGLOG:-}" ]]; then
-            printf '%s\n' "$*" >> "$FAKE_PY_ARGLOG"
-            env | grep -E '^(WHISPER_MODEL|LIMIT|RETRY_ERRORS|NO_RESUME|SAMPLE_)' \
-                | sort >> "$FAKE_PY_ARGLOG" || true
+        if [[ -n "$arglog" ]]; then
+            printf '%s\n' "$*" >> "$arglog"
+            # RADARR_/SONARR_ are dumped so a test can prove the launcher
+            # stripped the API keys and nothing else.
+            env | grep -E '^(WHISPER_MODEL|LIMIT|RETRY_ERRORS|NO_RESUME|SAMPLE_|RADARR_|SONARR_)' \
+                | sort >> "$arglog" || true
         fi
         exit "${FAKE_PY_EXIT:-0}"
     fi
