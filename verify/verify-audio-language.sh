@@ -295,6 +295,13 @@ report_missing_python() {
     print_venv_recipe
 }
 
+# ensure_dir <dir> -- create it, or stop with a message of our own. mkdir's own
+# stderr is dropped on purpose: "mkdir: /vol/x: Permission denied" reads like a
+# crash halfway through the run, where this is the launcher refusing to start.
+ensure_dir() {
+    mkdir -p -- "$1" 2>/dev/null || die 1 "cannot create directory: $1"
+}
+
 # check_disk_space -- TEMP_DIR is the PARENT of the run's private sample
 # directory, so it is created here rather than left for df to trip over: a
 # TEMP_DIR that does not exist yet is a normal first run, not an error.
@@ -302,9 +309,8 @@ check_disk_space() {
     local dir min_mb avail_mb
 
     dir="${TEMP_DIR:-${TMPDIR:-/tmp}}"
-    if [[ -n "${TEMP_DIR:-}" ]] && ! mkdir -p -- "$TEMP_DIR"; then
-        err "TEMP_DIR '$TEMP_DIR' does not exist and cannot be created."
-        return 1
+    if [[ -n "${TEMP_DIR:-}" ]]; then
+        ensure_dir "$TEMP_DIR"
     fi
 
     min_mb="${MIN_FREE_SPACE_MB:-500}"
@@ -448,7 +454,7 @@ main() {
     check_disk_space || return 1
 
     # 6. Run the worker, without the *arr credentials it does not need.
-    mkdir -p -- "$(dirname -- "$output_csv")"
+    ensure_dir "$(dirname -- "$output_csv")"
     build_extra_args
 
     log ""

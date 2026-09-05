@@ -51,6 +51,12 @@ setup() {
     export ALA_DOTENV_FILE="$TMP/absent.env"
 }
 
+teardown() {
+    # V21 leaves a mode 500 directory behind; bats' own cleanup must not trip
+    # over it on a host where the parent permissions are not enough.
+    chmod -R u+rwX "$BATS_TEST_TMPDIR" 2>/dev/null || true
+}
+
 # --------------------------------------------------------------------------
 # local helpers
 # --------------------------------------------------------------------------
@@ -167,6 +173,24 @@ arglog_line() {
     [ ! -e "$ARGLOG" ]
 }
 
+@test "V20: the venv wins even when the system interpreter also has the package" {
+    install_venv_shim
+    export FAKE_PY_HAS_FW=1 FAKE_PY_HAS_FW_VENV=1
+
+    run_launcher "$IN" "$OUT"
+    assert_success
+    assert_stderr_contains "faster-whisper found (venv: $TMP/verify/venv)"
+
+    run arglog_line "$VENV_ARGLOG"
+    assert_output "$WORKER --input $IN --output $OUT"
+    [ ! -e "$ARGLOG" ]
+
+    # And the path the orchestrator parses out of --check is the venv's.
+    run_launcher --check
+    assert_success
+    assert_stderr_contains "python via: $TMP/verify/venv/bin/python"
+}
+
 @test "V6: an existing venv without the package gets the pip-into-venv recipe" {
     install_venv_shim
     export FAKE_PY_HAS_FW=0 FAKE_PY_HAS_FW_VENV=0
@@ -260,6 +284,23 @@ arglog_line() {
     [ -d "$TEMP_DIR" ]
     run grep -F -- "$TEMP_DIR" "$DFLOG"
     assert_success
+}
+
+@test "V21: a TEMP_DIR that cannot be created is refused in our own words" {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        skip "root writes into a mode 500 directory regardless"
+    fi
+    mkdir -p "$TMP/readonly"
+    chmod 500 "$TMP/readonly"
+    export TEMP_DIR="$TMP/readonly/samples"
+
+    run_launcher "$IN" "$OUT"
+    assert_failure 1
+    assert_stderr_contains "cannot create directory: $TEMP_DIR"
+    # mkdir's own diagnostic reads like a crash mid-run; ours reads like a
+    # launcher that refused to start.
+    refute_stderr_contains "mkdir:"
+    [ ! -e "$ARGLOG" ]
 }
 
 # --------------------------------------------------------------------------
