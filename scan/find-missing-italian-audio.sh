@@ -287,7 +287,8 @@ permissions 600. ARR_ASSUME_TTY=1 runs it without a terminal; ARR_LOCALHOST
 Exit codes:
   0   completed (with or without findings). The report is built in
       "<OUTPUT_CSV>.tmp.<pid>" and moved into place here, so a reader never
-      sees a partial file.
+      sees a partial file. Being a rename, it gives the report a new file's
+      permissions rather than those of the one it replaces.
   1   missing dependency (jq / curl) or bad arguments.
   2   an enabled app could not be listed after retries. The temporary file is
       discarded, so a previous report survives untouched rather than being
@@ -412,13 +413,17 @@ ask() {
 
     while [[ "$attempt" -le 2 ]]; do
         value=""
+        # "|| true", never "|| value=\"\"": read returns 1 at end of input, but
+        # it has already assigned what it read. A scripted stdin whose last
+        # answer has no trailing newline is still an answer, and discarding it
+        # here would silently turn it into the empty string.
         if [[ -n "$secret" ]]; then
             # The prompt goes to stderr on its own: -s means the answer never
             # reaches the terminal, so nothing closes the line.
-            read -r -s -p "$prompt" value || value=""
+            read -r -s -p "$prompt" value || true
             echo "" >&2
         else
-            read -r -p "$prompt" value || value=""
+            read -r -p "$prompt" value || true
         fi
         [[ -n "$value" ]] || value="$default"
         if [[ "$value" =~ $regex ]]; then
@@ -442,7 +447,7 @@ prompt_app_config() {
 
     log ""
     log "--- $app_label setup ---"
-    read -r -p "Configure $app_label? [Y/n]: " ans || ans=""
+    read -r -p "Configure $app_label? [Y/n]: " ans || true
     if [[ "${ans:-Y}" =~ ^[Nn] ]]; then
         printf -v "$skip_var" "true"
         return 0
@@ -526,7 +531,7 @@ run_wizard() {
 
     log ""
     read -r -p "Save this configuration to $ENV_FILE for next time? [y/N]: " save_ans ||
-        save_ans=""
+        true
     if [[ "${save_ans:-N}" =~ ^[Yy] ]]; then
         write_env_file
         log "Configuration saved to $ENV_FILE (permissions restricted to your user)."
@@ -550,11 +555,15 @@ run_wizard() {
 # the grounds that a stale tag is still worth reporting.
 wait_for_command() {
     local base_url="$1" api_key="$2" command_name="$3"
-    local cmd_id body status elapsed=0
+    local cmd_id body request status elapsed=0
     local interval="${RESCAN_POLL_INTERVAL:-5}"
 
-    if ! body=$(arr_post "$base_url/api/v3/command" "$api_key" \
-        "{\"name\":\"$command_name\"}"); then
+    # jq builds the body rather than string interpolation. Every caller passes
+    # a literal today, so nothing is broken; a helper that produces JSON should
+    # not be one careless argument away from producing something else.
+    request=$(jq -n -c --arg name "$command_name" '{name: $name}')
+
+    if ! body=$(arr_post "$base_url/api/v3/command" "$api_key" "$request"); then
         warn "failed to trigger $command_name."
         return 1
     fi

@@ -486,15 +486,27 @@ print(rows[0]["Path"])
     cp "$CACHE" "$BATS_TEST_TMPDIR/cache-before.json"
 
     arr_control '{"fail_count": {"/sonarr/api/v3/series": 3}}'
+    : > "$FAKE_ARR_LOG"
 
     run_scan
     assert_failure 2
+    # Saved before the next `run` overwrites $output.
+    local hit_lines="$output"
+
     assert_stderr_contains "Sonarr scan failed"
     assert_stderr_contains "scan incomplete: Sonarr unreachable"
     refute_stderr_contains "No files missing Italian audio were found."
 
-    # Radarr was still scanned and its findings are in the report.
-    assert_csv_has 'Radarr,"Salt and Iron",2018,,"English","/media/movies/Salt and Iron (2018)/Salt and Iron (2018).mkv"'
+    # Sonarr failing does not stop Radarr. The report on disk is the previous
+    # run's -- an incomplete run keeps it -- so asserting on the report would
+    # prove nothing about this run: the live evidence is the request log and
+    # the hit lines this run put on stdout.
+    run arr_request_count "/radarr/api/v3/movie"
+    assert_output "1"
+    if [[ "$hit_lines" != *'[Radarr] Salt and Iron (2018) -> audio: English'* ]]; then
+        printf 'Radarr was not scanned; stdout was:\n%s\n' "$hit_lines" >&2
+        return 1
+    fi
 
     run diff "$BATS_TEST_TMPDIR/cache-before.json" "$CACHE"
     assert_success
@@ -966,6 +978,32 @@ EOF
     assert_success
     run arr_request_count "/radarr/api/v3/movie"
     assert_output "1"
+}
+
+@test "S33 twin: an answer with no trailing newline is still an answer" {
+    export FAKE_RADARR_KEY=radarrkey
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+
+    local envfile="$BATS_TEST_TMPDIR/wizard.env" url="$RADARR_URL"
+    : > "$envfile"
+
+    forget_arr_env
+    export SKIP_SONARR=true
+    export ALA_DOTENV_FILE="$envfile"
+    export ARR_ASSUME_TTY=1 ARR_LOCALHOST=127.0.0.1
+
+    # No newline after the final "y": read returns 1 at end of input having
+    # already assigned it, and a prompt that discarded the value on that rc
+    # would read it as "do not save".
+    printf 'y\n%s\nradarrkey\ny' "$url" > "$BATS_TEST_TMPDIR/answers"
+    run --separate-stderr "$BASH_UNDER_TEST" "$SCAN" "$OUT" \
+        < "$BATS_TEST_TMPDIR/answers"
+    assert_success
+
+    run grep -cxF "RADARR_API_KEY=radarrkey" "$envfile"
+    assert_output "1"
+    run file_mode "$envfile"
+    assert_output "600"
 }
 
 @test "S37: the wizard rejects a URL with a space and saves nothing" {
