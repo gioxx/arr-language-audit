@@ -3,11 +3,17 @@
 Two halves:
 
   * direct unit tests of `plan_rows`, which is pure -- it is handed the input
-    rows, the previous rows and a `signature` callable, and touches nothing
-    else. No filesystem, no CSV, no model.
+    rows, the previous rows and a `signature` callable, and reaches the disk
+    through none of them. They pass no path that exists, read and write no
+    CSV and build no model; the injected `Signatures` fake answers from a
+    dict and records every call.
   * end-to-end runs through `main()` that pin the resume behaviour the user
     actually sees, using the fake `faster_whisper` package and the ffmpeg
     shims (see conftest.py).
+
+The module-level fixtures isolate the environment (a clean env, a private
+stand-in for the system temp dir) for that second half; the unit tests are
+unaffected by them.
 """
 
 from __future__ import annotations
@@ -139,23 +145,29 @@ def test_plan_rows_without_previous_verifies_everything():
 
 def test_plan_rows_keeps_unchanged_and_verifies_changed():
     """The split the whole feature exists for, plus the signature cache: one
-    stat per distinct path, however many times the path is consulted."""
-    rows = [phase1_row("/m/a.mkv"), phase1_row("/m/b.mkv")]
+    stat per distinct path, however many rows -- input rows and orphan rows
+    alike -- are decided from it."""
+    rows = [phase1_row("/m/a.mkv", episode="S01E01"),
+            phase1_row("/m/a.mkv", episode="S01E02"),
+            phase1_row("/m/b.mkv")]
     previous = {
-        key("/m/a.mkv"): prev_row("/m/a.mkv", size="1", mtime="2"),
-        key("/m/b.mkv"): prev_row("/m/b.mkv", size="3", mtime="4"),
-        # an orphan on the same path as an input row: must not cost a 2nd stat
-        key("/m/a.mkv", "S01E09"): prev_row("/m/a.mkv", episode="S01E09",
+        key("/m/a.mkv", "S01E01"): prev_row("/m/a.mkv", episode="S01E01",
                                             size="1", mtime="2"),
+        key("/m/a.mkv", "S01E02"): prev_row("/m/a.mkv", episode="S01E02",
+                                            size="1", mtime="2"),
+        key("/m/b.mkv"): prev_row("/m/b.mkv", size="3", mtime="4"),
+        key("/m/c.mkv"): prev_row("/m/c.mkv", size="5", mtime="6"),
     }
-    sig = Signatures({"/m/a.mkv": (1, 2), "/m/b.mkv": (99, 4)})
+    sig = Signatures({"/m/a.mkv": (1, 2), "/m/b.mkv": (99, 4), "/m/c.mkv": (5, 6)})
 
     plan = vam.plan_rows(rows, previous, retry_errors=False, limit=0, signature=sig)
 
-    assert [r["Path"] for r in plan.kept] == ["/m/a.mkv"]
+    assert [r["Episode"] for r in plan.kept] == ["S01E01", "S01E02"]
     assert [r["Path"] for r in plan.to_verify] == ["/m/b.mkv"]
-    assert [r["Episode"] for r in plan.orphans] == ["S01E09"]
-    assert sorted(sig.calls) == ["/m/a.mkv", "/m/b.mkv"]
+    assert [r["Path"] for r in plan.orphans] == ["/m/c.mkv"]
+    # Four rows on /m/a.mkv, /m/b.mkv and /m/c.mkv -> three stats, not five.
+    assert sorted(sig.calls) == ["/m/a.mkv", "/m/b.mkv", "/m/c.mkv"]
+    assert len(sig.calls) == 3
 
 
 def test_plan_rows_keys_on_path_and_episode():
@@ -190,6 +202,112 @@ def test_plan_rows_limit_defers_previous_rows_of_the_remainder():
     assert [r["Path"] for r in plan.deferred] == ["/m/b.mkv"]
     assert plan.deferred[0]["Verdict"] == audit_common.VERDICT_CONFIRMED
     assert plan.kept == []
+
+
+def test_plan_rows_limit_does_not_touch_the_orphan_rules():
+    """--limit caps the work, and nothing else: which previous rows are
+    carried over and which are dropped is decided from `previous` and the
+    input alone, so a limited run reports the same orphans as a full one."""
+    rows = [phase1_row("/m/a.mkv"), phase1_row("/m/b.mkv")]
+    previous = {
+        key("/m/b.mkv"): prev_row("/m/b.mkv", size="1", mtime="2"),
+        key("/m/orphan-same.mkv"): prev_row("/m/orphan-same.mkv", size="3", mtime="4"),
+        key("/m/orphan-changed.mkv"): prev_row(
+            "/m/orphan-changed.mkv", size="5", mtime="6"),
+    }
+    table = {"/m/a.mkv": (9, 9), "/m/b.mkv": (7, 7),
+             "/m/orphan-same.mkv": (3, 4), "/m/orphan-changed.mkv": (99, 6)}
+
+    full = vam.plan_rows(rows, previous, retry_errors=False, limit=0,
+                         signature=Signatures(table))
+    limited = vam.plan_rows(rows, previous, retry_errors=False, limit=1,
+                            signature=Signatures(table))
+
+    assert [r["Path"] for r in limited.orphans] == ["/m/orphan-same.mkv"]
+    assert limited.orphans == full.orphans
+    assert limited.dropped_stale == full.dropped_stale == 1
+    assert limited.dropped_superseded == full.dropped_superseded == 0
+    # ... and only to_verify/deferred differ between the two.
+    assert [r["Path"] for r in full.to_verify] == ["/m/a.mkv", "/m/b.mkv"]
+    assert [r["Path"] for r in limited.to_verify] == ["/m/a.mkv"]
+    assert [r["Path"] for r in limited.deferred] == ["/m/b.mkv"]
+
+
+def test_plan_rows_carries_a_verdict_across_an_episode_relabel():
+    """Phase 1 renaming an episode changes the row's key but not one byte of
+    the media: the verdict moves to the new label instead of being re-earned,
+    and the row under the old label does not survive beside it."""
+    rows = [phase1_row("/m/x.mkv", episode="S01E01 - The Pilot")]
+    previous = {
+        key("/m/x.mkv", "S01E01 - Pilot"): prev_row(
+            "/m/x.mkv", audit_common.VERDICT_CONFIRMED, episode="S01E01 - Pilot",
+            size="1", mtime="2", detected="en", confidence="0.88"),
+    }
+    sig = Signatures({"/m/x.mkv": (1, 2)})
+
+    plan = vam.plan_rows(rows, previous, retry_errors=False, limit=0, signature=sig)
+
+    assert plan.to_verify == []
+    assert plan.orphans == []
+    assert plan.dropped_superseded == 0
+    assert len(plan.kept) == 1
+    carried = plan.kept[0]
+    assert carried["Episode"] == "S01E01 - The Pilot"
+    assert carried["Verdict"] == audit_common.VERDICT_CONFIRMED
+    assert carried["DetectedLanguage"] == "en"
+    assert carried["Confidence"] == "0.88"
+    assert (carried["FileSize"], carried["FileMtime"]) == ("1", "2")
+
+
+@pytest.mark.parametrize(
+    ("previous_row", "table"),
+    [
+        # the file changed as well as the label: the old verdict is worthless
+        (prev_row("/m/x.mkv", episode="old", size="1", mtime="2"), {"/m/x.mkv": (99, 2)}),
+        # an error verdict is never carried onto a new label
+        (prev_row("/m/x.mkv", audit_common.VERDICT_DETECTION_FAILED, episode="old",
+                  size="1", mtime="2"), {"/m/x.mkv": (1, 2)}),
+        # a legacy row has no signature to prove it is the same file
+        (prev_row("/m/x.mkv", episode="old"), {"/m/x.mkv": (1, 2)}),
+    ],
+)
+def test_plan_rows_drops_a_superseded_row_it_cannot_carry_over(previous_row, table):
+    """The old label still goes: keeping it would show the file twice for
+    ever, since a metadata edit never changes the signature."""
+    rows = [phase1_row("/m/x.mkv", episode="new")]
+    previous = {key("/m/x.mkv", "old"): previous_row}
+
+    plan = vam.plan_rows(rows, previous, retry_errors=False, limit=0,
+                         signature=Signatures(table))
+
+    assert [r["Episode"] for r in plan.to_verify] == ["new"]
+    assert plan.kept == []
+    assert plan.orphans == []
+    assert plan.dropped_superseded == 1
+    assert plan.dropped_stale == 0
+
+
+def test_plan_rows_relabel_never_steals_a_row_another_input_row_owns():
+    """R2 must survive the relabel rule: with two episodes in one file, the
+    second episode's own previous row is not a candidate for the first."""
+    rows = [phase1_row("/m/dual.mkv", episode="S01E01"),
+            phase1_row("/m/dual.mkv", episode="S01E03")]
+    previous = {
+        key("/m/dual.mkv", "S01E01"): prev_row(
+            "/m/dual.mkv", episode="S01E01", size="1", mtime="2"),
+        key("/m/dual.mkv", "S01E02"): prev_row(
+            "/m/dual.mkv", episode="S01E02", size="1", mtime="2"),
+    }
+    sig = Signatures({"/m/dual.mkv": (1, 2)})
+
+    plan = vam.plan_rows(rows, previous, retry_errors=False, limit=0, signature=sig)
+
+    # S01E01 keeps its own row; S01E03 inherits S01E02's, the only one going
+    # spare -- and neither is verified again.
+    assert [r["Episode"] for r in plan.kept] == ["S01E01", "S01E03"]
+    assert plan.to_verify == []
+    assert plan.orphans == []
+    assert plan.dropped_superseded == 0
 
 
 def test_plan_rows_drops_only_orphans_that_provably_changed():
@@ -507,6 +625,79 @@ def test_two_episodes_of_one_file_keep_their_own_rows(tmp_path, shim_path,
     assert len(rows) == 2
     assert [r["Episode"] for r in rows] == ["S01E01 - A", "S01E02 - B"]
     assert [r["Path"] for r in rows] == [path, path]
+
+
+# --- Y35: an episode phase 1 relabelled ------------------------------------
+
+
+def test_relabelled_episode_keeps_its_verdict_without_relistening(
+    tmp_path, shim_path, whisper_script, capsys
+):
+    """Y35: renaming an episode in Sonarr must not cost an hour of CPU, and
+    must not leave the same file in the report twice for ever."""
+    path = media(tmp_path, "x.mkv")
+    whisper_script({"*": ["en", 0.9]})
+    out = str(tmp_path / "out.csv")
+
+    old = write_phase1(tmp_path, [phase1_row(path, title="Show",
+                                             episode="S01E01 - Pilot")])
+    assert vam.main(["--input", old, "--output", out]) == 0
+    assert faster_whisper.WhisperModel.calls == [path]
+    _header, rows = read_rows(out)
+    assert rows[0]["Verdict"] == audit_common.VERDICT_CONFIRMED
+
+    new_input = write_phase1(tmp_path, [phase1_row(path, title="Show",
+                                                   episode="S01E01 - The Pilot")],
+                             name="in2.csv")
+    reset_model_recording()
+    capsys.readouterr()
+
+    assert vam.main(["--input", new_input, "--output", out]) == 0
+
+    # No model was even constructed: nothing needed listening to.
+    assert faster_whisper.WhisperModel.instances == []
+    assert faster_whisper.WhisperModel.calls == []
+
+    _header, rows = read_rows(out)
+    assert len(rows) == 1
+    assert rows[0]["Episode"] == "S01E01 - The Pilot"
+    assert rows[0]["Verdict"] == audit_common.VERDICT_CONFIRMED
+    assert rows[0]["DetectedLanguage"] == "en"
+    assert (rows[0]["FileSize"], rows[0]["FileMtime"]) == signature_of(path)
+
+    # A third run must be a no-op too: the old label is gone for good, not
+    # carried along as an orphan that reappears on every run.
+    reset_model_recording()
+    assert vam.main(["--input", new_input, "--output", out]) == 0
+    _header, rows = read_rows(out)
+    assert len(rows) == 1
+    assert faster_whisper.WhisperModel.instances == []
+
+
+def test_relabelled_episode_whose_file_also_changed_is_dropped_and_reverified(
+    tmp_path, shim_path, whisper_script, capsys
+):
+    """Y35 twin: when the verdict cannot be carried over, the old label is
+    still dropped -- one row for one file, either way."""
+    path = media(tmp_path, "x.mkv")
+    whisper_script({"*": ["it", 0.95]})
+    out = write_phase2(tmp_path, [
+        prev_row(path, audit_common.VERDICT_CONFIRMED, episode="S01E01 - Pilot",
+                 size="1", mtime="1"),
+    ], name="out.csv")
+    inp = write_phase1(tmp_path, [phase1_row(path, episode="S01E01 - The Pilot")])
+
+    assert vam.main(["--input", inp, "--output", out]) == 0
+
+    err = capsys.readouterr().err
+    assert "Dropped 1 superseded row(s): same file, relabelled by phase 1." in err
+    assert "Carrying over" not in err
+
+    assert faster_whisper.WhisperModel.calls == [path]
+    _header, rows = read_rows(out)
+    assert len(rows) == 1
+    assert rows[0]["Episode"] == "S01E01 - The Pilot"
+    assert rows[0]["Verdict"] == audit_common.VERDICT_MISTAGGED
 
 
 # --- Y34: R3, an unstamped error row whose file came back ------------------

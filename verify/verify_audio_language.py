@@ -36,12 +36,18 @@ dropped; if its signature still matches (the scan just had a narrower
 scope) or the file is gone, the row is kept. Use the orchestrator's
 "Reset reports" action to wipe everything and start over.
 
+An episode phase 1 relabels keeps its verdict: the row under the old label
+is superseded and dropped, and the verdict moves to the new one as long as
+the file's signature is unchanged. Renaming an episode never costs a
+re-listen, and never leaves the same file in the report twice.
+
 --limit caps how many files are (re)verified in one run; the rows it cuts
 keep the verdict they already had, so a limited run never empties out the
 report.
 
-    --retry-errors   also reprocess rows that previously failed
-                     (FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)
+    --retry-errors   also reprocess rows whose previous verdict is
+                     retryable (FILE_NOT_FOUND, EXTRACTION_FAILED,
+                     DETECTION_FAILED, LOW_CONFIDENCE)
     --no-resume      ignore any existing output file and start fresh
                      (overwrites it)
 
@@ -407,11 +413,13 @@ def make_row(row: Mapping[str, str], *, detected="", confidence="", verdict="",
 class Plan:
     """What a run has to do, decided before anything is opened for writing.
 
-    kept           finished output rows reused unchanged (input order)
-    to_verify      input rows needing detection (input order, already limited)
-    deferred       previous rows for the rows --limit cut from to_verify
-    orphans        previous rows whose key is no longer in the input
-    dropped_stale  previous rows discarded because the file was fixed
+    kept                finished output rows reused unchanged (input order)
+    to_verify           input rows needing detection (input order, limited)
+    deferred            previous rows for the rows --limit cut from to_verify
+    orphans             previous rows whose key is no longer in the input
+    dropped_stale       previous rows discarded because the file was fixed
+    dropped_superseded  previous rows discarded because phase 1 relabelled
+                        the same file under a different episode
     """
 
     kept: list[dict]
@@ -419,6 +427,39 @@ class Plan:
     deferred: list[dict]
     orphans: list[dict]
     dropped_stale: int
+    dropped_superseded: int
+
+
+def _carry_over(candidates, *, input_keys, consumed, cur_size, cur_mtime,
+                retry_errors: bool):
+    """The previous verdict for this same file under a different episode
+    label, or (None, None).
+
+    Phase 1 relabelling an episode ("S01E01 - Pilot" -> "S01E01 - The Pilot")
+    changes the row's key without changing a byte of the media. Re-listening
+    to the audio for that would be an hour of CPU spent on a metadata edit,
+    so the verdict moves to the new label instead -- but only when the file
+    is provably the same one it was verified against: a stored signature,
+    equal to the current one, on a row that was actually verified."""
+    for pkey, entry in candidates:
+        # A candidate the input still lists under its own key belongs to that
+        # row, and one already claimed by an earlier input row is spoken for.
+        if pkey in input_keys or pkey in consumed:
+            continue
+        if (entry.get("Verdict", "") or "").strip() in ERROR_VERDICTS:
+            continue
+        prev_size = (entry.get("FileSize", "") or "").strip()
+        prev_mtime = (entry.get("FileMtime", "") or "").strip()
+        if not prev_size or not prev_mtime or cur_size is None or cur_mtime is None:
+            continue
+        if str(cur_size) != prev_size or str(cur_mtime) != prev_mtime:
+            continue
+        # --retry-errors still wins: a row it would have re-run under its own
+        # key must not sneak through as a relabel.
+        if resume_decision(entry, cur_size, cur_mtime, retry_errors) != "keep":
+            continue
+        return pkey, entry
+    return None, None
 
 
 def plan_rows(input_rows, previous, *, retry_errors: bool, limit: int,
@@ -436,9 +477,17 @@ def plan_rows(input_rows, previous, *, retry_errors: bool, limit: int,
             cache[path] = signature(path)
         return cache[path]
 
+    input_keys = {row_key(row) for row in input_rows}
+    input_paths = {k[0] for k in input_keys if k[0]}
+    # Previous rows grouped by path. A file phase 1 relabelled has no row
+    # under its new key, but its verdict is still there under the old one.
+    by_path: dict[str, list] = {}
+    for pkey, entry in previous.items():
+        by_path.setdefault(pkey[0], []).append((pkey, entry))
+
     kept = []
     pending = []       # (input row, its previous row or None), input order
-    seen = set()
+    consumed = set()   # previous keys claimed by a relabelled input row
     for row in input_rows:
         key = row_key(row)
         if not key[0]:
@@ -446,14 +495,35 @@ def plan_rows(input_rows, previous, *, retry_errors: bool, limit: int,
             # records it as FILE_NOT_FOUND.
             pending.append((row, None))
             continue
-        seen.add(key)
         cur_size, cur_mtime = signature_of(key[0])
         entry = previous.get(key)
+        if entry is None:
+            pkey, source = _carry_over(
+                by_path.get(key[0], ()), input_keys=input_keys, consumed=consumed,
+                cur_size=cur_size, cur_mtime=cur_mtime, retry_errors=retry_errors,
+            )
+            if source is not None:
+                # Same file, same signature, new label: the verdict moves to
+                # the new row and the old key is dropped as superseded below.
+                consumed.add(pkey)
+                kept.append(make_row(
+                    row,
+                    detected=(source.get("DetectedLanguage", "") or ""),
+                    confidence=(source.get("Confidence", "") or ""),
+                    verdict=(source.get("Verdict", "") or ""),
+                    size=cur_size, mtime=cur_mtime,
+                ))
+                continue
         if resume_decision(entry, cur_size, cur_mtime, retry_errors) == "verify":
             pending.append((row, entry))
             continue
         # A kept error row must not be stamped with a signature it was never
-        # verified against, or resume_decision can never retry it again.
+        # verified against, or resume_decision can never retry it again. This
+        # is deliberately ERROR_VERDICTS and not the wider RETRYABLE_VERDICTS
+        # --retry-errors uses above: a LOW_CONFIDENCE row was really listened
+        # to and owns a true signature, so stamping it again is correct and
+        # costs it nothing -- only rows that never got that far must stay
+        # unstamped, or R3 can never notice their file came back.
         if (entry.get("Verdict", "") or "").strip() in ERROR_VERDICTS:
             kept.append(normalise_previous(entry))
         else:
@@ -476,8 +546,18 @@ def plan_rows(input_rows, previous, *, retry_errors: bool, limit: int,
     #    full scan should not cost hours of re-verification.
     orphans = []
     dropped_stale = 0
+    dropped_superseded = 0
     for key, entry in previous.items():
-        if key in seen:
+        if key in input_keys or key in consumed:
+            continue
+        if key[0] in input_paths:
+            # The input still lists this file, under a different episode
+            # label: phase 1 renamed the episode. The row for the new label
+            # is handled above (with this verdict carried over when the file
+            # is provably unchanged). Keeping this one too would show the
+            # same file twice, for ever -- a metadata edit never changes the
+            # signature, so nothing would ever clear it.
+            dropped_superseded += 1
             continue
         prev_size = (entry.get("FileSize", "") or "").strip()
         prev_mtime = (entry.get("FileMtime", "") or "").strip()
@@ -489,7 +569,8 @@ def plan_rows(input_rows, previous, *, retry_errors: bool, limit: int,
         orphans.append(normalise_previous(entry))
 
     return Plan(kept=kept, to_verify=to_verify, deferred=deferred,
-                orphans=orphans, dropped_stale=dropped_stale)
+                orphans=orphans, dropped_stale=dropped_stale,
+                dropped_superseded=dropped_superseded)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -526,8 +607,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Only (re)verify the first N files that need it (0 = all); "
                              "the rows it cuts keep the verdict they already had")
     parser.add_argument("--retry-errors", action="store_true",
-                        help="Also reprocess rows that previously failed "
-                             "(FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)")
+                        help="Also reprocess rows whose previous verdict is retryable "
+                             "(FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED, "
+                             "LOW_CONFIDENCE)")
     parser.add_argument("--no-resume", action="store_true",
                         help="Ignore any existing output file and start fresh (overwrites it)")
     return parser
@@ -632,6 +714,9 @@ def _log_plan(plan: Plan, total: int) -> None:
     if plan.dropped_stale:
         log(f"Dropped {plan.dropped_stale} stale row(s): file changed and is no longer "
             "flagged by phase 1.")
+    if plan.dropped_superseded:
+        log(f"Dropped {plan.dropped_superseded} superseded row(s): same file, "
+            "relabelled by phase 1.")
     log(f"Loaded {total} suspect file(s) total, "
         f"{len(plan.to_verify)} to (re)verify now.")
 
@@ -696,6 +781,7 @@ def _run(args, cfg: Config, temp_dir: str) -> int:
     log("\n--- Summary ---")
     log(f"Reused unchanged:             {len(plan.kept)}")
     log(f"Dropped (fixed, unflagged):   {plan.dropped_stale}")
+    log(f"Dropped (relabelled):         {plan.dropped_superseded}")
     log(f"Mistagged (actually Italian): {counts.get(VERDICT_MISTAGGED, 0)}")
     log(f"Confirmed not Italian:        {counts.get(VERDICT_CONFIRMED, 0)}")
     log(f"Errors this run:              {error_count}")
