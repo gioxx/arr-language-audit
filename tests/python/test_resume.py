@@ -287,6 +287,71 @@ def test_plan_rows_drops_a_superseded_row_it_cannot_carry_over(previous_row, tab
     assert plan.dropped_stale == 0
 
 
+@pytest.mark.parametrize(
+    ("retry_errors", "carried"),
+    [(False, True), (True, False)],
+)
+def test_plan_rows_relabelled_low_confidence_follows_the_retry_errors_rule(
+    retry_errors, carried
+):
+    """A LOW_CONFIDENCE row was really listened to, so a relabel treats it
+    exactly as its own key would: carried over while --retry-errors is off,
+    re-verified under the new label when it is on. Only error verdicts are
+    excluded from carry-over outright, because they were never earned."""
+    rows = [phase1_row("/m/x.mkv", episode="new")]
+    previous = {
+        key("/m/x.mkv", "old"): prev_row(
+            "/m/x.mkv", audit_common.VERDICT_LOW_CONFIDENCE, episode="old",
+            size="1", mtime="2", detected="en", confidence="0.41"),
+    }
+    sig = Signatures({"/m/x.mkv": (1, 2)})
+
+    plan = vam.plan_rows(rows, previous, retry_errors=retry_errors, limit=0,
+                         signature=sig)
+
+    assert plan.orphans == []
+    if carried:
+        assert plan.to_verify == []
+        assert [r["Episode"] for r in plan.kept] == ["new"]
+        assert plan.kept[0]["Verdict"] == audit_common.VERDICT_LOW_CONFIDENCE
+        assert plan.kept[0]["Confidence"] == "0.41"
+        assert plan.dropped_superseded == 0
+    else:
+        assert plan.kept == []
+        assert [r["Episode"] for r in plan.to_verify] == ["new"]
+        # The old label goes either way -- one file, one row.
+        assert plan.dropped_superseded == 1
+
+
+def test_plan_rows_carries_over_exactly_one_of_several_old_labels():
+    """Two old labels for one file and a single new one: the verdict is
+    carried once and the surplus row is dropped, never written twice."""
+    rows = [phase1_row("/m/x.mkv", episode="new")]
+    previous = {
+        key("/m/x.mkv", "old-a"): prev_row(
+            "/m/x.mkv", audit_common.VERDICT_CONFIRMED, episode="old-a",
+            size="1", mtime="2", detected="en", confidence="0.90"),
+        key("/m/x.mkv", "old-b"): prev_row(
+            "/m/x.mkv", audit_common.VERDICT_MISTAGGED, episode="old-b",
+            size="1", mtime="2", detected="it", confidence="0.95"),
+    }
+    sig = Signatures({"/m/x.mkv": (1, 2)})
+
+    plan = vam.plan_rows(rows, previous, retry_errors=False, limit=0, signature=sig)
+
+    assert len(plan.kept) == 1
+    assert plan.kept[0]["Episode"] == "new"
+    # The first candidate in the previous CSV's own order wins, deterministically.
+    assert plan.kept[0]["Verdict"] == audit_common.VERDICT_CONFIRMED
+    assert plan.dropped_superseded == 1
+    assert plan.to_verify == []
+    assert plan.deferred == []
+    assert plan.orphans == []
+    # One file, one row -- whatever else the plan holds.
+    written = plan.kept + plan.deferred + plan.orphans
+    assert [r["Path"] for r in written] == ["/m/x.mkv"]
+
+
 def test_plan_rows_relabel_never_steals_a_row_another_input_row_owns():
     """R2 must survive the relabel rule: with two episodes in one file, the
     second episode's own previous row is not a candidate for the first."""

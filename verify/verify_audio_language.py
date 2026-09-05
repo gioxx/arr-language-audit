@@ -446,6 +446,12 @@ def _carry_over(candidates, *, input_keys, consumed, cur_size, cur_mtime,
         # row, and one already claimed by an earlier input row is spoken for.
         if pkey in input_keys or pkey in consumed:
             continue
+        # ERROR_VERDICTS only, deliberately not the wider RETRYABLE_VERDICTS:
+        # an error row was never verified against this file, so there is no
+        # verdict to move. LOW_CONFIDENCE was earned, so it follows exactly
+        # the same retry_errors rule here as it would under its own key --
+        # carried when the flag is off, re-verified when it is on, which the
+        # resume_decision call below enforces.
         if (entry.get("Verdict", "") or "").strip() in ERROR_VERDICTS:
             continue
         prev_size = (entry.get("FileSize", "") or "").strip()
