@@ -104,7 +104,10 @@ assert_csv_has() {
 # file_mode <path> -- the permission bits as three octal digits, on BSD and on
 # GNU stat alike.
 file_mode() {
-    stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"
+    # GNU stat first: on BSD "-c" is an illegal option and fails, falling
+    # through to the BSD spelling. The other order is wrong: GNU accepts
+    # "stat -f" (file-system status) and prints six lines instead of a mode.
+    stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
 }
 
 # tmp_leftovers -- how many "<report>.tmp.<pid>" files survive next to $OUT. A
