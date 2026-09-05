@@ -43,7 +43,8 @@ STATIC_ROUTES = {
 }
 
 _lock = threading.Lock()
-_command_polls = {"count": 0}
+# One counter per app: a Radarr poll must not consume Sonarr's sequence.
+_command_polls = {}
 
 
 def _fixture_dir() -> Path:
@@ -95,13 +96,13 @@ def _take_scheduled_failure(request_path: str) -> bool:
         return True
 
 
-def _next_command_status() -> str:
-    """Next element of control.command_status; the last value repeats."""
+def _next_command_status(app: str) -> str:
+    """Next element of control.command_status for this app; the last repeats."""
     statuses = _read_control().get("command_status") or ["completed"]
     with _lock:
-        index = min(_command_polls["count"], len(statuses) - 1)
-        _command_polls["count"] += 1
-    return statuses[index]
+        polls = _command_polls.get(app, 0)
+        _command_polls[app] = polls + 1
+    return statuses[min(polls, len(statuses) - 1)]
 
 
 def _resolve_fixture(app: str, route: str, query: dict) -> Path | None:
@@ -198,7 +199,7 @@ class Handler(BaseHTTPRequestHandler):
         if route == "command" and method == "POST":
             return 201, {"id": COMMAND_ID, "status": "queued"}
         if route == f"command/{COMMAND_ID}" and method == "GET":
-            return 200, {"id": COMMAND_ID, "status": _next_command_status()}
+            return 200, {"id": COMMAND_ID, "status": _next_command_status(app)}
         if method != "GET":
             return 405, {"message": "Method not allowed"}
         fixture = _resolve_fixture(app, route, query)

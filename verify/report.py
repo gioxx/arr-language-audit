@@ -36,6 +36,8 @@ Exit codes:
     1   input CSV not found / unreadable
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import datetime

@@ -74,3 +74,15 @@ def test_a_scripted_null_language_is_returned_as_none(fake_wav, whisper_script):
     model = faster_whisper.WhisperModel("small")
 
     assert model.detect_language(audio=wav) == (None, 0.0, [])
+
+
+def test_product_modules_import_on_floor():
+    """L5: the modules must import on the declared Python floor, not just on the
+    interpreter the developer happens to run."""
+    # Imported inside the test on purpose: a failure here must be this test
+    # failing, not the whole module failing to collect.
+    import report  # noqa: PLC0415
+    import verify_audio_language  # noqa: PLC0415
+
+    assert callable(report.main)
+    assert callable(verify_audio_language.main)

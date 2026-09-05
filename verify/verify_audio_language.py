@@ -51,6 +51,8 @@ Environment variables (optional):
     TEMP_DIR           directory for temporary audio samples (default: mktemp)
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import json

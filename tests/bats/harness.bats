@@ -11,6 +11,12 @@ teardown() {
     stop_fake_arr
 }
 
+# Local to this file: GET the fake command and print just its status.
+# poll_command_status <app-url> <api-key>
+poll_command_status() {
+    curl -sf -H "X-Api-Key: $2" "$1/api/v3/command/42" | "${REAL_JQ:-jq}" -r '.status'
+}
+
 @test "fake server serves the system/status fixture and logs the request" {
     start_fake_arr "$BATS_TESTS_DIR/fixtures"
 
@@ -148,4 +154,63 @@ teardown() {
     run cat "$RECORDER_LOG"
     assert_output --partial "argv: $BATS_TEST_TMPDIR/fake-scan.sh --refresh"
     assert_output --partial "env: RADARR_URL=http://127.0.0.1:1/radarr"
+}
+
+@test "command_status walks the scripted sequence and repeats the last value" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    arr_control '{"command_status": ["queued", "completed"]}'
+
+    run curl -sf -X POST -H "X-Api-Key: radarr-key" "$RADARR_URL/api/v3/command"
+    assert_success
+    assert_output --partial '"status": "queued"'
+
+    run poll_command_status "$RADARR_URL" radarr-key
+    assert_output "queued"
+
+    run poll_command_status "$RADARR_URL" radarr-key
+    assert_output "completed"
+
+    run poll_command_status "$RADARR_URL" radarr-key
+    assert_output "completed"
+}
+
+@test "each app walks command_status independently" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    arr_control '{"command_status": ["queued", "completed"]}'
+
+    run poll_command_status "$RADARR_URL" radarr-key
+    assert_output "queued"
+
+    # Sonarr has not polled yet, so it must still see the first element.
+    run poll_command_status "$SONARR_URL" sonarr-key
+    assert_output "queued"
+
+    run poll_command_status "$RADARR_URL" radarr-key
+    assert_output "completed"
+
+    run poll_command_status "$SONARR_URL" sonarr-key
+    assert_output "completed"
+}
+
+@test "control crlf makes every response body end with CRLF" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    arr_control '{"crlf": true}'
+
+    curl -sf -H "X-Api-Key: radarr-key" \
+        -o "$BATS_TEST_TMPDIR/body.json" "$RADARR_URL/api/v3/system/status"
+
+    run bash -c "tail -c 2 '$BATS_TEST_TMPDIR/body.json' | od -An -t x1 | tr -d ' \n'"
+    assert_output "0d0a"
+}
+
+@test "write_csv writes CRLF line endings like csv.DictWriter" {
+    write_csv "$BATS_TEST_TMPDIR/rows.csv" "App,Title" "Radarr,Il Cammino Lungo"
+
+    run grep -c $'\r$' "$BATS_TEST_TMPDIR/rows.csv"
+    assert_success
+    assert_output "2"
+
+    # Exactly two CR bytes: one per line, none anywhere else.
+    run bash -c "tr -dc '\r' < '$BATS_TEST_TMPDIR/rows.csv' | wc -c | tr -d ' '"
+    assert_output "2"
 }
