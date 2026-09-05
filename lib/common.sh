@@ -141,27 +141,41 @@ _ala_key_allowed() {
 # load_dotenv <file> -- set the allow-listed keys the file defines, rc 1 if the
 # file does not exist.
 #
-#   * blank lines and # comments are skipped;
-#   * only KEY=value with a shell-identifier KEY is accepted, anything else is
-#     ignored, so a stray command in the file is inert;
-#   * a trailing CR (a file edited on Windows) is removed;
+#   * blank lines and # comments are skipped, leading whitespace and a trailing
+#     CR (a file edited on Windows) are removed first;
+#   * only KEY=value with a shell-identifier KEY is accepted; any other
+#     non-blank line is reported and ignored, so a stray command in the file is
+#     inert and a typo is visible instead of silent;
 #   * one pair of matching surrounding quotes is removed from the value, and
 #     nothing else about it is interpreted -- no expansion, no substitution;
-#   * a variable already set in the environment wins over the file, so
-#     `LIMIT=5 ./scan.sh` beats what .env says;
+#   * a variable that is already set AND non-empty wins over the file, so
+#     `LIMIT=5 ./scan.sh` beats what .env says. Set-but-empty counts as unset:
+#     a caller that writes `LIMIT="${LIMIT:-}"` before calling must not thereby
+#     void its own .env. The same rule makes the first non-empty value for a
+#     duplicated key win over the later ones;
 #   * nothing is exported: a caller that wants a child to see a value exports
 #     it itself.
 load_dotenv() {
-    local file="${1:-}" line key value name
+    local file="${1:-}" line key value name lineno=0
     [[ -f "$file" ]] || return 1
 
     # `|| [[ -n "$line" ]]` so a last line without a newline is still read.
     while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
         line="${line%$'\r'}"
+        # An indented key is a human writing a config file, not an error.
+        while [[ "$line" == [[:space:]]* ]]; do
+            line="${line#?}"
+        done
         case "$line" in
             '' | '#'*) continue ;;
         esac
-        [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+        if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            # The line number, never the line: a malformed line can still hold
+            # most of an API key.
+            warn "$file:$lineno: ignoring malformed line"
+            continue
+        fi
         key="${BASH_REMATCH[1]}"
         value="${BASH_REMATCH[2]}"
 
@@ -176,8 +190,10 @@ load_dotenv() {
             esac
         fi
 
-        # Already set in the environment: the caller's value wins.
-        declare -p "$key" >/dev/null 2>&1 && continue
+        # Already set and non-empty: the caller's value wins. `declare -p`
+        # would also succeed for a set-but-empty variable, which would let a
+        # caller's own `X="${X:-}"` default silently void the .env.
+        [[ -n "${!key:-}" ]] && continue
         printf -v "$key" '%s' "$value"
     done < "$file"
 
@@ -214,12 +230,21 @@ arr_curl() {
 # last attempt has failed. *arr answers 503 while it is starting up and the
 # scans are long enough to hit a restart, so a transient failure is retried.
 arr_get() {
-    local url="${1:-}" key="${2:-}" tries="${3:-3}" attempt=1 body
+    local url="${1:-}" key="${2:-}" tries="${3:-3}" attempt=1 body rc=0
     while :; do
+        # The assignment stays inside the `if` so a caller running under
+        # `set -e` is not killed by a failed attempt; the `else` branch is
+        # where curl's own exit status is still readable.
         if body="$(arr_curl "$key" -m "${ARR_TIMEOUT:-120}" "$url")"; then
             printf '%s\n' "$body"
             return 0
+        else
+            rc=$?
         fi
+        # -s and -f leave curl silent, so without this a wrong key or a
+        # stopped *arr is three round trips and a bare rc 1. The URL is safe
+        # to print; the key never appears in it.
+        warn "GET $url failed (curl exit $rc), attempt $attempt/$tries"
         [[ $attempt -ge $tries ]] && return 1
         attempt=$((attempt + 1))
         sleep "${ARR_RETRY_DELAY:-2}"

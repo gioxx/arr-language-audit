@@ -257,6 +257,39 @@ ERROR: broken"
     assert_output "[small][3]"
 }
 
+@test "load_dotenv warns about a malformed line and names its line number" {
+    make_fake_repo
+    write_env "$FAKE_ROOT/.env" \
+        'LIMIT=1' \
+        'RADARR_API_KEY abc' \
+        'not a config line at all'
+
+    lib_run_err 'load_dotenv "$ALA_ENV_FILE"
+        printf "%s\n" "$LIMIT" "${RADARR_API_KEY:-unset}"'
+    assert_success
+    assert_line --index 0 "1"
+    assert_line --index 1 "unset"
+
+    run cat "$ERRFILE"
+    assert_line --index 0 "WARN: $FAKE_ROOT/.env:2: ignoring malformed line"
+    assert_line --index 1 "WARN: $FAKE_ROOT/.env:3: ignoring malformed line"
+    # The line number, never the line: it can still hold most of a key.
+    refute_output --partial "abc"
+}
+
+@test "load_dotenv accepts an indented key without warning" {
+    make_fake_repo
+    printf '  LIMIT=7\n\t# indented comment\n\tWHISPER_MODEL=small\n' \
+        > "$FAKE_ROOT/.env"
+
+    lib_run_err 'load_dotenv "$ALA_ENV_FILE"; printf "[%s][%s]\n" "$LIMIT" "$WHISPER_MODEL"'
+    assert_success
+    assert_output "[7][small]"
+
+    run cat "$ERRFILE"
+    assert_output ""
+}
+
 @test "load_dotenv warns about an unknown key and does not set it" {
     make_fake_repo
     write_env "$FAKE_ROOT/.env" 'PATH=/evil' 'SOMETHING_ELSE=x' 'LIMIT=4'
@@ -283,6 +316,43 @@ ERROR: broken"
     assert_success
     assert_line --index 0 "true"
     assert_line --index 1 "9"
+}
+
+@test "load_dotenv treats a set-but-empty variable as unset" {
+    make_fake_repo
+    write_env "$FAKE_ROOT/.env" 'LIMIT=4'
+    # A caller that defaults its own variables before loading -- exactly what
+    # the entry points do -- must not thereby void the .env.
+    export LIMIT=
+
+    lib_run 'load_dotenv "$ALA_ENV_FILE"; printf "%s\n" "$LIMIT"'
+    assert_success
+    assert_output "4"
+}
+
+@test "load_dotenv lets a non-exported shell variable win too" {
+    make_fake_repo
+    write_env "$FAKE_ROOT/.env" 'LIMIT=4'
+
+    lib_run 'LIMIT=9; load_dotenv "$ALA_ENV_FILE"; printf "%s\n" "$LIMIT"'
+    assert_success
+    assert_output "9"
+}
+
+@test "load_dotenv keeps the first non-empty value of a duplicated key" {
+    make_fake_repo
+    write_env "$FAKE_ROOT/.env" \
+        'WHISPER_MODEL=' \
+        'WHISPER_MODEL=small' \
+        'WHISPER_MODEL=large-v3' \
+        'LIMIT=1' \
+        'LIMIT=2'
+
+    lib_run 'load_dotenv "$ALA_ENV_FILE"; printf "[%s][%s]\n" "$WHISPER_MODEL" "$LIMIT"'
+    assert_success
+    # The empty first assignment does not lock the key; the first non-empty
+    # value does.
+    assert_output "[small][1]"
 }
 
 @test "load_dotenv does not export what it sets" {
@@ -386,12 +456,16 @@ ERROR: broken"
     arr_control '{"fail_count": {"/radarr/api/v3/movie": 2}}'
     export ARR_RETRY_DELAY=0
 
-    lib_run 'arr_get "$RADARR_URL/api/v3/movie" "$RADARR_API_KEY"'
+    lib_run_err 'arr_get "$RADARR_URL/api/v3/movie" "$RADARR_API_KEY"'
     assert_success
     assert_output --partial '"title"'
 
     run arr_request_count "/radarr/api/v3/movie"
     assert_output "3"
+
+    # One warning per failed attempt, and none for the attempt that worked.
+    run grep -c "^WARN: GET .* failed" "$ERRFILE"
+    assert_output "2"
 }
 
 @test "arr_get gives up after the default three attempts" {
@@ -400,11 +474,22 @@ ERROR: broken"
     arr_control '{"fail_count": {"/radarr/api/v3/movie": 99}}'
     export ARR_RETRY_DELAY=0
 
-    lib_run 'arr_get "$RADARR_URL/api/v3/movie" "$RADARR_API_KEY"'
+    lib_run_err 'arr_get "$RADARR_URL/api/v3/movie" "$RADARR_API_KEY"'
     assert_failure 1
     assert_output ""
 
     run arr_request_count "/radarr/api/v3/movie"
+    assert_output "3"
+
+    # curl -sf exits 22 on an HTTP error and says nothing itself, so the
+    # library has to: three attempts, three warnings, the url and never the key.
+    run cat "$ERRFILE"
+    assert_line --index 0 "WARN: GET $RADARR_URL/api/v3/movie failed (curl exit 22), attempt 1/3"
+    assert_line --index 1 "WARN: GET $RADARR_URL/api/v3/movie failed (curl exit 22), attempt 2/3"
+    assert_line --index 2 "WARN: GET $RADARR_URL/api/v3/movie failed (curl exit 22), attempt 3/3"
+    refute_output --partial "radarr-key"
+
+    run grep -c "^WARN: GET .* failed" "$ERRFILE"
     assert_output "3"
 }
 
@@ -414,11 +499,14 @@ ERROR: broken"
     arr_control '{"fail_count": {"/radarr/api/v3/movie": 99}}'
     export ARR_RETRY_DELAY=0
 
-    lib_run 'arr_get "$RADARR_URL/api/v3/movie" "$RADARR_API_KEY" 1'
+    lib_run_err 'arr_get "$RADARR_URL/api/v3/movie" "$RADARR_API_KEY" 1'
     assert_failure 1
 
     run arr_request_count "/radarr/api/v3/movie"
     assert_output "1"
+
+    run cat "$ERRFILE"
+    assert_output "WARN: GET $RADARR_URL/api/v3/movie failed (curl exit 22), attempt 1/1"
 }
 
 # ------------------------------------------------------------------- python --
