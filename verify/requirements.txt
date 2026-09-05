@@ -3,4 +3,8 @@
 # You install this yourself into verify/venv (see README); the scripts
 # never install anything automatically. It is pinned here so Dependabot
 # can open PRs when a new release is available.
+#
+# This file is what gets installed: the orchestrator's "Set up phase 2"
+# action runs `pip install -r verify/requirements.txt` into verify/venv, and
+# the launcher's printed recipe names the same file.
 faster-whisper==1.2.1
