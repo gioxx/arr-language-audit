@@ -114,9 +114,11 @@ python3.X-venv package to install first when python3 -m venv does not work
 Exit codes:
   0    verification finished
   1    missing dependency, missing input, not enough disk space, bad usage
-  3    verification finished, but some files could not be verified
+  2    the worker rejected an option (e.g. a non-numeric LIMIT)
+  3    verification finished, but EVERY file this run errored (paths not
+       visible here?) -- a partial failure still exits 0; see the CSV
   130  interrupted (Ctrl-C)
-Codes 0, 1, 3 and 130 are verify_audio_language.py's own, passed through
+Codes 0, 2, 3 and 130 are verify_audio_language.py's own, passed through
 unchanged once the pre-flight checks have passed.
 EOF
 }
