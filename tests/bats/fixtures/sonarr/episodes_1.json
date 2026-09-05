@@ -1,0 +1,59 @@
+[
+  {
+    "id": 11,
+    "seriesId": 1,
+    "seasonNumber": 1,
+    "episodeNumber": 1,
+    "title": "Primo Giorno",
+    "hasFile": true,
+    "episodeFileId": 71,
+    "episodeFile": {
+      "id": 71,
+      "path": "/media/tv/Le Colline Silenziose/Season 01/S01E01.mkv",
+      "mediaInfo": {
+        "audioLanguages": "Italian"
+      }
+    }
+  },
+  {
+    "id": 12,
+    "seriesId": 1,
+    "seasonNumber": 1,
+    "episodeNumber": 2,
+    "title": "Cold Front",
+    "hasFile": true,
+    "episodeFileId": 72,
+    "episodeFile": {
+      "id": 72,
+      "path": "/media/tv/Le Colline Silenziose/Season 01/S01E02.mkv",
+      "mediaInfo": {
+        "audioLanguages": "English"
+      }
+    }
+  },
+  {
+    "id": 13,
+    "seriesId": 1,
+    "seasonNumber": 1,
+    "episodeNumber": 3,
+    "title": "",
+    "hasFile": true,
+    "episodeFileId": 73,
+    "episodeFile": {
+      "id": 73,
+      "path": "/media/tv/Le Colline Silenziose/Season 01/S01E03.mkv",
+      "mediaInfo": {
+        "audioLanguages": ""
+      }
+    }
+  },
+  {
+    "id": 14,
+    "seriesId": 1,
+    "seasonNumber": 1,
+    "episodeNumber": 4,
+    "title": "Deferred File",
+    "hasFile": true,
+    "episodeFileId": 77
+  }
+]

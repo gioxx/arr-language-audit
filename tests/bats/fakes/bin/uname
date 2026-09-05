@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Fake uname: report a scripted kernel name.
+#
+#   FAKE_UNAME  what to print; default Linux.
+set -u
+printf '%s\n' "${FAKE_UNAME:-Linux}"

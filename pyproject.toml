@@ -1,0 +1,28 @@
+# Tooling configuration only: this repository ships shell scripts and plain
+# Python modules, not an installable package.
+
+[tool.ruff]
+target-version = "py39"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "PL", "RUF", "DTZ", "BLE", "S"]
+ignore = [
+    # Complexity metrics: these scripts are long by design, not by accident.
+    "PLR0913",
+    "PLR0912",
+    "PLR0915",
+    "PLR2004",
+    # subprocess calls are the point of the phase 2 worker (ffmpeg/ffprobe).
+    "S603",
+    "S607",
+    # urlopen with a non-literal scheme: the report viewer only serves locally.
+    "S310",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S108", "PLR2004", "BLE001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+pythonpath = ["verify", "tests/python", "tests/fakes/pypath"]

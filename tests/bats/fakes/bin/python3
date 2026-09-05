@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Fake python3: answers every probe the shell scripts make of the interpreter,
+# without ever running Python.
+#
+#   FAKE_PY_VERSION  reported version; default 3.12.0.
+#   FAKE_PY_HAS_PIP  1 => `python3 -m pip --version` succeeds (default 1).
+#   FAKE_PY_VENV_OK  1 => `python3 -m venv DIR` also creates DIR/bin/pip.
+#   FAKE_PY_HAS_FW   1 => `python3 -c "import faster_whisper"` succeeds.
+#   FAKE_PY_ARGLOG   file the worker invocation (`python3 .../foo.py ...`) is
+#                    appended to, with the environment the worker reads.
+#   FAKE_PY_EXIT     exit status of that worker invocation; default 0.
+set -u
+
+version="${FAKE_PY_VERSION:-3.12.0}"
+major_minor="${version%.*}"
+major="${version%%.*}"
+rest="${version#*.}"
+minor="${rest%%.*}"
+
+# --version -------------------------------------------------------------
+if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
+    printf 'Python %s\n' "$version"
+    exit 0
+fi
+
+# -m <module> -----------------------------------------------------------
+for arg in "$@"; do
+    if [[ "$arg" == "-m" ]]; then
+        module_mode=1
+    fi
+done
+if [[ "${module_mode:-0}" == "1" ]]; then
+    module=""
+    prev=""
+    target=""
+    for arg in "$@"; do
+        if [[ "$prev" == "-m" ]]; then
+            module="$arg"
+        elif [[ -n "$module" && "$arg" != -* ]]; then
+            target="$arg"
+        fi
+        prev="$arg"
+    done
+    case "$module" in
+        pip)
+            if [[ "${FAKE_PY_HAS_PIP:-1}" == "1" ]]; then
+                printf 'pip 24.0 from /fake/pip (python %s)\n' "$major_minor"
+                exit 0
+            fi
+            echo "No module named pip" >&2
+            exit 1
+            ;;
+        venv)
+            mkdir -p "$target/bin"
+            if [[ "${FAKE_PY_VENV_OK:-1}" == "1" ]]; then
+                printf '#!/bin/sh\nexit 0\n' > "$target/bin/pip"
+                chmod +x "$target/bin/pip"
+                printf '#!/bin/sh\nexit 0\n' > "$target/bin/python"
+                chmod +x "$target/bin/python"
+                exit 0
+            fi
+            echo "Error: ensurepip is not available." >&2
+            exit 1
+            ;;
+        *)
+            exit 0
+            ;;
+    esac
+fi
+
+# -c <snippet> ----------------------------------------------------------
+snippet=""
+prev=""
+for arg in "$@"; do
+    if [[ "$prev" == "-c" ]]; then
+        snippet="$arg"
+        break
+    fi
+    prev="$arg"
+done
+if [[ -n "$snippet" ]]; then
+    case "$snippet" in
+        *faster_whisper*)
+            if [[ "${FAKE_PY_HAS_FW:-1}" == "1" ]]; then
+                exit 0
+            fi
+            echo "ModuleNotFoundError: No module named 'faster_whisper'" >&2
+            exit 1
+            ;;
+        *"version_info >= (3, 9)"*)
+            # An exit-status probe of the interpreter floor, not a print.
+            if [[ "$major" -gt 3 ]] || { [[ "$major" -eq 3 ]] && [[ "$minor" -ge 9 ]]; }; then
+                exit 0
+            fi
+            exit 1
+            ;;
+        *version_info*)
+            printf '%s\n' "$major_minor"
+            exit 0
+            ;;
+        *)
+            exit 0
+            ;;
+    esac
+fi
+
+# python3 <script>.py ... ------------------------------------------------
+for arg in "$@"; do
+    if [[ "$arg" == *.py ]]; then
+        if [[ -n "${FAKE_PY_ARGLOG:-}" ]]; then
+            printf '%s\n' "$*" >> "$FAKE_PY_ARGLOG"
+            env | grep -E '^(WHISPER_MODEL|LIMIT|RETRY_ERRORS|NO_RESUME|SAMPLE_)' \
+                | sort >> "$FAKE_PY_ARGLOG" || true
+        fi
+        exit "${FAKE_PY_EXIT:-0}"
+    fi
+done
+
+exit 0

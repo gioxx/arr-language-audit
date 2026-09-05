@@ -6,6 +6,9 @@
 reports/
 *.csv
 *.html
+# ...but the test fixtures are checked in.
+!tests/**/*.csv
+!tests/**/*.html
 
 # Sonarr per-series cache written by find-missing-italian-audio.sh
 *.cache.json
@@ -17,6 +20,8 @@ venv/
 # Python bytecode / caches
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ruff_cache/
 
 # Leftover temp sample dirs, if TEMP_DIR points into the repo
 lang-check-*/

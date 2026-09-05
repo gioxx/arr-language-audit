@@ -95,11 +95,12 @@ def get_duration_seconds(file_path: str) -> float | None:
                 "-of", "json",
                 file_path,
             ],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, check=False,
         )
         data = json.loads(result.stdout)
         return float(data["format"]["duration"])
-    except Exception:
+    except Exception:  # noqa: BLE001
+        # Any probe failure means "duration unknown"; the caller falls back.
         return None
 
 
@@ -131,19 +132,22 @@ def extract_sample(file_path: str, out_wav: str) -> bool:
     except subprocess.CalledProcessError as e:
         print(f"  ffmpeg failed for '{file_path}': {e.stderr.strip()[:200]}", file=sys.stderr)
         return False
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
+        # One unreadable file must not end the run: report it and carry on.
         print(f"  ffmpeg failed for '{file_path}': {e}", file=sys.stderr)
         return False
 
 
 def load_model():
-    from faster_whisper import WhisperModel
+    # Imported here on purpose: loading faster_whisper costs seconds, and the
+    # script must run --help (and fail cleanly) without the package installed.
+    from faster_whisper import WhisperModel  # noqa: PLC0415
     print(f"Loading Whisper model '{WHISPER_MODEL}' (CPU)...", file=sys.stderr)
     return WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
 
 
 def detect_language(model, wav_path: str) -> tuple[str, float]:
-    segments, info = model.transcribe(wav_path, beam_size=1, best_of=1, vad_filter=True)
+    _segments, info = model.transcribe(wav_path, beam_size=1, best_of=1, vad_filter=True)
     # Force generator evaluation is not needed: info.language is populated
     # after the initial language-detection pass, before segment decoding.
     return info.language, info.language_probability
@@ -236,7 +240,8 @@ def main():
     parser.add_argument("--limit", type=int, default=0,
                         help="Only (re)verify the first N files that need it (0 = all)")
     parser.add_argument("--retry-errors", action="store_true",
-                         help="Also reprocess rows that previously failed (FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)")
+                         help="Also reprocess rows that previously failed "
+                              "(FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)")
     parser.add_argument("--no-resume", action="store_true",
                          help="Ignore any existing output file and start fresh (overwrites it)")
     args = parser.parse_args()
@@ -273,7 +278,7 @@ def main():
             out["FileMtime"] = str(mtime)
         return out
 
-    def make_row(row, detected="", confidence="", verdict="", size=None, mtime=None):
+    def make_row(row, *, detected="", confidence="", verdict="", size=None, mtime=None):
         return {
             "App": row.get("App", ""),
             "Title": row.get("Title", ""),
@@ -342,14 +347,20 @@ def main():
     if kept_rows:
         print(f"Reusing {len(kept_rows)} previous verdict(s) for unchanged files.", file=sys.stderr)
     if orphan_rows:
-        print(f"Carrying over {len(orphan_rows)} row(s) whose file is no longer in the phase 1 CSV.", file=sys.stderr)
+        print(f"Carrying over {len(orphan_rows)} row(s) whose file is no longer "
+              "in the phase 1 CSV.", file=sys.stderr)
     if dropped_stale:
-        print(f"Dropped {dropped_stale} stale row(s): file changed and is no longer flagged by phase 1.", file=sys.stderr)
-    print(f"Loaded {len(all_rows)} suspect file(s) total, {len(to_verify)} to (re)verify now.", file=sys.stderr)
+        print(f"Dropped {dropped_stale} stale row(s): file changed and is no longer "
+              "flagged by phase 1.", file=sys.stderr)
+    print(f"Loaded {len(all_rows)} suspect file(s) total, "
+          f"{len(to_verify)} to (re)verify now.", file=sys.stderr)
 
     # Always rewrite the output in full: kept + carried-over rows first, so a
     # crash during detection still leaves a complete, valid CSV.
-    out_f = open(args.output, "w", newline="", encoding="utf-8")
+    # SIM115: deliberately not a context manager -- the handle lives for the
+    # whole detection loop and is flushed after every row, so an abort leaves a
+    # complete file behind. It is closed at the end of main().
+    out_f = open(args.output, "w", newline="", encoding="utf-8")  # noqa: SIM115
     writer = csv.DictWriter(out_f, fieldnames=fieldnames)
     writer.writeheader()
     for r in kept_rows:
@@ -396,7 +407,8 @@ def main():
 
             try:
                 lang, prob = detect_language(model, sample_path)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
+                # Whisper can fail in many ways; each is a DETECTION_FAILED row.
                 print(f"  Whisper detection failed: {e}", file=sys.stderr)
                 writer.writerow(make_row(row, verdict="DETECTION_FAILED",
                                          size=cur_size, mtime=cur_mtime))

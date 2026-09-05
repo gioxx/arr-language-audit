@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Fake df: report a scripted amount of free space in 1M blocks.
+#
+#   FAKE_DF_AVAIL_MB  the "Available" column; default 100000.
+#   FAKE_DF_LOG       file to append argv to.
+set -u
+
+if [[ -n "${FAKE_DF_LOG:-}" ]]; then
+    printf '%s\n' "$*" >> "$FAKE_DF_LOG"
+fi
+
+printf 'Filesystem 1M-blocks Used Available Capacity Mounted on\n'
+printf 'fake 100000 1 %s 1%% /\n' "${FAKE_DF_AVAIL_MB:-100000}"

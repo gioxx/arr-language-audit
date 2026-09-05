@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Fake ffprobe: report a scripted duration for the file it is asked about.
+# The real invocation puts the media path last, so that is what we key on.
+#
+#   FAKE_DURATIONS   JSON map "<path>": <seconds>; anything not listed gets 600.
+#   FAKE_FFPROBE_LOG file to append argv to, one invocation per line.
+set -u
+
+input=""
+for arg in "$@"; do
+    input="$arg"
+done
+
+if [[ -n "${FAKE_FFPROBE_LOG:-}" ]]; then
+    printf '%s\n' "$*" >> "$FAKE_FFPROBE_LOG"
+fi
+
+duration=600
+if [[ -n "${FAKE_DURATIONS:-}" ]]; then
+    scripted=$(printf '%s' "$FAKE_DURATIONS" \
+        | "${REAL_JQ:-jq}" -r --arg p "$input" '.[$p] // empty' 2>/dev/null)
+    if [[ -n "$scripted" ]]; then
+        duration="$scripted"
+    fi
+fi
+
+printf '{"format":{"duration":"%s"}}\n' "$duration"

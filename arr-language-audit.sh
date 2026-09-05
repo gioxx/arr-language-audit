@@ -167,8 +167,8 @@ probe_app() {
     if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
         echo "unknown (need curl + jq to probe)"; return 1
     fi
-    local body="" attempt
-    for attempt in 1 2 3; do
+    local body="" _attempt
+    for _attempt in 1 2 3; do
         body=$(curl -sf -m 5 -H "X-Api-Key: $key" "$url/api/v3/system/status" 2>/dev/null) && break
         body=""
         sleep 1
@@ -196,7 +196,10 @@ app_rootfolders() {
 # Count active health warnings. Echoes a number or "?".
 app_health_count() {
     local url="$1" key="$2"
-    command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || { echo "?"; return; }
+    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        echo "?"
+        return
+    fi
     curl -sf -m 5 -H "X-Api-Key: $key" "$url/api/v3/health" 2>/dev/null \
         | jq -r 'length' 2>/dev/null | tr -d '\r' || echo "?"
 }

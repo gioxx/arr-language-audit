@@ -38,7 +38,7 @@ Exit codes:
 
 import argparse
 import csv
-import html
+import datetime
 import http.server
 import json
 import os
@@ -47,7 +47,7 @@ import socket
 import sys
 import threading
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 # Default location of the phase 2 CSV: <repo>/reports/ (this file is in
 # <repo>/verify/), so it does not matter which directory you run this from.
@@ -153,18 +153,27 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   .wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
   table { border-collapse: collapse; width: 100%; font-size: .88rem; }
-  th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th, td {
+    text-align: left; padding: .5rem .6rem;
+    border-bottom: 1px solid var(--border); vertical-align: top;
+  }
   th {
     position: sticky; top: 0; background: var(--bg); cursor: pointer; white-space: nowrap;
     user-select: none;
   }
   th .arrow { color: var(--muted); font-size: .75rem; }
   tbody tr:nth-child(even) { background: var(--row); }
-  td.path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .82rem; word-break: break-all; }
+  td.path {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .82rem; word-break: break-all;
+  }
   td.num { text-align: right; white-space: nowrap; }
   .copy { margin-left: .4rem; padding: .05rem .35rem; font-size: .75rem; }
 
-  .badge { display: inline-block; padding: .12rem .45rem; border-radius: 4px; font-size: .78rem; white-space: nowrap; }
+  .badge {
+    display: inline-block; padding: .12rem .45rem;
+    border-radius: 4px; font-size: .78rem; white-space: nowrap;
+  }
   .badge-ok   { background: var(--ok-bg);   color: var(--ok-fg); }
   .badge-bad  { background: var(--bad-bg);  color: var(--bad-fg); }
   .badge-warn { background: var(--warn-bg); color: var(--warn-fg); }
@@ -376,13 +385,12 @@ render();
 
 
 def build_html(rows: list[dict], csv_path: str) -> str:
-    import datetime
-
     def js(value) -> str:
         # json.dumps then neutralise any "</" so the blob can't close <script>.
         return json.dumps(value, ensure_ascii=False).replace("</", "<\\/")
 
-    generated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    generated = (datetime.datetime.now(datetime.timezone.utc)
+                 .astimezone().strftime("%Y-%m-%d %H:%M:%S"))
     return (
         HTML_TEMPLATE
         .replace("__DATA_JSON__", js(rows))
@@ -442,6 +450,9 @@ def make_handler(payload: bytes, token: str | None):
 
 
 def serve(html_text: str, host: str, port: int, use_token: bool) -> None:
+    # S104 below: serving on every interface is the documented point of --serve
+    # (open the report from a phone on the LAN). The URL carries an access token
+    # unless --no-token is passed, and the bind address is the caller's choice.
     payload = html_text.encode("utf-8")
     token = secrets.token_urlsafe(16) if use_token else None
     handler = make_handler(payload, token)
@@ -456,11 +467,11 @@ def serve(html_text: str, host: str, port: int, use_token: bool) -> None:
     log("Open one of:")
     shown = set()
     for h in (bound_host, "127.0.0.1", local_ipv4()):
-        if not h or h in shown or h == "0.0.0.0":
+        if not h or h in shown or h == "0.0.0.0":  # noqa: S104
             continue
         shown.add(h)
         log(f"  http://{h}:{bound_port}{suffix}")
-    if bound_host == "0.0.0.0" and not shown:
+    if bound_host == "0.0.0.0" and not shown:  # noqa: S104
         log(f"  http://<this-host>:{bound_port}{suffix}")
     if token:
         log("")
@@ -496,7 +507,7 @@ def main() -> None:
                         help="output HTML path (default: CSV path with .html)")
     parser.add_argument("--serve", action="store_true",
                         help="serve the HTML over HTTP and wait for Enter")
-    parser.add_argument("--host", default="0.0.0.0",
+    parser.add_argument("--host", default="0.0.0.0",  # noqa: S104
                         help="bind address when serving (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=0,
                         help="bind port when serving (default: 0 = pick a free port)")

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Fake whiptail: the scripts read a dialog's result through `3>&1 1>&2 2>&3`,
+# so the answer goes to stdout and everything else is irrelevant.
+#
+#   FAKE_WT_OUT  what the dialog "returns"; default empty.
+#   FAKE_WT_RC   exit status; default 0 (OK). 1 = Cancel, 255 = Esc.
+#   FAKE_WT_LOG  file to append argv to, one invocation per line.
+set -u
+
+if [[ -n "${FAKE_WT_LOG:-}" ]]; then
+    printf '%s\n' "$*" >> "$FAKE_WT_LOG"
+fi
+
+printf '%s' "${FAKE_WT_OUT:-}"
+exit "${FAKE_WT_RC:-0}"
