@@ -28,8 +28,6 @@ load helpers/common
 }
 
 @test "L6: orchestrator -h exits 0 and prints Usage" {
-    skip "fixed in Task 10: the -h sed script is GNU-only and prints nothing on BSD sed"
-
     run "$BASH_UNDER_TEST" "$ROOT/arr-language-audit.sh" -h
     assert_success
     assert_output --partial "Usage:"

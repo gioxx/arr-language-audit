@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Fake whiptail: the scripts read a dialog's result through `3>&1 1>&2 2>&3`,
-# so the answer goes to stdout and everything else is irrelevant.
+# Fake whiptail. Real whiptail draws its UI on stdout and writes the value the
+# user chose to STDERR, which is why every caller inverts the two with
+# `3>&1 1>&2 2>&3`; this shim writes FAKE_WT_OUT to stderr for the same reason,
+# so a test exercises the caller's fd dance rather than bypassing it.
 #
 #   FAKE_WT_OUT  what the dialog "returns"; default empty.
 #   FAKE_WT_RC   exit status; default 0 (OK). 1 = Cancel, 255 = Esc.
@@ -11,5 +13,5 @@ if [[ -n "${FAKE_WT_LOG:-}" ]]; then
     printf '%s\n' "$*" >> "$FAKE_WT_LOG"
 fi
 
-printf '%s' "${FAKE_WT_OUT:-}"
+printf '%s' "${FAKE_WT_OUT:-}" >&2
 exit "${FAKE_WT_RC:-0}"

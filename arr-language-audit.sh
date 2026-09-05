@@ -1,28 +1,30 @@
 #!/usr/bin/env bash
 #
-# arr-language-audit -- interactive orchestrator.
+# arr-language-audit -- interactive orchestrator: one menu driving phase 1,
+# phase 2 and the report. What it is and how it is used: -h / usage() below.
 #
-# A single entry point that drives the whole two-phase workflow:
+# Design notes that matter when changing this file:
 #
-#   phase 1  scan/find-missing-italian-audio.sh   (Radarr/Sonarr API -> CSV)
-#   phase 2  verify/verify-audio-language.sh      (ffmpeg + faster-whisper -> CSV)
-#   report   verify/report.py                     (CSV -> HTML, optional viewer)
+#   * Sourcing this file has NO side effects: no directory is created, no
+#     command is run, nothing is printed. Everything that acts lives in main(),
+#     behind the BASH_SOURCE guard at the bottom, so the bats suite can source
+#     the script and call one function at a time.
+#   * bash 3.2 (the /bin/bash macOS ships): "${arr[@]}" on an EMPTY array under
+#     `set -u` is an error before bash 4.4. The ask_* helpers therefore branch
+#     instead of building option arrays, and the one place that really needs an
+#     array expands it as ${arr[@]+"${arr[@]}"}.
+#   * The .env file is PARSED by lib/common.sh, never sourced: a .env is often
+#     world-readable, and sourcing it is arbitrary code execution as the user
+#     running the audit. Nothing from it is exported either -- the API keys stay
+#     in this shell and are explicitly removed from the environment of ffmpeg,
+#     whisper and the report.
+#   * The *arr API key never reaches curl's argv (ps would show it to every
+#     user on the box); arr_curl passes it through a --config file on stdin.
+#   * Whether phase 2 can run is decided by ONE thing: what
+#     `verify-audio-language.sh --check` says. Importing faster_whisper here
+#     too would let the menu and the launcher disagree.
 #
-# On launch it runs a pre-flight: loads .env, checks the tools each phase
-# needs, and actually queries Radarr/Sonarr (/api/v3/system/status) so the
-# menu can show what is connected, which version, and where the libraries
-# live. It always passes explicit paths under <repo>/reports/, so it does
-# not matter which directory you launch it from.
-#
-# The menu uses whiptail if it is installed (ncurses dialogs) and falls
-# back to a plain numbered prompt otherwise. Nothing is installed
-# automatically.
-#
-# Usage:
-#   ./arr-language-audit.sh            # interactive menu
-#   ./arr-language-audit.sh -h         # this help
-#
-# All the underlying scripts remain usable on their own; see their --help.
+# Usage, options and exit codes: -h (the usage() below is the single copy).
 
 # No 'errexit' here on purpose: this is an interactive loop where a menu
 # choice or a "no" answer routinely yields a non-zero status that must not
@@ -30,88 +32,152 @@
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+# shellcheck source=lib/common.sh
+. "$ROOT/lib/common.sh"
+
 REPORTS_DIR="$ROOT/reports"
 
 SCAN_SH="$ROOT/scan/find-missing-italian-audio.sh"
 VERIFY_SH="$ROOT/verify/verify-audio-language.sh"
 REPORT_PY="$ROOT/verify/report.py"
+REQUIREMENTS="$ROOT/verify/requirements.txt"
+VENV_DIR="$ROOT/verify/venv"
 
 CSV="$REPORTS_DIR/missing-italian-audio.csv"
 VERIFIED_CSV="$REPORTS_DIR/verified-language-results.csv"
 HTML="$REPORTS_DIR/verified-language-results.html"
 ENV_FILE="$ROOT/.env"
 
-mkdir -p "$REPORTS_DIR"
-
 # Project identity, shown in the menu header / whiptail backtitle / About.
 PROJECT_NAME="arr-language-audit"
 PROJECT_URL="https://github.com/gioxx/arr-language-audit"
-PROJECT_VERSION="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || true)"
-[[ -z "$PROJECT_VERSION" ]] && PROJECT_VERSION="(version unknown)"
-PROJECT_BANNER="$PROJECT_NAME  $PROJECT_VERSION  -  $PROJECT_URL"
+PROJECT_VERSION=""
 
-log() { echo "$@" >&2; }
-err() { echo "ERROR: $*" >&2; }
+usage() {
+    cat <<'EOF'
+arr-language-audit -- interactive orchestrator.
 
-case "${1:-}" in
-    -h|--help)
-        sed -n '2,/^# All the underlying scripts/{s/^# \{0,1\}//; p}' "$0"
-        exit 0
-        ;;
-esac
+A single entry point that drives the whole two-phase workflow:
 
+  phase 1  scan/find-missing-italian-audio.sh   (Radarr/Sonarr API -> CSV)
+  phase 2  verify/verify-audio-language.sh      (ffmpeg + faster-whisper -> CSV)
+  report   verify/report.py                     (CSV -> HTML, optional viewer)
+
+On launch it runs a pre-flight: it reads .env, checks the tools each phase
+needs, asks the phase 2 launcher whether its environment is ready, and
+queries Radarr and Sonarr (/api/v3/system/status, both at once, one attempt)
+so the menu can show what is connected, which version, and where the
+libraries live. It always passes explicit paths under <repo>/reports/, so it
+does not matter which directory you launch it from.
+
+The menu uses whiptail if it is installed (ncurses dialogs) and falls back to
+a plain numbered prompt otherwise. Nothing is installed automatically.
+
+Usage:
+  ./arr-language-audit.sh            # interactive menu
+  ./arr-language-audit.sh -h         # this help
+
+Environment:
+  ARR_PLAIN_MENU     set to anything to force the plain menu even when
+                     whiptail is installed
+  ALA_DOTENV_FILE    read this .env instead of searching the repository
+
+Exit codes:
+  0   the menu was left with "Quit" (or Esc / Cancel)
+  1   the reports directory could not be created
+
+All the underlying scripts remain usable on their own; see their --help.
+EOF
+}
+
+# The version is a git call, so it is made once, on demand: sourcing this file
+# must not shell out, and `-h` must not either.
+project_version() {
+    if [[ -z "$PROJECT_VERSION" ]]; then
+        PROJECT_VERSION="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || true)"
+        [[ -n "$PROJECT_VERSION" ]] || PROJECT_VERSION="(version unknown)"
+    fi
+    printf '%s\n' "$PROJECT_VERSION"
+}
+
+project_banner() {
+    printf '%s  %s  -  %s\n' "$PROJECT_NAME" "$(project_version)" "$PROJECT_URL"
+}
+
+# whiptail is used when it is installed, unless ARR_PLAIN_MENU asks for the
+# plain prompt (which is also how the tests drive the menu).
 HAVE_WHIPTAIL=false
-command -v whiptail >/dev/null 2>&1 && HAVE_WHIPTAIL=true
+if [[ -z "${ARR_PLAIN_MENU:-}" ]] && have whiptail; then
+    HAVE_WHIPTAIL=true
+fi
 
-# Common whiptail prefix: project banner on top, dialog title in the frame.
-WT=(whiptail --backtitle "$PROJECT_BANNER" --title "$PROJECT_NAME")
+# wt <whiptail-args>... -- whiptail with the project banner on top and the
+# dialog title in the frame. A function rather than an array, so building the
+# banner (a git call) is deferred to the first dialog.
+wt() {
+    whiptail --backtitle "$(project_banner)" --title "$PROJECT_NAME" "$@"
+}
 
 # ---------------------------------------------------------------------------
 # ask_* helpers: whiptail when available, plain read otherwise. Each echoes
 # its result (ask_input / ask_menu) or returns 0/1 (ask_yesno), so the
 # action functions stay readable.
+#
+# All three report a Cancel, an Esc or an exhausted stdin as a non-zero status
+# and print nothing: a cancelled dialog must abandon the action, never fall
+# through to a default that runs something the operator did not ask for.
 # ---------------------------------------------------------------------------
 
 ask_yesno() {
     # ask_yesno "question" [yes|no]   (default answer when the user just hits Enter)
     local q="$1" def="${2:-no}"
     if [[ "$HAVE_WHIPTAIL" == "true" ]]; then
-        local flag=(--defaultno)
-        [[ "$def" == "yes" ]] && flag=()
-        "${WT[@]}" --yesno "$q" "${flag[@]}" 12 74
+        # Branch rather than build a flag array: an empty "${flag[@]}" under
+        # `set -u` is an error on bash 3.2.
+        if [[ "$def" == "yes" ]]; then
+            wt --yesno "$q" 12 74
+        else
+            wt --yesno "$q" --defaultno 12 74
+        fi
         return $?
     fi
     local hint="[y/N]"
     [[ "$def" == "yes" ]] && hint="[Y/n]"
     local a
-    read -r -p "$q $hint: " a
+    read -r -p "$q $hint: " a || return 1
     a="${a:-$def}"
     [[ "$a" =~ ^[Yy] || "$a" == "yes" ]]
 }
 
 ask_input() {
-    # ask_input "prompt" "default"  -> echoes entered value (may be empty)
-    local prompt="$1" def="${2:-}"
+    # ask_input "prompt" "default"  -> echoes the entered value (may be empty),
+    # rc 1 when the dialog was cancelled.
+    local prompt="$1" def="${2:-}" out rc=0
     if [[ "$HAVE_WHIPTAIL" == "true" ]]; then
-        "${WT[@]}" --inputbox "$prompt" 12 74 "$def" 3>&1 1>&2 2>&3
-        return
+        out=$(wt --inputbox "$prompt" 12 74 "$def" 3>&1 1>&2 2>&3) || rc=$?
+        [[ "$rc" -eq 0 ]] || return 1
+        printf '%s\n' "$out"
+        return 0
     fi
     local a
-    read -r -p "$prompt [${def:-empty}]: " a
-    echo "${a:-$def}"
+    read -r -p "$prompt [${def:-empty}]: " a || return 1
+    printf '%s\n' "${a:-$def}"
 }
 
 ask_menu() {
-    # ask_menu "default_tag" "title" tag1 "desc1" tag2 "desc2" ...  -> echoes chosen tag.
-    # "default_tag" is pre-selected in whiptail and used when the plain
-    # prompt gets an empty line.
+    # ask_menu "default_tag" "title" tag1 "desc1" tag2 "desc2" ...  -> echoes
+    # the chosen tag, rc 1 when the dialog was cancelled. "default_tag" is
+    # pre-selected in whiptail and used when the plain prompt gets an empty
+    # line.
     local default_tag="$1" title="$2"; shift 2
     if [[ "$HAVE_WHIPTAIL" == "true" ]]; then
         local count=$(( $# / 2 ))
-        local pre=()
-        [[ -n "$default_tag" ]] && pre=(--default-item "$default_tag")
-        "${WT[@]}" "${pre[@]}" --menu "$title" 24 78 "$count" "$@" 3>&1 1>&2 2>&3
-        return
+        if [[ -n "$default_tag" ]]; then
+            wt --default-item "$default_tag" --menu "$title" 24 78 "$count" "$@" 3>&1 1>&2 2>&3
+        else
+            wt --menu "$title" 24 78 "$count" "$@" 3>&1 1>&2 2>&3
+        fi
+        return $?
     fi
     echo "" >&2
     echo "$title" >&2
@@ -121,15 +187,15 @@ ask_menu() {
         shift 2
     done
     local a
-    read -r -p "Select [Enter = ${default_tag:-0}]: " a
-    echo "${a:-$default_tag}"
+    read -r -p "Select [Enter = ${default_tag:-0}]: " a || return 1
+    printf '%s\n' "${a:-$default_tag}"
 }
 
 info_box() {
     # Show a block of text; whiptail msgbox or plain print + pause.
     local text="$1"
     if [[ "$HAVE_WHIPTAIL" == "true" ]]; then
-        "${WT[@]}" --scrolltext --msgbox "$text" 24 78
+        wt --scrolltext --msgbox "$text" 24 78
     else
         echo "" >&2
         echo "$text" >&2
@@ -155,7 +221,19 @@ RADARR_LINE="" ; RADARR_OK=false
 SONARR_LINE="" ; SONARR_OK=false
 ENV_READY=false
 TOOLS_LINE=""
-PHASE2_READY=false ; PHASE2_NOTE=""
+PHASE2_READY=false ; PHASE2_NOTE="" ; PHASE2_PYTHON="" ; PHASE2_HINT=""
+
+# The *arr configuration. Seeded from the environment (never overwritten with
+# an empty string: load_dotenv treats set-but-empty as unset, so a .env can
+# still fill in what the environment left out).
+RADARR_URL="${RADARR_URL:-}" ; RADARR_API_KEY="${RADARR_API_KEY:-}"
+SONARR_URL="${SONARR_URL:-}" ; SONARR_API_KEY="${SONARR_API_KEY:-}"
+SKIP_RADARR="${SKIP_RADARR:-false}" ; SKIP_SONARR="${SKIP_SONARR:-false}"
+
+# How long a single pre-flight probe may take. One attempt, a short timeout:
+# this runs before the menu is drawn, and the retries that a real scan needs
+# belong to the scan script, which is where a slow *arr actually matters.
+PROBE_TIMEOUT="${ALA_PROBE_TIMEOUT:-3}"
 
 # Query one app's /api/v3/system/status. Echoes "OK  vX  [instance]  url"
 # on success (return 0), or a short reason otherwise (return 1).
@@ -164,22 +242,19 @@ probe_app() {
     if [[ -z "$url" || -z "$key" || "$key" == YOUR_* ]]; then
         echo "not configured"; return 1
     fi
-    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    if ! have curl || ! have jq; then
         echo "unknown (need curl + jq to probe)"; return 1
     fi
-    local body="" _attempt
-    for _attempt in 1 2 3; do
-        body=$(curl -sf -m 5 -H "X-Api-Key: $key" "$url/api/v3/system/status" 2>/dev/null) && break
-        body=""
-        sleep 1
-    done
+    local body="" ver inst
+    body=$(arr_curl "$key" -m "$PROBE_TIMEOUT" "$url/api/v3/system/status" 2>/dev/null) || body=""
     if [[ -z "$body" ]]; then
         echo "UNREACHABLE ($url) -- check URL / API key / that it is running"
         return 1
     fi
-    local ver inst
-    ver=$(jq -r '.version // "?"' <<< "$body" | tr -d '\r')
-    inst=$(jq -r '.instanceName // .appName // "?"' <<< "$body" | tr -d '\r')
+    ver=$(jq -r '.version // "?"' <<< "$body" 2>/dev/null)
+    inst=$(jq -r '.instanceName // .appName // "?"' <<< "$body" 2>/dev/null)
+    strip_cr ver
+    strip_cr inst
     echo "OK   v$ver   [$inst]   $url"
     return 0
 }
@@ -187,8 +262,8 @@ probe_app() {
 # List an app's root folders (path + accessibility + free space). Best effort.
 app_rootfolders() {
     local url="$1" key="$2"
-    command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 0
-    curl -sf -m 5 -H "X-Api-Key: $key" "$url/api/v3/rootfolder" 2>/dev/null \
+    have curl && have jq || return 0
+    arr_curl "$key" -m "$PROBE_TIMEOUT" "$url/api/v3/rootfolder" 2>/dev/null \
         | jq -r '.[] | "    \(.path)  (accessible: \(.accessible // "?"), free: \(((.freeSpace // 0) / 1073741824) | floor) GiB)"' 2>/dev/null \
         | tr -d '\r'
 }
@@ -196,71 +271,99 @@ app_rootfolders() {
 # Count active health warnings. Echoes a number or "?".
 app_health_count() {
     local url="$1" key="$2"
-    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    if ! have curl || ! have jq; then
         echo "?"
         return
     fi
-    curl -sf -m 5 -H "X-Api-Key: $key" "$url/api/v3/health" 2>/dev/null \
+    arr_curl "$key" -m "$PROBE_TIMEOUT" "$url/api/v3/health" 2>/dev/null \
         | jq -r 'length' 2>/dev/null | tr -d '\r' || echo "?"
 }
 
-run_preflight() {
-    # Load .env the same way the scan script does.
-    if [[ -f "$ENV_FILE" ]]; then
-        set -a
-        # shellcheck disable=SC1090
-        . "$ENV_FILE"
-        set +a
-    fi
-    RADARR_URL="${RADARR_URL:-}"       ; RADARR_API_KEY="${RADARR_API_KEY:-}"
-    SONARR_URL="${SONARR_URL:-}"       ; SONARR_API_KEY="${SONARR_API_KEY:-}"
-    SKIP_RADARR="${SKIP_RADARR:-false}"; SKIP_SONARR="${SKIP_SONARR:-false}"
-
-    # Tool readiness.
-    local need_scan=() need_verify=()
-    command -v curl    >/dev/null 2>&1 || need_scan+=(curl)
-    command -v jq      >/dev/null 2>&1 || need_scan+=(jq)
-    command -v python3 >/dev/null 2>&1 || need_verify+=(python3)
-    command -v ffmpeg  >/dev/null 2>&1 || need_verify+=(ffmpeg)
-    command -v ffprobe >/dev/null 2>&1 || need_verify+=(ffprobe)
-    local t="tools: "
-    if (( ${#need_scan[@]} == 0 )); then t+="phase 1 ready"; else t+="phase 1 MISSING ${need_scan[*]}"; fi
-    if (( ${#need_verify[@]} == 0 )); then t+="  |  phase 2 tools ready"; else t+="  |  phase 2 missing ${need_verify[*]}"; fi
-    [[ "$HAVE_WHIPTAIL" == "true" ]] && t+="  |  whiptail" || t+="  |  plain menu"
+# preflight_tools -- the one-line summary of what each phase can run.
+preflight_tools() {
+    local need_scan="" need_verify="" t="tools: "
+    have curl    || need_scan="$need_scan curl"
+    have jq      || need_scan="$need_scan jq"
+    have python3 || need_verify="$need_verify python3"
+    have ffmpeg  || need_verify="$need_verify ffmpeg"
+    have ffprobe || need_verify="$need_verify ffprobe"
+    if [[ -z "$need_scan" ]]; then t+="phase 1 ready"; else t+="phase 1 MISSING${need_scan}"; fi
+    if [[ -z "$need_verify" ]]; then t+="  |  phase 2 tools ready"; else t+="  |  phase 2 missing${need_verify}"; fi
+    if [[ "$HAVE_WHIPTAIL" == "true" ]]; then t+="  |  whiptail"; else t+="  |  plain menu"; fi
     TOOLS_LINE="$t"
+}
 
-    # faster-whisper (the phase 2 Python dependency): system python, or the
-    # local verify/venv. This is separate from the CLI tools above.
+# preflight_phase2 -- ask the launcher, and only the launcher, whether phase 2
+# can run. Its answer also names the interpreter, which is the one the report
+# is then built with: a venv that has faster-whisper usually has the rest too.
+preflight_phase2() {
     PHASE2_READY=false
-    if ! command -v python3 >/dev/null 2>&1; then
-        PHASE2_NOTE="faster-whisper: python3 missing"
-    elif python3 -c "import faster_whisper" >/dev/null 2>&1; then
-        PHASE2_READY=true; PHASE2_NOTE="faster-whisper: OK (system python3)"
-    elif [[ -x "$ROOT/verify/venv/bin/python" ]] \
-         && "$ROOT/verify/venv/bin/python" -c "import faster_whisper" >/dev/null 2>&1; then
-        PHASE2_READY=true; PHASE2_NOTE="faster-whisper: OK (verify/venv)"
+    PHASE2_PYTHON=""
+    PHASE2_HINT=""
+    local out=""
+    if out="$(env -u RADARR_API_KEY -u SONARR_API_KEY "$VERIFY_SH" --check 2>&1)"; then
+        PHASE2_READY=true
+        PHASE2_PYTHON="$(printf '%s\n' "$out" | sed -n 's/.*python via: \([^)]*\)).*/\1/p' | head -1)"
+        PHASE2_NOTE="phase 2: ready (python: ${PHASE2_PYTHON:-unknown})"
     else
-        PHASE2_NOTE="faster-whisper: NOT installed -- use 'Set up phase 2'"
+        PHASE2_NOTE="phase 2: NOT ready -- use 'Set up phase 2 (faster-whisper)'"
+    fi
+    PHASE2_HINT="$out"
+}
+
+# preflight_apps -- probe Radarr and Sonarr AT THE SAME TIME. Sequentially,
+# with retries, two unreachable apps used to hold the menu for half a minute.
+preflight_apps() {
+    local tmp radarr_pid=0 sonarr_pid=0
+    if ! tmp="$(mktemp -d "${TMPDIR:-/tmp}/ala-preflight.XXXXXX")"; then
+        RADARR_LINE="unknown (no temp directory to run the pre-flight in)"
+        SONARR_LINE="$RADARR_LINE"
+        return 1
     fi
 
-    # Radarr.
     RADARR_OK=false
-    if [[ "$SKIP_RADARR" == "true" ]]; then
+    if is_true "$SKIP_RADARR"; then
         RADARR_LINE="skipped (SKIP_RADARR=true)"
     else
-        RADARR_LINE=$(probe_app "$RADARR_URL" "$RADARR_API_KEY") && RADARR_OK=true
+        probe_app "$RADARR_URL" "$RADARR_API_KEY" > "$tmp/radarr" 2>/dev/null &
+        radarr_pid=$!
     fi
 
-    # Sonarr.
     SONARR_OK=false
-    if [[ "$SKIP_SONARR" == "true" ]]; then
+    if is_true "$SKIP_SONARR"; then
         SONARR_LINE="skipped (SKIP_SONARR=true)"
     else
-        SONARR_LINE=$(probe_app "$SONARR_URL" "$SONARR_API_KEY") && SONARR_OK=true
+        probe_app "$SONARR_URL" "$SONARR_API_KEY" > "$tmp/sonarr" 2>/dev/null &
+        sonarr_pid=$!
     fi
+
+    if [[ "$radarr_pid" -ne 0 ]]; then
+        wait "$radarr_pid" && RADARR_OK=true
+        RADARR_LINE="$(cat "$tmp/radarr" 2>/dev/null)"
+    fi
+    if [[ "$sonarr_pid" -ne 0 ]]; then
+        wait "$sonarr_pid" && SONARR_OK=true
+        SONARR_LINE="$(cat "$tmp/sonarr" 2>/dev/null)"
+    fi
+
+    rm -rf "$tmp"
+}
+
+run_preflight() {
+    local dotenv
+    if dotenv="$(find_dotenv)"; then
+        load_dotenv "$dotenv" || warn "could not read $dotenv"
+    fi
+    SKIP_RADARR="${SKIP_RADARR:-false}"
+    SKIP_SONARR="${SKIP_SONARR:-false}"
+
+    preflight_tools
+    preflight_phase2
+    preflight_apps
 
     ENV_READY=false
     { [[ "$RADARR_OK" == "true" ]] || [[ "$SONARR_OK" == "true" ]]; } && ENV_READY=true
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -278,16 +381,20 @@ csv_row_count() {
 
 verdict_summary() {
     [[ -f "$VERIFIED_CSV" ]] || { echo "not run yet"; return; }
-    local mis conf errs
+    local mis conf low errs
     mis=$(grep -c ',MISTAGGED_IS_ITALIAN,' "$VERIFIED_CSV" 2>/dev/null || true)
     conf=$(grep -c ',CONFIRMED_NOT_ITALIAN,' "$VERIFIED_CSV" 2>/dev/null || true)
+    low=$(grep -c ',LOW_CONFIDENCE,' "$VERIFIED_CSV" 2>/dev/null || true)
     errs=$(grep -Ec ',(FILE_NOT_FOUND|EXTRACTION_FAILED|DETECTION_FAILED),' "$VERIFIED_CSV" 2>/dev/null || true)
-    echo "${mis:-0} mistagged / ${conf:-0} confirmed not Italian / ${errs:-0} errors"
+    echo "${mis:-0} mistagged / ${conf:-0} confirmed not Italian / ${low:-0} low confidence / ${errs:-0} errors"
 }
 
 # Echo the menu tag for the most sensible next step given the current state,
 # so the menu can pre-select it and label it "(recommended)".
 #   8 reconfigure   1 scan   6 set up phase 2   2 verify   3 report   4 serve
+#
+# A phase 1 CSV with only its header counts as scanned: the scan ran and found
+# nothing, and telling the operator to run it again would be a loop.
 recommended_action() {
     [[ "$ENV_READY" == "true" ]]                        || { echo 8; return; }
     [[ -f "$CSV" ]]                                     || { echo 1; return; }
@@ -311,9 +418,9 @@ recommended_hint() {
 }
 
 status_text() {
-    # whiptail shows PROJECT_BANNER as its backtitle already; repeat it here
+    # whiptail shows the banner as its backtitle already; repeat it here
     # so the plain-text menu carries the same identity line.
-    [[ "$HAVE_WHIPTAIL" == "true" ]] || printf '%s\n\n' "$PROJECT_BANNER"
+    [[ "$HAVE_WHIPTAIL" == "true" ]] || printf '%s\n\n' "$(project_banner)"
     printf 'Radarr : %s\nSonarr : %s\n%s\n%s\n\nPhase 1 CSV : %s rows\nPhase 2     : %s\nHTML report : %s\n' \
         "$RADARR_LINE" \
         "$SONARR_LINE" \
@@ -342,12 +449,19 @@ action_scan() {
     ask_yesno "Force Radarr/Sonarr to rescan files on disk first (FORCE_RESCAN)? Slower." no && force=true
     ask_yesno "Ignore the Sonarr per-series cache and re-fetch every series (--refresh)?" no && refresh=true
 
-    local args=("$CSV")
-    [[ "$refresh" == "true" ]] && args+=(--refresh)
-
     log ""
     log "Running phase 1 (scan)..."
-    FORCE_RESCAN="$force" "$SCAN_SH" "${args[@]}" || err "phase 1 exited with an error."
+    local rc=0
+    if [[ "$refresh" == "true" ]]; then
+        FORCE_RESCAN="$force" "$SCAN_SH" "$CSV" --refresh || rc=$?
+    else
+        FORCE_RESCAN="$force" "$SCAN_SH" "$CSV" || rc=$?
+    fi
+    case "$rc" in
+        0) ;;
+        2) err "phase 1 finished with an unreachable app; previous report kept" ;;
+        *) err "phase 1 exited with an error." ;;
+    esac
     pause
 }
 
@@ -366,9 +480,10 @@ Run 'Scan library (phase 1)' first."
   $PHASE2_NOTE
 
 Use the menu item 'Set up phase 2 (faster-whisper)': it creates
-verify/venv and installs the package, with your confirmation. Or install
-it yourself -- 'verify/verify-audio-language.sh --check' prints exactly
-what is missing."
+verify/venv and installs verify/requirements.txt, with your confirmation.
+Or install it yourself -- this is what the launcher reports:
+
+$PHASE2_HINT"
         return
     fi
 
@@ -377,11 +492,11 @@ what is missing."
         small  "balanced (default)" \
         tiny   "fastest, least accurate" \
         base   "fast" \
-        medium "most accurate, slowest")
+        medium "most accurate, slowest") || return
     [[ -z "$model" ]] && return   # cancelled
 
     local limit
-    limit=$(ask_input "Process only the first N files (blank = all, for a quick test):" "")
+    limit=$(ask_input "Process only the first N files (blank = all, for a quick test):" "") || return
 
     local retry=false
     if [[ -f "$VERIFIED_CSV" ]]; then
@@ -390,36 +505,44 @@ what is missing."
 
     log ""
     log "Running phase 2 (verify) with model '$model'..."
-    WHISPER_MODEL="$model" LIMIT="$limit" RETRY_ERRORS="$retry" \
-        "$VERIFY_SH" "$CSV" "$VERIFIED_CSV" || err "phase 2 exited with an error."
+    local rc=0
+    # The keys are of no use to ffmpeg and whisper, and phase 2 shells out for
+    # every single file.
+    env -u RADARR_API_KEY -u SONARR_API_KEY \
+        WHISPER_MODEL="$model" LIMIT="$limit" RETRY_ERRORS="$retry" \
+        "$VERIFY_SH" "$CSV" "$VERIFIED_CSV" || rc=$?
+    case "$rc" in
+        0) ;;
+        3) err "phase 2 finished but every file errored (are the media paths mounted here?)" ;;
+        *) err "phase 2 exited with an error." ;;
+    esac
     pause
 }
 
 action_setup_phase2() {
-    if ! command -v python3 >/dev/null 2>&1; then
+    if ! have python3; then
         info_box "python3 is not installed. Install it (and ffmpeg) first."
         return
     fi
 
     log ""
     log "Checking the phase 2 environment..."
-    if "$VERIFY_SH" --check; then
+    if env -u RADARR_API_KEY -u SONARR_API_KEY "$VERIFY_SH" --check; then
         info_box "Phase 2 environment is already ready. Nothing to do."
         run_preflight
         pause
         return
     fi
 
-    local venv="$ROOT/verify/venv"
-    ask_yesno "Create $venv and 'pip install faster-whisper' now?
+    ask_yesno "Create $VENV_DIR and install $REQUIREMENTS now?
 (a few hundred MB, downloads CPU Torch etc.)" no || return
 
     log ""
-    if [[ ! -x "$venv/bin/python" ]]; then
-        log "Creating virtual environment: $venv"
-        if ! python3 -m venv "$venv"; then
+    if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+        log "Creating virtual environment: $VENV_DIR"
+        if ! python3 -m venv "$VENV_DIR"; then
             local pv
-            pv=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+            pv=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
             info_box "Could not create the venv (ensurepip / python3-venv missing).
 On Debian/Ubuntu install it first, then run this again:
 
@@ -428,9 +551,13 @@ On Debian/Ubuntu install it first, then run this again:
         fi
     fi
 
-    log "Installing faster-whisper into the venv..."
-    "$venv/bin/pip" install --upgrade pip && "$venv/bin/pip" install faster-whisper
-    local irc=$?
+    # A pip that cannot upgrade itself is not a reason to stop: the pinned
+    # requirements install perfectly well with the pip the venv already has.
+    log "Installing the phase 2 requirements into the venv..."
+    "$VENV_DIR/bin/pip" install --upgrade pip \
+        || warn "could not upgrade pip inside the venv; continuing with the one it has."
+    local irc=0
+    "$VENV_DIR/bin/pip" install -r "$REQUIREMENTS" || irc=$?
 
     run_preflight
     if [[ "$irc" -eq 0 && "$PHASE2_READY" == "true" ]]; then
@@ -442,38 +569,57 @@ On Debian/Ubuntu install it first, then run this again:
     pause
 }
 
-action_report() {
-    if [[ ! -f "$VERIFIED_CSV" ]]; then
-        info_box "No phase 2 CSV yet at:
+# require_phase2_csv -- rc 0 when phase 2 has produced its CSV, otherwise say
+# where it should be and rc 1.
+require_phase2_csv() {
+    [[ -f "$VERIFIED_CSV" ]] && return 0
+    info_box "No phase 2 CSV yet at:
   $VERIFIED_CSV
 
 Run 'Verify suspects (phase 2)' first."
-        return
-    fi
-    command -v python3 >/dev/null 2>&1 || { err "python3 not found."; pause; return; }
-    python3 "$REPORT_PY" "$VERIFIED_CSV" || err "report generation failed."
+    return 1
+}
+
+# phase2_python -- echo the interpreter the report runs under: the one the
+# launcher named, so a venv build is not rendered by a bare system python3.
+phase2_python() {
+    local py="${PHASE2_PYTHON:-python3}"
+    have "$py" || { err "no usable python3 found ($py)."; return 1; }
+    printf '%s\n' "$py"
+}
+
+action_report() {
+    require_phase2_csv || return 0   # explained, not a failure
+    local py
+    py=$(phase2_python) || { pause; return; }
+
+    env -u RADARR_API_KEY -u SONARR_API_KEY "$py" "$REPORT_PY" "$VERIFIED_CSV" \
+        || err "report generation failed."
     log "HTML report: $HTML"
     pause
 }
 
 action_serve() {
-    if [[ ! -f "$VERIFIED_CSV" ]]; then
-        info_box "No phase 2 CSV yet at:
-  $VERIFIED_CSV
-
-Run 'Verify suspects (phase 2)' first."
-        return
-    fi
-    command -v python3 >/dev/null 2>&1 || { err "python3 not found."; pause; return; }
+    require_phase2_csv || return 0   # explained, not a failure
+    local py
+    py=$(phase2_python) || { pause; return; }
 
     local port
-    port=$(ask_input "Port to serve on (blank = pick a free one):" "")
+    port=$(ask_input "Port to serve on (blank = pick a free one):" "") || return
+
+    # The report lists every path in the library, so it stays on the loopback
+    # interface unless the operator asks for the LAN in so many words.
     local extra=()
     [[ -n "$port" ]] && extra=(--port "$port")
+    if ask_yesno "Expose the report on the LAN (bind 0.0.0.0)?" no; then
+        extra=(${extra[@]+"${extra[@]}"} --host 0.0.0.0)
+    fi
 
     log ""
     log "Starting the report webserver. Press Enter in this terminal to stop it."
-    python3 "$REPORT_PY" "$VERIFIED_CSV" --serve "${extra[@]}" || err "the report server exited with an error."
+    env -u RADARR_API_KEY -u SONARR_API_KEY \
+        "$py" "$REPORT_PY" "$VERIFIED_CSV" --serve ${extra[@]+"${extra[@]}"} \
+        || err "the report server exited with an error."
     pause
 }
 
@@ -513,7 +659,7 @@ action_connection_details() {
 
 action_about() {
     info_box "$PROJECT_NAME
-$PROJECT_VERSION
+$(project_version)
 
 Find media files in Radarr/Sonarr libraries that have no Italian audio,
 then verify the real spoken language locally with faster-whisper. The
@@ -566,9 +712,10 @@ action_configure() {
     fi
     local editor="${EDITOR:-${VISUAL:-}}"
     if [[ -z "$editor" ]]; then
-        for e in nano vim vi; do command -v "$e" >/dev/null 2>&1 && { editor="$e"; break; }; done
+        local e
+        for e in nano vim vi; do have "$e" && { editor="$e"; break; }; done
     fi
-    if [[ -n "$editor" ]] && command -v "$editor" >/dev/null 2>&1; then
+    if [[ -n "$editor" ]] && have "$editor"; then
         "$editor" "$ENV_FILE"
     else
         info_box "No editor found (set \$EDITOR). Edit this file by hand:
@@ -584,6 +731,16 @@ action_configure() {
 # ---------------------------------------------------------------------------
 
 main() {
+    case "${1:-}" in
+        -h|--help)
+            usage
+            return 0
+            ;;
+    esac
+
+    mkdir -p "$REPORTS_DIR" 2>/dev/null \
+        || die 1 "cannot create the reports directory: $REPORTS_DIR"
+
     run_preflight
 
     while true; do
@@ -603,7 +760,7 @@ main() {
             8 "$(_lbl 8 'Reconfigure (.env) + re-check')" \
             R "Reset reports (delete CSV/HTML/cache, start over)" \
             9 "About / project page" \
-            0 "Quit") || break   # whiptail Cancel / Esc
+            0 "Quit") || break   # whiptail Cancel / Esc, or no more input
 
         case "${choice:-}" in
             1) action_scan ;;
@@ -623,4 +780,8 @@ main() {
     log "Bye."
 }
 
-main
+# Sourcing this file defines everything and runs nothing: that is what lets the
+# bats suite exercise one function at a time.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
