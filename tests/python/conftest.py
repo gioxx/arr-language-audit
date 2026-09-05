@@ -1,16 +1,48 @@
-"""Shared pytest fixtures.
+"""Shared pytest fixtures and CSV helpers.
 
 `pythonpath` in pyproject.toml puts verify/, tests/python/ and the fake
 faster-whisper package on sys.path, so the modules under test import by name.
+
+The fixtures that isolate a worker run from the developer's own environment
+(`clean_env`, `sys_temp`, `shim_path`) live here because both test_verify.py
+and test_resume.py drive `main()`; they are opt-in, so the report and harness
+tests are unaffected. A module takes the first two with
+
+    pytestmark = pytest.mark.usefixtures("clean_env", "sys_temp")
 """
 
 from __future__ import annotations
 
+import csv
 import json
+import os
 import struct
+import subprocess
+import tempfile
+from pathlib import Path
 
+import audit_common
 import faster_whisper
 import pytest
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+SHIM_BIN = ROOT / "tests" / "bats" / "fakes" / "bin"
+
+ENV_VARS = (
+    "WHISPER_MODEL",
+    "SAMPLE_SECONDS",
+    "SAMPLE_OFFSET_PCT",
+    "MIN_FREE_SPACE_MB",
+    "TEMP_DIR",
+    "MIN_CONFIDENCE",
+    "WHISPER_THREADS",
+    "FAKE_WHISPER_SCRIPT",
+    "FAKE_FFMPEG_FAIL",
+    "FAKE_FFMPEG_LOG",
+    "FAKE_DURATIONS",
+    "FAKE_STREAMS",
+    "FAKE_FFPROBE_LOG",
+)
 
 
 # 44-byte RIFF/WAVE header, 16 kHz mono s16le -- byte for byte what the ffmpeg
@@ -28,14 +60,19 @@ def _wav_bytes(media_path: str) -> bytes:
     )
 
 
+def _forget_fake_whisper():
+    faster_whisper.WhisperModel.instances = []
+    faster_whisper.WhisperModel.calls = []
+    faster_whisper.WhisperModel.transcribe_calls = []
+    faster_whisper.WhisperModel.detect_calls = []
+
+
 @pytest.fixture(autouse=True)
 def _reset_fake_whisper():
     """Each test sees a fresh recording of constructed models and media seen."""
-    faster_whisper.WhisperModel.instances = []
-    faster_whisper.WhisperModel.calls = []
+    _forget_fake_whisper()
     yield
-    faster_whisper.WhisperModel.instances = []
-    faster_whisper.WhisperModel.calls = []
+    _forget_fake_whisper()
 
 
 @pytest.fixture
@@ -63,3 +100,98 @@ def whisper_script(tmp_path, monkeypatch):
         return str(path)
 
     return _write
+
+
+@pytest.fixture
+def clean_env(monkeypatch):
+    """The developer's own WHISPER_MODEL/TEMP_DIR must not reach the code."""
+    for name in ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def sys_temp(tmp_path, monkeypatch):
+    """Stands in for the system temp dir; must be empty when a run is over."""
+    holder = tmp_path / "systmp"
+    holder.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(holder))
+    monkeypatch.setenv("TMPDIR", str(holder))
+    return holder
+
+
+@pytest.fixture
+def shim_path(monkeypatch):
+    """Put the fake ffmpeg/ffprobe ahead of anything real."""
+    monkeypatch.setenv("PATH", str(SHIM_BIN) + os.pathsep + os.environ["PATH"])
+
+
+# --- test doubles -----------------------------------------------------------
+
+
+class Recorder:
+    """Stands in for subprocess.run: records argv, writes the output file.
+
+    Shared because both the extraction tests and the probe tests need to see
+    the exact argv the worker builds -- that argv IS the behaviour under test
+    (which stream ffmpeg is told to take, what ffprobe is asked for)."""
+
+    def __init__(self, payload=b"x", exc=None, stdout=""):
+        self.calls = []
+        self.payload = payload
+        self.exc = exc
+        self.stdout = stdout
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if self.exc is not None:
+            raise self.exc
+        if self.payload is not None:
+            Path(argv[-1]).write_bytes(self.payload)
+        return subprocess.CompletedProcess(argv, 0, self.stdout, "")
+
+
+# --- CSV helpers ------------------------------------------------------------
+
+
+def media(tmp_path, name, content=b"not really a movie"):
+    path = tmp_path / name
+    path.write_bytes(content)
+    return str(path)
+
+
+def write_phase1(tmp_path, rows, name="in.csv"):
+    path = tmp_path / name
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=audit_common.PHASE1_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({c: row.get(c, "") for c in audit_common.PHASE1_COLUMNS})
+    return str(path)
+
+
+def write_phase2(tmp_path, rows, name="prev.csv", columns=None):
+    """A previous-run output CSV. `columns` writes an older schema verbatim."""
+    fieldnames = list(columns or audit_common.PHASE2_COLUMNS)
+    path = tmp_path / name
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({c: row.get(c, "") for c in fieldnames})
+    return str(path)
+
+
+def read_rows(path):
+    with open(path, newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        return list(reader.fieldnames or []), list(reader)
+
+
+def signature_of(path):
+    st = os.stat(path)
+    return str(int(st.st_size)), str(int(st.st_mtime))
+
+
+def phase1_row(path, title="T", declared="eng", app="Radarr", episode=""):
+    return {"App": app, "Title": title, "Year": "2001", "Episode": episode,
+            "AudioLanguages": declared, "Path": path}

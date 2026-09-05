@@ -10,6 +10,11 @@ script, so a test says what language a given media file "is".
       A rule of ["it", 0.97] is returned as (language, probability); the string
       "RAISE" makes the call raise; [null, 0.0] yields (None, 0.0). "*" is the
       fallback, itself defaulting to ("en", 0.9).
+
+Class attributes record what happened: `instances` (constructor args), `calls`
+(the media behind each sample, in order), `transcribe_calls` and `detect_calls`
+(the arguments of each call to either API, so a test can prove which one the
+worker reached for).
 """
 
 from __future__ import annotations
@@ -54,10 +59,14 @@ def _rule_for(source: str):
 
 
 class WhisperModel:
-    """Records how it was built and which media it was asked about."""
+    """Records how it was built, which media it was asked about, and -- so a
+    test can prove which detection API the worker used -- every transcribe()
+    and detect_language() call it received."""
 
     instances: ClassVar[list] = []
     calls: ClassVar[list] = []
+    transcribe_calls: ClassVar[list] = []
+    detect_calls: ClassVar[list] = []
 
     def __init__(self, model_size_or_path, device=None, compute_type=None, **kw):
         self.args = (model_size_or_path, device, compute_type)
@@ -73,6 +82,7 @@ class WhisperModel:
         return rule
 
     def transcribe(self, wav_path, **kw):
+        WhisperModel.transcribe_calls.append(wav_path)
         language, probability = self._resolve(wav_path)
 
         def _segments():
@@ -91,5 +101,11 @@ class WhisperModel:
         language_detection_threshold=0.5,
         **kw,
     ):
+        WhisperModel.detect_calls.append({
+            "audio": audio,
+            "vad_filter": vad_filter,
+            "language_detection_segments": language_detection_segments,
+            "language_detection_threshold": language_detection_threshold,
+        })
         language, probability = self._resolve(audio)
         return language, probability, []

@@ -17,6 +17,16 @@ poll_command_status() {
     curl -sf -H "X-Api-Key: $2" "$1/api/v3/command/42" | "${REAL_JQ:-jq}" -r '.status'
 }
 
+# Local to this file: probe a file the way the phase 2 worker does and print
+# [duration, audio stream count, position of the default one].
+# probe_streams <path>
+probe_streams() {
+    ffprobe -v error -select_streams a -show_streams -show_format -of json "$1" \
+        | "${REAL_JQ:-jq}" -c '[.format.duration,
+                                (.streams | length),
+                                (.streams | map(.disposition.default) | index(1))]'
+}
+
 @test "fake server serves the system/status fixture and logs the request" {
     start_fake_arr "$BATS_TESTS_DIR/fixtures"
 
@@ -125,6 +135,55 @@ poll_command_status() {
     run ffprobe -v error -show_entries format=duration -of json /media/other.mkv
     assert_success
     assert_output '{"format":{"duration":"600"}}'
+}
+
+@test "ffprobe shim reports the scripted streams when asked for them" {
+    make_bin
+    install_shim ffprobe
+
+    export FAKE_DURATIONS='{"/media/x.mkv": 42}'
+    export FAKE_STREAMS='[{"index":0,"codec_type":"video","disposition":{"default":1}},{"index":1,"codec_type":"audio","disposition":{"default":0}},{"index":2,"codec_type":"audio","disposition":{"default":1}}]'
+
+    # -select_streams a drops the video stream, so the array position of a
+    # stream is the index `-map 0:a:<n>` takes.
+    run probe_streams /media/x.mkv
+    assert_success
+    assert_output '["42",2,1]'
+
+    # No FAKE_STREAMS: one audio stream, flagged default.
+    unset FAKE_STREAMS
+    run probe_streams /media/x.mkv
+    assert_success
+    assert_output '["42",1,0]'
+
+    # A caller that did not ask for streams still gets the old shape.
+    run ffprobe -v error -show_entries format=duration -of json /media/x.mkv
+    assert_success
+    assert_output '{"format":{"duration":"42"}}'
+}
+
+@test "ffprobe shim prints only the sections it was asked for" {
+    make_bin
+    install_shim ffprobe
+
+    export FAKE_DURATIONS='{"/media/x.mkv": 42}'
+
+    # Strict on purpose: a shim that answers a caller which forgot a flag is a
+    # shim no test can use to notice the flag going missing. The phase 2
+    # worker needs BOTH sections, and dropping -show_format would silently
+    # make every duration unknown in production.
+    run ffprobe -v error -select_streams a -show_streams -of json /media/x.mkv
+    assert_success
+    refute_output --partial '"format"'
+    assert_output --partial '"streams"'
+
+    run ffprobe -v error -show_format -of json /media/x.mkv
+    assert_success
+    assert_output '{"format":{"duration":"42"}}'
+
+    run ffprobe -v error -of json /media/x.mkv
+    assert_success
+    assert_output '{}'
 }
 
 @test "whiptail shim returns the scripted answer and exit status" {
