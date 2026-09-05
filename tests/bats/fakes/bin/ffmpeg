@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Fake ffmpeg: write a 44-byte RIFF/WAVE header (16 kHz mono s16le) followed by
+# "FAKEWAV:<input path>" so the fake faster-whisper can tell which media file a
+# sample came from.
+#
+#   FAKE_FFMPEG_FAIL  substring; if the input path contains it, fail like a
+#                     corrupt file would.
+#   FAKE_FFMPEG_LOG   file to append argv to, one invocation per line.
+set -u
+
+input=""
+output=""
+prev=""
+for arg in "$@"; do
+    if [[ "$prev" == "-i" ]]; then
+        input="$arg"
+    fi
+    output="$arg"
+    prev="$arg"
+done
+
+if [[ -n "${FAKE_FFMPEG_LOG:-}" ]]; then
+    printf '%s\n' "$*" >> "$FAKE_FFMPEG_LOG"
+fi
+
+if [[ -n "${FAKE_FFMPEG_FAIL:-}" && "$input" == *"$FAKE_FFMPEG_FAIL"* ]]; then
+    echo "Invalid data found when processing input" >&2
+    exit 1
+fi
+
+payload="FAKEWAV:$input"
+data_size=$(( ${#payload} + 1 ))
+
+# Little-endian 32-bit integer, byte by byte (bash 3.2 has no printf -v %n).
+le32() {
+    local value="$1" i byte out=""
+    for i in 0 1 2 3; do
+        byte=$(( (value >> (i * 8)) & 255 ))
+        out="$out\\$(printf '%03o' "$byte")"
+    done
+    printf '%b' "$out"
+}
+
+{
+    printf 'RIFF'
+    le32 $(( 36 + data_size ))
+    printf 'WAVEfmt '
+    le32 16          # fmt chunk size
+    printf '\x01\x00'  # PCM
+    printf '\x01\x00'  # mono
+    le32 16000       # sample rate
+    le32 32000       # byte rate = 16000 * 1 * 16/8
+    printf '\x02\x00'  # block align
+    printf '\x10\x00'  # bits per sample
+    printf 'data'
+    le32 "$data_size"
+    printf '%s\n' "$payload"
+} > "$output"

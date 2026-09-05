@@ -1,0 +1,8 @@
+{
+  "name": "arr-language-audit-report-tests",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test report.test.mjs" },
+  "engines": { "node": ">=22" },
+  "devDependencies": { "jsdom": "26.1.0" }
+}

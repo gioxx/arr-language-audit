@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fake apt: exists so `command -v apt` succeeds on a fake Debian host. It never
+# does anything, and records that it was called.
+set -u
+if [[ -n "${FAKE_APT_LOG:-}" ]]; then
+    printf '%s\n' "$*" >> "$FAKE_APT_LOG"
+fi
+exit 0

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Generic recorder: stands in for any executable a script shells out to, most
+# often the fake SCAN_SH / VERIFY_SH in the orchestrator tests.
+#
+#   RECORDER_LOG   file to append to; one line "argv: $0 <args>" per call,
+#                  followed by one "env: NAME=value" line per interesting
+#                  variable.
+#   RECORDER_RC    exit status; default 0.
+#   RECORDER_OUT   text to print on stdout; default empty.
+set -u
+
+if [[ -n "${RECORDER_LOG:-}" ]]; then
+    printf 'argv: %s %s\n' "$0" "$*" >> "$RECORDER_LOG"
+    env | grep -E '^(RADARR_|SONARR_|WHISPER_MODEL|LIMIT|RETRY_ERRORS|NO_RESUME|SAMPLE_|OUTPUT|INPUT|FORCE_RESCAN|REFRESH|PYTHON_BIN)' \
+        | sort \
+        | sed 's/^/env: /' >> "$RECORDER_LOG" || true
+fi
+
+if [[ -n "${RECORDER_OUT:-}" ]]; then
+    printf '%s\n' "$RECORDER_OUT"
+fi
+
+exit "${RECORDER_RC:-0}"

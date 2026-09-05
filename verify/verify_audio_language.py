@@ -10,6 +10,13 @@ Sonarr mediaInfo) against the ACTUALLY DETECTED spoken language.
 This does NOT rely on container metadata at all -- it listens to the audio.
 No media file is modified; the only output is the verdict CSV.
 
+What is listened to: the audio stream the container marks as default (else
+the first one), sampled for SAMPLE_SECONDS from SAMPLE_OFFSET_PCT into the
+file. Only that window decides -- a file whose sampled minute is music, or
+whose tracks differ from the default one, is judged on what that minute
+contains, which is why a detection below MIN_CONFIDENCE is reported as
+LOW_CONFIDENCE rather than as an answer.
+
 Normally you run this through verify-audio-language.sh, which performs the
 dependency and disk-space checks first. You can also call it directly:
 
@@ -18,19 +25,36 @@ dependency and disk-space checks first. You can also call it directly:
 
 By default, if the output CSV already exists, files already verified in it
 are reused on subsequent runs, so you can stop and resume a long scan.
+Rows are matched on (path, episode), not on the path alone: a single file
+holding a double episode is two Sonarr rows sharing one path, and each of
+them keeps its own verdict.
+
 A file is re-verified automatically when its size or mtime changed since
 the last run (it was replaced, re-encoded or re-downloaded), even though
 its path is unchanged. Rows written before this behaviour existed carry no
-stored size/mtime and are reused as-is until verified again.
+stored size/mtime and are reused as-is until verified again. An error row
+carrying no signature (typically FILE_NOT_FOUND from a run where the share
+was not mounted) is retried as soon as the file is visible again, and is
+never stamped with a signature it was not verified against.
 
-Rows in the output whose path is no longer in the phase 1 CSV: if the file
-also changed on disk (it was fixed), the stale verdict is dropped; if its
-signature still matches (the scan just had a narrower scope) or the file
-is gone, the row is kept. Use the orchestrator's "Reset reports" action to
-wipe everything and start over.
+Rows in the output whose (path, episode) is no longer in the phase 1 CSV:
+if the file also changed on disk (it was fixed), the stale verdict is
+dropped; if its signature still matches (the scan just had a narrower
+scope) or the file is gone, the row is kept. Use the orchestrator's
+"Reset reports" action to wipe everything and start over.
 
-    --retry-errors   also reprocess rows that previously failed
-                     (FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)
+An episode phase 1 relabels keeps its verdict: the row under the old label
+is superseded and dropped, and the verdict moves to the new one as long as
+the file's signature is unchanged. Renaming an episode never costs a
+re-listen, and never leaves the same file in the report twice.
+
+--limit caps how many files are (re)verified in one run; the rows it cuts
+keep the verdict they already had, so a limited run never empties out the
+report.
+
+    --retry-errors   also reprocess rows whose previous verdict is
+                     retryable (FILE_NOT_FOUND, EXTRACTION_FAILED,
+                     DETECTION_FAILED, LOW_CONFIDENCE)
     --no-resume      ignore any existing output file and start fresh
                      (overwrites it)
 
@@ -39,32 +63,69 @@ Verdicts written to the output CSV:
                             wrong. Fix the mediaInfo/tag, no redownload.
     CONFIRMED_NOT_ITALIAN   spoken language really is not Italian. Needs a
                             real fix: redownload or remux an Italian track.
+    LOW_CONFIDENCE          a language was named but below MIN_CONFIDENCE, so
+                            it decides nothing. Re-run with a bigger
+                            WHISPER_MODEL or another SAMPLE_OFFSET_PCT, or
+                            with --retry-errors.
     FILE_NOT_FOUND          path from the phase 1 CSV does not exist here.
     EXTRACTION_FAILED       ffmpeg could not produce an audio sample.
-    DETECTION_FAILED        faster-whisper raised while analyzing the sample.
+    DETECTION_FAILED        faster-whisper raised while analyzing the sample,
+                            or could not name a language at all.
+
+Exit codes:
+    0   finished (including "nothing new to verify")
+    1   configuration, input, output path or disk-space problem, or the
+        model could not be loaded (the previous output CSV is untouched)
+    2   usage error: an unknown flag or a bad value (argparse)
+    3   every file this run tried to verify errored
+    130 interrupted (Ctrl-C); the CSV written so far stays valid
 
 Environment variables (optional):
     WHISPER_MODEL       tiny | base | small | medium (default: small)
+    WHISPER_THREADS     CPU threads for the model (default: all cores)
     SAMPLE_SECONDS      length of the audio sample to analyze (default: 60)
     SAMPLE_OFFSET_PCT   where to start sampling, as % of duration (default: 25)
+    MIN_CONFIDENCE      0..1; a detection below it is LOW_CONFIDENCE
+                        (default: 0.6)
     MIN_FREE_SPACE_MB   minimum free space required in temp dir (default: 500)
-    TEMP_DIR           directory for temporary audio samples (default: mktemp)
+    TEMP_DIR            PARENT directory for the run's scratch directory
+                        (default: the system temp dir). A private
+                        'lang-check-XXXX' directory is created inside it and
+                        only that directory is ever removed -- the directory
+                        you point TEMP_DIR at is never deleted.
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
-SAMPLE_SECONDS = int(os.environ.get("SAMPLE_SECONDS", "60"))
-SAMPLE_OFFSET_PCT = float(os.environ.get("SAMPLE_OFFSET_PCT", "25"))
-MIN_FREE_SPACE_MB = int(os.environ.get("MIN_FREE_SPACE_MB", "500"))
+from audit_common import (
+    ALL_VERDICTS,
+    ERROR_VERDICTS,
+    PHASE1_COLUMNS,
+    PHASE2_COLUMNS,
+    RETRYABLE_VERDICTS,
+    VERDICT_CONFIRMED,
+    VERDICT_DETECTION_FAILED,
+    VERDICT_EXTRACTION_FAILED,
+    VERDICT_FILE_NOT_FOUND,
+    VERDICT_LOW_CONFIDENCE,
+    VERDICT_MISTAGGED,
+    check_python_floor,
+    log,
+)
 
 # Default report location: <repo>/reports/ (this file lives in <repo>/verify/).
 # Keeps phase 1, phase 2 and the HTML report pointed at the same directory
@@ -73,245 +134,607 @@ REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_INPUT = str(REPORTS_DIR / "missing-italian-audio.csv")
 DEFAULT_OUTPUT = str(REPORTS_DIR / "verified-language-results.csv")
 
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_ALL_FAILED = 3
+EXIT_INTERRUPTED = 130
+
+# How much of a tool's complaint is worth keeping in the log.
+MAX_ERROR_CHARS = 200
+
+
+class WorkerError(Exception):
+    """Anything that stops the run with exit 1 and a message for the user.
+
+    Helpers raise instead of calling sys.exit, so main() stays the only place
+    that decides an exit code -- and so the tests can call them directly."""
+
+
+class ConfigError(WorkerError):
+    """An environment variable does not hold a usable value."""
+
+
+class DiskSpaceError(WorkerError):
+    """Not enough free space left in the scratch directory."""
+
+
+@dataclass(frozen=True)
+class Config:
+    """Everything the run takes from the environment, read once in main()."""
+
+    whisper_model: str = "small"
+    sample_seconds: int = 60
+    sample_offset_pct: float = 25.0
+    min_free_space_mb: int = 500
+    temp_parent: str | None = None
+    # The floor a detection has to clear before its language is believed;
+    # anything under it is VERDICT_LOW_CONFIDENCE. See classify().
+    min_confidence: float = 0.6
+    whisper_threads: int = 0
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> Config:
+        """Build a Config from `env` (default: os.environ).
+
+        An unset variable and one exported empty ("SAMPLE_SECONDS=") mean the
+        same thing: use the default. Anything else that is not a usable value
+        raises ConfigError, which main() reports as exit 1."""
+        source: Mapping[str, str] = os.environ if env is None else env
+
+        def text(name: str) -> str:
+            return (source.get(name) or "").strip()
+
+        kinds = {int: "whole number", float: "number"}
+
+        def number(name: str, default, cast, low=None, high=None):
+            raw = text(name)
+            if not raw:
+                return default
+            try:
+                value = cast(raw)
+            except (TypeError, ValueError):
+                raise ConfigError(
+                    f"{name} must be a {kinds[cast]}, got '{raw}'."
+                ) from None
+            if cast is float and not math.isfinite(value):
+                raise ConfigError(f"{name} must be a finite number, got '{raw}'.")
+            if (low is not None and value < low) or (high is not None and value > high):
+                bounds = f"{low}..{high}" if high is not None else f">= {low}"
+                raise ConfigError(f"{name} must be {bounds}, got '{raw}'.")
+            return value
+
+        return cls(
+            whisper_model=text("WHISPER_MODEL") or "small",
+            sample_seconds=number("SAMPLE_SECONDS", 60, int, low=1),
+            sample_offset_pct=number("SAMPLE_OFFSET_PCT", 25.0, float, low=0.0, high=100.0),
+            min_free_space_mb=number("MIN_FREE_SPACE_MB", 500, int, low=0),
+            temp_parent=text("TEMP_DIR") or None,
+            min_confidence=number("MIN_CONFIDENCE", 0.6, float, low=0.0, high=1.0),
+            whisper_threads=number("WHISPER_THREADS", 0, int, low=0),
+        )
+
+
+def make_temp_dir(cfg: Config) -> str:
+    """A private scratch directory for this run's audio samples.
+
+    TEMP_DIR (cfg.temp_parent) is only ever the PARENT: a user pointing it at
+    /tmp or at a scratch share must get their directory back untouched, so the
+    only thing this program ever removes is the directory it created here."""
+    if cfg.temp_parent:
+        os.makedirs(cfg.temp_parent, exist_ok=True)
+    return tempfile.mkdtemp(prefix="lang-check-", dir=cfg.temp_parent)
+
 
 def check_disk_space(path: str, min_mb: int) -> None:
     usage = shutil.disk_usage(path)
     free_mb = usage.free / (1024 * 1024)
     if free_mb < min_mb:
-        print(
-            f"ERROR: only {free_mb:.0f} MB free in '{path}', "
-            f"need at least {min_mb} MB. Aborting.",
-            file=sys.stderr,
+        raise DiskSpaceError(
+            f"only {free_mb:.0f} MB free in '{path}', need at least {min_mb} MB."
         )
-        sys.exit(1)
 
 
-def get_duration_seconds(file_path: str) -> float | None:
+@dataclass(frozen=True)
+class MediaProbe:
+    """What one ffprobe call tells us about a media file.
+
+    duration      length in seconds, or None when it could not be read
+    audio_stream  which audio stream to listen to, counted WITHIN the file's
+                  audio streams (what `-map 0:a:<n>` takes, not the container
+                  stream index), or None when the file has no audio stream or
+                  the probe failed
+    """
+
+    duration: float | None
+    audio_stream: int | None
+
+
+def media_tool_environment() -> dict[str, str]:
+    """Direct worker invocation must keep Arr credentials out of children too."""
+    return {name: value for name, value in os.environ.items()
+            if name not in {"RADARR_API_KEY", "SONARR_API_KEY"}}
+
+
+def probe_media(file_path: str) -> MediaProbe:
+    """Duration and the audio stream to sample, from ONE ffprobe invocation.
+
+    R5: ffmpeg left to itself takes the audio stream with the most channels,
+    so an Italian 2.0 track flagged default alongside an English 5.1 track was
+    being judged in English. The stream the container marks as default is the
+    one the user hears, and it is the one we listen to; failing that, the first
+    audio stream.
+
+    One invocation because this runs once per file over a whole library.
+    -select_streams a is what makes the array position an audio-relative
+    index; -show_streams (rather than -show_entries stream_disposition=...)
+    is spelled the way every ffprobe build accepts."""
     try:
         result = subprocess.run(
             [
                 "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
+                "-select_streams", "a",
+                "-show_streams",
+                "-show_format",
                 "-of", "json",
                 file_path,
             ],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, check=False,
+            env=media_tool_environment(),
         )
+        if result.returncode:
+            return MediaProbe(None, None)
         data = json.loads(result.stdout)
-        return float(data["format"]["duration"])
-    except Exception:
-        return None
+        if not isinstance(data, dict):
+            raise ValueError("ffprobe did not return an object")
+    except Exception:  # noqa: BLE001
+        # Any probe failure means "nothing known"; the caller falls back to
+        # sampling from the start and letting ffmpeg choose the stream.
+        return MediaProbe(None, None)
+
+    try:
+        duration = float((data.get("format") or {})["duration"])
+        if not math.isfinite(duration):
+            duration = None
+    except (AttributeError, KeyError, TypeError, ValueError):
+        duration = None
+
+    # Defensive on top of -select_streams: a build that ignored it must not
+    # shift the numbering by counting a video stream.
+    streams = data.get("streams") or []
+    if not isinstance(streams, list):
+        return MediaProbe(duration, None)
+    audio = [s for s in streams
+             if isinstance(s, dict) and (s.get("codec_type") or "audio") == "audio"]
+    if not audio:
+        return MediaProbe(duration, None)
+    chosen = 0
+    for position, stream in enumerate(audio):
+        disposition = stream.get("disposition") or {}
+        if isinstance(disposition, dict) and disposition.get("default") in (1, "1"):
+            chosen = position
+            break
+    return MediaProbe(duration, chosen)
 
 
-def extract_sample(file_path: str, out_wav: str) -> bool:
-    duration = get_duration_seconds(file_path)
+def extract_sample(file_path: str, out_wav: str, cfg: Config, probe: MediaProbe) -> bool:
+    duration = probe.duration
     if duration is None or duration <= 0:
         start = 0
     else:
-        start = max(0, duration * (SAMPLE_OFFSET_PCT / 100.0))
+        start = max(0, duration * (cfg.sample_offset_pct / 100.0))
         # don't start so late that there's not enough left to sample
-        start = min(start, max(0, duration - SAMPLE_SECONDS))
+        start = min(start, max(0, duration - cfg.sample_seconds))
+
+    argv = [
+        "ffmpeg",
+        "-nostdin",
+        "-loglevel", "error",
+        "-y",
+        "-ss", str(start),
+        "-i", file_path,
+    ]
+    if probe.audio_stream is not None:
+        # R5: name the stream explicitly, or ffmpeg picks the one with the
+        # most channels rather than the one the container marks as default.
+        argv += ["-map", f"0:a:{probe.audio_stream}"]
+    argv += [
+        "-t", str(cfg.sample_seconds),
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        out_wav,
+    ]
 
     try:
         subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-ss", str(start),
-                "-i", file_path,
-                "-t", str(SAMPLE_SECONDS),
-                "-vn",
-                "-acodec", "pcm_s16le",
-                "-ar", "16000",
-                "-ac", "1",
-                out_wav,
-            ],
+            argv,
             capture_output=True, text=True, timeout=120, check=True,
+            env=media_tool_environment(),
         )
         return os.path.exists(out_wav) and os.path.getsize(out_wav) > 0
     except subprocess.CalledProcessError as e:
-        print(f"  ffmpeg failed for '{file_path}': {e.stderr.strip()[:200]}", file=sys.stderr)
+        detail = (e.stderr or "").strip()[:MAX_ERROR_CHARS]
+        log(f"  ffmpeg failed for '{file_path}': {detail}")
         return False
-    except Exception as e:
-        print(f"  ffmpeg failed for '{file_path}': {e}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001
+        # One unreadable file must not end the run: report it and carry on.
+        log(f"  ffmpeg failed for '{file_path}': {str(e)[:MAX_ERROR_CHARS]}")
         return False
 
 
-def load_model():
-    from faster_whisper import WhisperModel
-    print(f"Loading Whisper model '{WHISPER_MODEL}' (CPU)...", file=sys.stderr)
-    return WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+def load_model(cfg: Config):
+    # Imported here on purpose: loading faster_whisper costs seconds, and the
+    # script must run --help (and fail cleanly) without the package installed.
+    from faster_whisper import WhisperModel  # noqa: PLC0415
+
+    threads = cfg.whisper_threads or os.cpu_count() or 4
+    log(f"Loading Whisper model '{cfg.whisper_model}' (CPU, {threads} thread(s))...")
+    return WhisperModel(
+        cfg.whisper_model, device="cpu", compute_type="int8", cpu_threads=threads
+    )
 
 
-def detect_language(model, wav_path: str) -> tuple[str, float]:
-    segments, info = model.transcribe(wav_path, beam_size=1, best_of=1, vad_filter=True)
+def detect_language(model, wav_path: str) -> tuple[str | None, float]:
+    """(language, probability) for a sample. The language is None when the
+    detector could not name one -- the caller turns that into a verdict.
+
+    P5: transcribe() identifies the language from the first 30 s window only,
+    so half of a 60 s sample never reached the decision. faster-whisper's
+    dedicated detect_language() takes a second window when the first one comes
+    back under language_detection_threshold, which is what a sample opening on
+    music or on a silent title card needs. transcribe() stays as the fallback
+    for a faster-whisper too old to have the method -- callers may have older
+    installed builds, so "too old" includes a detect_language() that does not
+    take these keywords, not only a build that lacks the method entirely."""
+    detect = getattr(model, "detect_language", None)
+    if detect is not None:
+        kwargs = {
+            "audio": wav_path,
+            "vad_filter": True,
+            "language_detection_segments": 2,
+            "language_detection_threshold": 0.5,
+        }
+        try:
+            signature = inspect.signature(detect)
+        except (TypeError, ValueError):
+            signature = None
+        compatible = True
+        if signature is not None:
+            try:
+                signature.bind(**kwargs)
+            except TypeError:
+                compatible = False
+        if compatible:
+            from faster_whisper.audio import decode_audio  # noqa: PLC0415
+
+            # Only a call-signature mismatch triggers the old API fallback.
+            # A TypeError raised inside detection is a real per-file failure.
+            # Unlike transcribe(), detect_language() requires a mono float
+            # waveform, not a filename. Decode only after checking the API so
+            # legacy models retain their path-based transcribe fallback.
+            kwargs["audio"] = decode_audio(wav_path, sampling_rate=16000)
+            result = detect(**kwargs)
+            return result[0], float(result[1] or 0.0)
+
+    _segments, info = model.transcribe(
+        wav_path, beam_size=1, best_of=1, vad_filter=True
+    )
     # Force generator evaluation is not needed: info.language is populated
     # after the initial language-detection pass, before segment decoding.
-    return info.language, info.language_probability
+    return info.language, float(info.language_probability or 0.0)
 
 
-def is_italian(lang_code: str) -> bool:
+def classify(lang: str | None, prob: float, min_confidence: float) -> str:
+    """The verdict for one detection result.
+
+    H5: the probability used to be thrown away, so a 31%-confident "en"
+    guessed off a window of music was written out as CONFIRMED_NOT_ITALIAN --
+    the verdict that tells the user to re-download the file. A detection that
+    does not clear `min_confidence` says nothing about the language and gets
+    its own verdict, which --retry-errors picks up again.
+
+    The threshold is a floor, not a gap: prob == min_confidence is believed."""
+    if not isinstance(lang, str) or not lang.strip():
+        # Silence, or VAD stripped everything: no language to compare.
+        return VERDICT_DETECTION_FAILED
+    if not math.isfinite(prob) or not 0.0 <= prob <= 1.0:
+        return VERDICT_DETECTION_FAILED
+    if prob < min_confidence:
+        return VERDICT_LOW_CONFIDENCE
+    return VERDICT_MISTAGGED if is_italian(lang) else VERDICT_CONFIRMED
+
+
+def is_italian(lang_code: str | None) -> bool:
+    """True only for a language code that names Italian. A missing code
+    (the detector gave up) is not Italian and is not an error here."""
+    if not lang_code:
+        return False
     return lang_code.lower() in ("it", "ita")
 
 
-ERROR_VERDICTS = {"FILE_NOT_FOUND", "EXTRACTION_FAILED", "DETECTION_FAILED"}
-
-
-def file_signature(path: str) -> tuple[int | None, int | None]:
-    """(size_bytes, mtime_epoch_seconds) for path, or (None, None) if it
+def file_signature(path: str) -> tuple[int | None, str | None]:
+    """(size_bytes, precise_mtime_seconds) for path, or (None, None) if it
     cannot be stat()'d. Comparing this against the value stored on the
     previous run is how we notice a file was replaced even though its path
     did not change."""
     try:
         st = os.stat(path)
-        return int(st.st_size), int(st.st_mtime)
+        seconds, nanos = divmod(abs(st.st_mtime_ns), 1_000_000_000)
+        sign = "-" if st.st_mtime_ns < 0 else ""
+        return int(st.st_size), f"{sign}{seconds}.{nanos:09d}"
     except OSError:
         return None, None
 
 
-def load_previous_rows(output_path: str) -> dict:
-    """path -> the previous run's output row (dict), for resume decisions.
-    Empty when there is no readable previous output."""
-    previous = {}
+def signature_matches(prev_size, prev_mtime, cur_size, cur_mtime) -> bool:
+    """Compare precise signatures while accepting old whole-second mtimes.
+
+    A legacy signature retains its original precision until verification;
+    accepting it never upgrades it to a precision we did not observe then.
+    """
+    if str(cur_size) != prev_size:
+        return False
+    current = str(cur_mtime)
+    return current == prev_mtime or (
+        "." not in prev_mtime and current.partition(".")[0] == prev_mtime
+    )
+
+
+def row_key(row: Mapping[str, str]) -> tuple[str, str]:
+    """(path, episode) -- what identifies a row across runs.
+
+    The path alone is not enough: a file holding a double episode appears in
+    the phase 1 CSV once per episode, and keying on the path made those two
+    rows overwrite each other on every resume. Path whitespace is part of
+    the filename and must never be stripped or merged with another path."""
+    return (row.get("Path") or "", (row.get("Episode") or "").strip())
+
+
+def load_previous_rows(output_path: str) -> dict[tuple[str, str], dict]:
+    """(path, episode) -> the previous run's output row (dict), for resume
+    decisions. Empty when there is no readable previous output."""
+    previous: dict[tuple[str, str], dict] = {}
     if not os.path.isfile(output_path):
         return previous
-    with open(output_path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            path = (row.get("Path", "") or "").strip()
-            if path:
-                previous[path] = row
+    for row in read_csv_rows(output_path, PHASE2_COLUMNS[:-2]):
+        if row["Verdict"].strip() not in ALL_VERDICTS:
+            raise WorkerError(f"invalid verdict in resume CSV '{output_path}'.")
+        key = row_key(row)
+        if key[0]:
+            previous[key] = row
     return previous
+
+
+def read_csv_rows(path: str, required_columns: list[str]) -> list[dict]:
+    """Read a complete, well-formed CSV before the output can be changed."""
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle, strict=True)
+            columns = reader.fieldnames or []
+            if (len(columns) != len(set(columns))
+                    or not set(required_columns).issubset(columns)):
+                raise WorkerError(f"invalid or missing columns in CSV '{path}'.")
+            rows = []
+            for row in reader:
+                if None in row or any(value is None or "\x00" in value for value in row.values()):
+                    raise WorkerError(f"invalid row at line {reader.line_num} in CSV '{path}'.")
+                rows.append(row)
+            return rows
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise WorkerError(f"cannot read CSV '{path}': {exc}") from exc
 
 
 def resume_decision(entry, cur_size, cur_mtime, retry_errors: bool) -> str:
     """Decide what to do with an input row we have a previous verdict for.
 
-        entry         previous output row for this path, or None
+        entry         previous output row for this (path, episode), or None
         cur_size      current file size in bytes, or None if the file is gone
         cur_mtime     current file mtime (epoch seconds), or None if gone
-        retry_errors  reprocess rows whose previous verdict was an error
+        retry_errors  reprocess rows whose previous verdict is retryable
+                      (RETRYABLE_VERDICTS: the three error verdicts, plus
+                      LOW_CONFIDENCE once the detector produces it)
 
     Returns 'verify' (run detection again and replace the old row) or
     'keep' (reuse the previous verdict unchanged)."""
     if entry is None:
         return "verify"
-    if retry_errors and (entry.get("Verdict", "") or "") in ERROR_VERDICTS:
+    verdict = (entry.get("Verdict", "") or "").strip()
+    if retry_errors and verdict in RETRYABLE_VERDICTS:
         return "verify"
 
     prev_size = (entry.get("FileSize", "") or "").strip()
     prev_mtime = (entry.get("FileMtime", "") or "").strip()
     if not prev_size or not prev_mtime:
+        if verdict in ERROR_VERDICTS and cur_size is not None and cur_mtime is not None:
+            # An error row was never given a signature (FILE_NOT_FOUND is
+            # written without one, and so is every row from a run older than
+            # signatures). The file is readable again now, so the reason for
+            # the error may be gone: verify instead of carrying the failure
+            # forward for ever.
+            return "verify"
         # Legacy row from before signatures were recorded: fall back to the
-        # old path-only behaviour (keep). It gets a signature stamped on
-        # this run, so change detection works for it from now on.
+        # old path-only behaviour (keep). No signature can be invented for
+        # a file that this run did not actually verify.
         return "keep"
     if cur_size is None or cur_mtime is None:
         # File not visible right now (unmounted share, transient error):
         # do not churn, keep the previous verdict.
         return "keep"
-    if str(cur_size) == prev_size and str(cur_mtime) == prev_mtime:
-        return "keep"
-    return "verify"
+    unchanged = signature_matches(prev_size, prev_mtime, cur_size, cur_mtime)
+    return "keep" if unchanged else "verify"
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Verify the real spoken language of suspect media files (phase 2 of arr-language-audit).",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Verdicts:\n"
-            "  MISTAGGED_IS_ITALIAN   spoken audio is Italian, only the tag was wrong\n"
-            "  CONFIRMED_NOT_ITALIAN  really not Italian; redownload or remux needed\n"
-            "  FILE_NOT_FOUND / EXTRACTION_FAILED / DETECTION_FAILED   see script header\n"
-            "\n"
-            "Environment variables:\n"
-            "  WHISPER_MODEL      tiny | base | small | medium        (default: small)\n"
-            "  SAMPLE_SECONDS     audio sample length, seconds        (default: 60)\n"
-            "  SAMPLE_OFFSET_PCT  sampling start, % of duration       (default: 25)\n"
-            "  MIN_FREE_SPACE_MB  minimum free space in temp dir, MB  (default: 500)\n"
-            "  TEMP_DIR          temp dir for audio samples          (default: mktemp)\n"
-        ),
-    )
-    parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV from find-missing-italian-audio.sh")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output CSV path")
-    parser.add_argument("--limit", type=int, default=0,
-                        help="Only (re)verify the first N files that need it (0 = all)")
-    parser.add_argument("--retry-errors", action="store_true",
-                         help="Also reprocess rows that previously failed (FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED)")
-    parser.add_argument("--no-resume", action="store_true",
-                         help="Ignore any existing output file and start fresh (overwrites it)")
-    args = parser.parse_args()
+def normalise_previous(row: Mapping[str, str], size=None, mtime=None) -> dict:
+    """A row read back from a previous output CSV, reshaped to the current
+    schema. Missing columns (older CSV) become "". A fresh signature is
+    stamped on when one is passed, so legacy rows pick one up without being
+    re-verified."""
+    out = {k: (row.get(k, "") or "") for k in PHASE2_COLUMNS}
+    if size is not None:
+        out["FileSize"] = str(size)
+    if mtime is not None:
+        out["FileMtime"] = str(mtime)
+    return out
 
-    if not os.path.isfile(args.input):
-        print(f"ERROR: input file '{args.input}' not found.", file=sys.stderr)
-        print("Run verify/verify-audio-language.sh (or the orchestrator) first,", file=sys.stderr)
-        print("or pass --input with the correct path.", file=sys.stderr)
-        sys.exit(1)
 
-    out_dir = os.path.dirname(os.path.abspath(args.output))
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+def make_row(row: Mapping[str, str], *, detected="", confidence="", verdict="",
+             size=None, mtime=None) -> dict:
+    """An output row for an input row this run verified (or failed to).
 
-    temp_dir = os.environ.get("TEMP_DIR") or tempfile.mkdtemp(prefix="lang-check-")
-    os.makedirs(temp_dir, exist_ok=True)
-    check_disk_space(temp_dir, MIN_FREE_SPACE_MB)
-
-    fieldnames = [
-        "App", "Title", "Year", "Episode",
-        "DeclaredAudioLanguages", "DetectedLanguage", "Confidence",
-        "Verdict", "Path", "FileSize", "FileMtime",
-    ]
-
-    def norm_prev(row, size=None, mtime=None):
-        # A row read back from a previous output CSV, reshaped to the current
-        # schema. Missing columns (older CSV) become "". A fresh signature is
-        # stamped on when the file is still readable, so legacy rows pick one
-        # up without being re-verified.
-        out = {k: (row.get(k, "") or "") for k in fieldnames}
-        if size is not None:
-            out["FileSize"] = str(size)
-        if mtime is not None:
-            out["FileMtime"] = str(mtime)
-        return out
-
-    def make_row(row, detected="", confidence="", verdict="", size=None, mtime=None):
-        return {
-            "App": row.get("App", ""),
-            "Title": row.get("Title", ""),
-            "Year": row.get("Year", ""),
-            "Episode": row.get("Episode", ""),
-            "DeclaredAudioLanguages": row.get("AudioLanguages", ""),
-            "DetectedLanguage": detected,
-            "Confidence": confidence,
-            "Verdict": verdict,
-            "Path": row.get("Path", ""),
-            "FileSize": "" if size is None else str(size),
-            "FileMtime": "" if mtime is None else str(mtime),
-        }
-
-    with open(args.input, newline="", encoding="utf-8") as f:
-        all_rows = list(csv.DictReader(f))
-
-    previous = {} if args.no_resume else load_previous_rows(args.output)
-    input_paths = {
-        (r.get("Path", "") or "").strip()
-        for r in all_rows if (r.get("Path", "") or "").strip()
+    Keyword-only past `row`: six same-typed slots read as noise at the call
+    site, and a mistyped one would silently land in the wrong column."""
+    return {
+        "App": row.get("App", ""),
+        "Title": row.get("Title", ""),
+        "Year": row.get("Year", ""),
+        "Episode": row.get("Episode", ""),
+        "DeclaredAudioLanguages": row.get("AudioLanguages", ""),
+        "DetectedLanguage": detected,
+        "Confidence": confidence,
+        "Verdict": verdict,
+        "Path": row.get("Path", ""),
+        "FileSize": "" if size is None else str(size),
+        "FileMtime": "" if mtime is None else str(mtime),
     }
 
-    # Split the input into "already known, unchanged" (reuse the verdict)
-    # and "needs (re)verification" (new file, or size/mtime changed).
-    kept_rows = []      # finished output rows, input order
-    to_verify = []      # input rows still needing detection, input order
-    for row in all_rows:
-        path = (row.get("Path", "") or "").strip()
-        if not path:
-            to_verify.append(row)          # worker will record FILE_NOT_FOUND
+
+@dataclass
+class Plan:
+    """What a run has to do, decided before anything is opened for writing.
+
+    kept                finished output rows reused unchanged (input order)
+    to_verify           input rows needing detection (input order, limited)
+    deferred            previous rows for the rows --limit cut from to_verify
+    orphans             previous rows whose key is no longer in the input
+    dropped_stale       previous rows discarded because the file was fixed
+    dropped_superseded  previous rows discarded because phase 1 relabelled
+                        the same file under a different episode
+    """
+
+    kept: list[dict]
+    to_verify: list[dict]
+    deferred: list[dict]
+    orphans: list[dict]
+    dropped_stale: int
+    dropped_superseded: int
+    previous_to_verify: dict[tuple[str, str], dict]
+
+
+def _carry_over(candidates, *, input_keys, consumed, cur_size, cur_mtime,
+                retry_errors: bool):
+    """The previous verdict for this same file under a different episode
+    label, or (None, None).
+
+    Phase 1 relabelling an episode ("S01E01 - Pilot" -> "S01E01 - The Pilot")
+    changes the row's key without changing a byte of the media. Re-listening
+    to the audio for that would be an hour of CPU spent on a metadata edit,
+    so the verdict moves to the new label instead -- but only when the file
+    is provably the same one it was verified against: a stored signature,
+    equal to the current one, on a row that was actually verified."""
+    for pkey, entry in candidates:
+        # A candidate the input still lists under its own key belongs to that
+        # row, and one already claimed by an earlier input row is spoken for.
+        if pkey in input_keys or pkey in consumed:
             continue
-        cur_size, cur_mtime = file_signature(path)
-        entry = previous.get(path)
-        if resume_decision(entry, cur_size, cur_mtime, args.retry_errors) == "keep":
-            kept_rows.append(norm_prev(entry, cur_size, cur_mtime))
-        else:
-            to_verify.append(row)
+        # ERROR_VERDICTS only, deliberately not the wider RETRYABLE_VERDICTS:
+        # an error row was never verified against this file, so there is no
+        # verdict to move. LOW_CONFIDENCE was earned, so it follows exactly
+        # the same retry_errors rule here as it would under its own key --
+        # carried when the flag is off, re-verified when it is on, which the
+        # resume_decision call below enforces.
+        if (entry.get("Verdict", "") or "").strip() in ERROR_VERDICTS:
+            continue
+        prev_size = (entry.get("FileSize", "") or "").strip()
+        prev_mtime = (entry.get("FileMtime", "") or "").strip()
+        if not prev_size or not prev_mtime or cur_size is None or cur_mtime is None:
+            continue
+        if not signature_matches(prev_size, prev_mtime, cur_size, cur_mtime):
+            continue
+        # --retry-errors still wins: a row it would have re-run under its own
+        # key must not sneak through as a relabel.
+        if resume_decision(entry, cur_size, cur_mtime, retry_errors) != "keep":
+            continue
+        return pkey, entry
+    return None, None
+
+
+def plan_rows(input_rows, previous, *, retry_errors: bool, limit: int,
+              signature=file_signature) -> Plan:
+    """Split the input into reuse / re-verify / defer, and sort out the
+    previous rows the input no longer mentions.
+
+    Pure apart from `signature`, which is the only way it learns anything
+    about the disk -- and is called at most once per distinct path, however
+    many rows share it."""
+    cache: dict[str, tuple] = {}
+
+    def signature_of(path: str):
+        if path not in cache:
+            cache[path] = signature(path)
+        return cache[path]
+
+    input_keys = {row_key(row) for row in input_rows}
+    input_paths = {k[0] for k in input_keys if k[0]}
+    # Previous rows grouped by path. A file phase 1 relabelled has no row
+    # under its new key, but its verdict is still there under the old one.
+    by_path: dict[str, list] = {}
+    for pkey, entry in previous.items():
+        by_path.setdefault(pkey[0], []).append((pkey, entry))
+
+    kept = []
+    pending = []       # (input row, its previous row or None), input order
+    consumed = set()   # previous keys claimed by a relabelled input row
+    pending_claimed = set()
+    for row in input_rows:
+        key = row_key(row)
+        if not key[0]:
+            # No path at all: not a resume question. The detection loop
+            # records it as FILE_NOT_FOUND.
+            pending.append((row, None))
+            continue
+        cur_size, cur_mtime = signature_of(key[0])
+        entry = previous.get(key)
+        if entry is None:
+            pkey, source = _carry_over(
+                by_path.get(key[0], ()), input_keys=input_keys, consumed=consumed,
+                cur_size=cur_size, cur_mtime=cur_mtime, retry_errors=retry_errors,
+            )
+            if source is not None:
+                # Same file, same signature, new label: the verdict moves to
+                # the new row and the old key is dropped as superseded below.
+                consumed.add(pkey)
+                kept.append(make_row(
+                    row,
+                    detected=(source.get("DetectedLanguage", "") or ""),
+                    confidence=(source.get("Confidence", "") or ""),
+                    verdict=(source.get("Verdict", "") or ""),
+                    size=source.get("FileSize"), mtime=source.get("FileMtime"),
+                ))
+                continue
+        if resume_decision(entry, cur_size, cur_mtime, retry_errors) == "verify":
+            if entry is None:
+                # If a relabel needs detection, its old verdict remains the
+                # fallback until that detection is actually completed.
+                entry = next((old for old_key, old in by_path.get(key[0], ())
+                              if old_key not in input_keys and old_key not in consumed
+                              and old_key not in pending_claimed), None)
+                if entry is not None:
+                    pending_claimed.add(row_key(entry))
+            pending.append((row, entry))
+            continue
+        # Keep the signature originally observed, including its precision.
+        kept.append(normalise_previous(entry))
+
+    # --limit caps the work, not the report: a row cut from this run keeps
+    # the verdict it already had instead of disappearing from the output.
+    cut = pending[limit:] if limit > 0 else []
+    selected = pending[:limit] if limit > 0 else pending
+    to_verify = [row for row, _ in selected]
+    previous_to_verify = {row_key(row): normalise_previous(entry)
+                          for row, entry in selected if entry is not None}
+    deferred = [normalise_previous(entry) for _row, entry in cut if entry is not None]
+    deferred_keys = {row_key(entry) for entry in deferred}
 
     # Previous verdicts whose file is no longer listed by phase 1. Two cases:
     #  - the file changed on disk (signature differs) and is no longer
@@ -322,117 +745,312 @@ def main():
     #    row is "orphaned" only because this scan had a narrower scope
     #    (SKIP_RADARR / SKIP_SONARR, an app that was down), and re-running a
     #    full scan should not cost hours of re-verification.
-    orphan_rows = []
+    orphans = []
     dropped_stale = 0
-    for p, r in previous.items():
-        if p in input_paths:
+    dropped_superseded = 0
+    for key, entry in previous.items():
+        if key in input_keys or key in consumed or key in deferred_keys:
             continue
-        prev_size = (r.get("FileSize", "") or "").strip()
-        prev_mtime = (r.get("FileMtime", "") or "").strip()
-        cur_size, cur_mtime = file_signature(p)
+        if key[0] in input_paths:
+            # The input still lists this file, under a different episode
+            # label: phase 1 renamed the episode. The row for the new label
+            # is handled above (with this verdict carried over when the file
+            # is provably unchanged). Keeping this one too would show the
+            # same file twice, for ever -- a metadata edit never changes the
+            # signature, so nothing would ever clear it.
+            dropped_superseded += 1
+            continue
+        prev_size = (entry.get("FileSize", "") or "").strip()
+        prev_mtime = (entry.get("FileMtime", "") or "").strip()
+        cur_size, cur_mtime = signature_of(key[0])
         if (prev_size and prev_mtime and cur_size is not None
-                and (str(cur_size) != prev_size or str(cur_mtime) != prev_mtime)):
+                and not signature_matches(prev_size, prev_mtime, cur_size, cur_mtime)):
             dropped_stale += 1
             continue
-        orphan_rows.append(norm_prev(r))
+        orphans.append(normalise_previous(entry))
 
-    if args.limit > 0:
-        to_verify = to_verify[: args.limit]
+    return Plan(kept=kept, to_verify=to_verify, deferred=deferred,
+                orphans=orphans, dropped_stale=dropped_stale,
+                dropped_superseded=dropped_superseded,
+                previous_to_verify=previous_to_verify)
 
-    if kept_rows:
-        print(f"Reusing {len(kept_rows)} previous verdict(s) for unchanged files.", file=sys.stderr)
-    if orphan_rows:
-        print(f"Carrying over {len(orphan_rows)} row(s) whose file is no longer in the phase 1 CSV.", file=sys.stderr)
-    if dropped_stale:
-        print(f"Dropped {dropped_stale} stale row(s): file changed and is no longer flagged by phase 1.", file=sys.stderr)
-    print(f"Loaded {len(all_rows)} suspect file(s) total, {len(to_verify)} to (re)verify now.", file=sys.stderr)
 
-    # Always rewrite the output in full: kept + carried-over rows first, so a
-    # crash during detection still leaves a complete, valid CSV.
-    out_f = open(args.output, "w", newline="", encoding="utf-8")
-    writer = csv.DictWriter(out_f, fieldnames=fieldnames)
-    writer.writeheader()
-    for r in kept_rows:
-        writer.writerow(r)
-    for r in orphan_rows:
-        writer.writerow(r)
-    out_f.flush()
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Verify the real spoken language of suspect media files (phase 2 of arr-language-audit).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Verdicts:\n"
+            "  MISTAGGED_IS_ITALIAN   spoken audio is Italian, only the tag was wrong\n"
+            "  CONFIRMED_NOT_ITALIAN  really not Italian; redownload or remux needed\n"
+            "  LOW_CONFIDENCE         detected below MIN_CONFIDENCE; decides nothing.\n"
+            "                         Retry with a bigger model, another offset, or\n"
+            "                         --retry-errors\n"
+            "  FILE_NOT_FOUND / EXTRACTION_FAILED / DETECTION_FAILED   see script header\n"
+            "\n"
+            "What is listened to: the default-disposition audio stream (else the first),\n"
+            "for SAMPLE_SECONDS from SAMPLE_OFFSET_PCT in. Only that window decides.\n"
+            "\n"
+            "Exit codes:\n"
+            "  0   finished (including 'nothing new to verify')\n"
+            "  1   configuration, input, disk or model-load error\n"
+            "  2   usage error (argparse)\n"
+            "  3   every file this run tried to verify errored\n"
+            "  130 interrupted\n"
+            "\n"
+            "Environment variables:\n"
+            "  WHISPER_MODEL      tiny | base | small | medium        (default: small)\n"
+            "  WHISPER_THREADS    CPU threads for the model           (default: all cores)\n"
+            "  SAMPLE_SECONDS     audio sample length, seconds        (default: 60)\n"
+            "  SAMPLE_OFFSET_PCT  sampling start, % of duration       (default: 25)\n"
+            "  MIN_CONFIDENCE     floor below which a detection is    (default: 0.6)\n"
+            "                     LOW_CONFIDENCE, 0..1\n"
+            "  MIN_FREE_SPACE_MB  minimum free space in temp dir, MB  (default: 500)\n"
+            "  TEMP_DIR           parent for the run's scratch dir    (default: system temp)\n"
+            "                     never deleted; only the 'lang-check-*' directory\n"
+            "                     created inside it is removed\n"
+        ),
+    )
+    parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV from find-missing-italian-audio.sh")
+    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output CSV path")
+    parser.add_argument("--limit", type=nonnegative_int, default=0,
+                        help="Only (re)verify the first N files that need it (0 = all); "
+                             "the rows it cuts keep the verdict they already had")
+    parser.add_argument("--retry-errors", action="store_true",
+                        help="Also reprocess rows whose previous verdict is retryable "
+                             "(FILE_NOT_FOUND, EXTRACTION_FAILED, DETECTION_FAILED, "
+                             "LOW_CONFIDENCE)")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Ignore any existing output file and start fresh (overwrites it)")
+    return parser
 
-    if len(to_verify) == 0:
-        out_f.close()
-        print("Nothing new to verify.", file=sys.stderr)
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return
 
-    model = load_model()
+def nonnegative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be greater than or equal to 0")
+    return number
 
-    mistagged_count = 0
-    confirmed_foreign_count = 0
-    error_count = 0
+
+def main(argv: list[str] | None = None) -> int:
+    check_python_floor()
+    args = build_parser().parse_args(argv)
+
+    temp_dir = None
+    try:
+        # The environment is read only now: a broken SAMPLE_SECONDS must not
+        # stop --help from working.
+        cfg = Config.from_env()
+
+        if not os.path.isfile(args.input):
+            raise WorkerError(
+                f"input file '{args.input}' not found.\n"
+                "Run verify/verify-audio-language.sh (or the orchestrator) first,\n"
+                "or pass --input with the correct path."
+            )
+
+        if os.path.exists(args.output) and os.path.samefile(args.input, args.output):
+            raise WorkerError("input and output CSV paths must be different files.")
+
+        out_dir = os.path.dirname(os.path.abspath(args.output))
+        if out_dir:
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except OSError as e:
+                raise WorkerError(
+                    f"cannot create the output directory '{out_dir}': {e}"
+                ) from e
+
+        try:
+            temp_dir = make_temp_dir(cfg)
+        except OSError as e:
+            raise WorkerError(f"cannot create a scratch directory: {e}") from e
+
+        return _run(args, cfg, temp_dir)
+    except WorkerError as e:
+        log(f"ERROR: {e}")
+        return EXIT_ERROR
+    except (OSError, UnicodeError, csv.Error) as e:
+        log(f"ERROR: input/output failure: {e}")
+        return EXIT_ERROR
+    except KeyboardInterrupt:
+        log("\nInterrupted. The results written so far are complete and valid.")
+        return EXIT_INTERRUPTED
+    finally:
+        # Only ever the directory make_temp_dir() created, never TEMP_DIR.
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def verify_one(row, model, cfg: Config, temp_dir: str, index: int) -> dict:
+    """Detect one file's spoken language and return its finished output row.
+
+    Every failure short of "the disk filled up" is a verdict, not an
+    exception: one unreadable file must never end the run."""
+    path = row.get("Path", "") or ""
+    if not path or not os.path.isfile(path):
+        return make_row(row, verdict=VERDICT_FILE_NOT_FOUND)
+
+    cur_size, cur_mtime = file_signature(path)
+
+    check_disk_space(temp_dir, cfg.min_free_space_mb)
+    sample_path = os.path.join(temp_dir, f"sample_{index}.wav")
 
     try:
-        for i, row in enumerate(to_verify, start=1):
-            path = (row.get("Path", "") or "").strip()
-            title = row.get("Title", "")
-            print(f"[{i}/{len(to_verify)}] {title} ...", file=sys.stderr)
+        probe = probe_media(path)
+        if not extract_sample(path, sample_path, cfg, probe):
+            return make_row(row, verdict=VERDICT_EXTRACTION_FAILED,
+                            size=cur_size, mtime=cur_mtime)
 
-            if not path or not os.path.isfile(path):
-                writer.writerow(make_row(row, verdict="FILE_NOT_FOUND"))
-                error_count += 1
-                out_f.flush()
-                continue
-
-            cur_size, cur_mtime = file_signature(path)
-
-            check_disk_space(temp_dir, MIN_FREE_SPACE_MB)
-            sample_path = os.path.join(temp_dir, f"sample_{i}.wav")
-
-            if not extract_sample(path, sample_path):
-                writer.writerow(make_row(row, verdict="EXTRACTION_FAILED",
-                                         size=cur_size, mtime=cur_mtime))
-                error_count += 1
-                out_f.flush()
-                continue
-
-            try:
-                lang, prob = detect_language(model, sample_path)
-            except Exception as e:
-                print(f"  Whisper detection failed: {e}", file=sys.stderr)
-                writer.writerow(make_row(row, verdict="DETECTION_FAILED",
-                                         size=cur_size, mtime=cur_mtime))
-                error_count += 1
-                out_f.flush()
-                continue
-            finally:
-                # Always clean up the sample immediately to keep disk usage minimal
-                if os.path.exists(sample_path):
-                    os.remove(sample_path)
-
-            declared = row.get("AudioLanguages", "")
-            if is_italian(lang):
-                verdict = "MISTAGGED_IS_ITALIAN"
-                mistagged_count += 1
-            else:
-                verdict = "CONFIRMED_NOT_ITALIAN"
-                confirmed_foreign_count += 1
-
-            print(f"  -> detected: {lang} ({prob:.0%}) | declared: {declared} | {verdict}", file=sys.stderr)
-
-            writer.writerow(make_row(row, detected=lang, confidence=f"{prob:.2f}",
-                                     verdict=verdict, size=cur_size, mtime=cur_mtime))
-            out_f.flush()
+        try:
+            lang, prob = detect_language(model, sample_path)
+        except Exception as e:  # noqa: BLE001
+            # Whisper can fail in many ways; each is a DETECTION_FAILED row.
+            log(f"  Whisper detection failed: {str(e)[:MAX_ERROR_CHARS]}")
+            return make_row(row, verdict=VERDICT_DETECTION_FAILED,
+                            size=cur_size, mtime=cur_mtime)
     finally:
-        out_f.close()
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        # Always clean up the sample immediately to keep disk usage minimal
+        if os.path.exists(sample_path):
+            os.remove(sample_path)
 
-    print("\n--- Summary ---", file=sys.stderr)
-    print(f"Reused unchanged:             {len(kept_rows)}", file=sys.stderr)
-    print(f"Dropped (fixed, unflagged):   {dropped_stale}", file=sys.stderr)
-    print(f"Mistagged (actually Italian): {mistagged_count}", file=sys.stderr)
-    print(f"Confirmed not Italian:        {confirmed_foreign_count}", file=sys.stderr)
-    print(f"Errors this run:              {error_count}", file=sys.stderr)
-    print(f"\nFull results written to: {args.output}", file=sys.stderr)
+    verdict = classify(lang, prob, cfg.min_confidence)
+    if verdict == VERDICT_DETECTION_FAILED:
+        log("  Whisper detection failed: no language identified.")
+        return make_row(row, verdict=verdict, size=cur_size, mtime=cur_mtime)
+
+    # A LOW_CONFIDENCE row keeps the language and probability it was given:
+    # they are what the user judges a re-run against.
+    declared = row.get("AudioLanguages", "")
+    log(f"  -> detected: {lang} ({prob:.0%}) | declared: {declared} | {verdict}")
+    return make_row(row, detected=lang, confidence=f"{prob:.2f}", verdict=verdict,
+                    size=cur_size, mtime=cur_mtime)
+
+
+def _log_plan(plan: Plan, total: int) -> None:
+    if plan.kept:
+        log(f"Reusing {len(plan.kept)} previous verdict(s) for unchanged files.")
+    if plan.deferred:
+        log(f"Deferring {len(plan.deferred)} row(s) beyond --limit; their previous "
+            "verdicts are kept.")
+    if plan.orphans:
+        log(f"Carrying over {len(plan.orphans)} row(s) whose file is no longer "
+            "in the phase 1 CSV.")
+    if plan.dropped_stale:
+        log(f"Dropped {plan.dropped_stale} stale row(s): file changed and is no longer "
+            "flagged by phase 1.")
+    if plan.dropped_superseded:
+        log(f"Dropped {plan.dropped_superseded} superseded row(s): same file, "
+            "relabelled by phase 1.")
+    log(f"Loaded {total} suspect file(s) total, "
+        f"{len(plan.to_verify)} to (re)verify now.")
+
+
+def _run(args, cfg: Config, temp_dir: str) -> int:
+    check_disk_space(temp_dir, cfg.min_free_space_mb)
+
+    all_rows = read_csv_rows(args.input, PHASE1_COLUMNS)
+
+    output_real = os.path.realpath(args.output)
+    for path in {row_key(row)[0] for row in all_rows} - {""}:
+        if os.path.realpath(path) == output_real or (
+            os.path.exists(args.output) and os.path.exists(path)
+            and os.path.samefile(args.output, path)
+        ):
+            raise WorkerError(f"output CSV must not overwrite a media file: '{path}'.")
+
+    previous = {} if args.no_resume else load_previous_rows(args.output)
+    plan = plan_rows(all_rows, previous, retry_errors=args.retry_errors,
+                     limit=args.limit)
+    _log_plan(plan, len(all_rows))
+
+    # The model is loaded BEFORE the output is opened for writing: opening it
+    # truncates the previous run's verdicts, and a missing package or a failed
+    # model download must not cost hours of already-done work.
+    model = None
+    if plan.to_verify:
+        try:
+            model = load_model(cfg)
+        except Exception as e:  # noqa: BLE001
+            log(f"ERROR: could not load the Whisper model: {e}")
+            log("Install faster_whisper (see the launcher script) and run again.")
+            log(f"'{args.output}' was left untouched.")
+            return EXIT_ERROR
+
+    # Prepare the initial snapshot next to the destination. A failed header
+    # or reuse-row write must not truncate the previous report. Once published,
+    # append completed detections and flush each row for incremental resume.
+    # SIM115: deliberately not a context manager -- the handle lives for the
+    # whole detection loop and is flushed after every row, so an abort leaves a
+    # complete file behind. It is closed in the finally below.
+    try:
+        out_f = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            mode="w", newline="", encoding="utf-8", delete=False,
+            dir=os.path.dirname(os.path.abspath(args.output)),
+            prefix=f".{os.path.basename(args.output)}.", suffix=".tmp",
+        )
+    except OSError as e:
+        raise WorkerError(f"cannot write '{args.output}': {e}") from e
+    counts: dict[str, int] = {}
+    completed = set()
+    staging_path = out_f.name
+    try:
+        writer = csv.DictWriter(out_f, fieldnames=list(PHASE2_COLUMNS))
+        writer.writeheader()
+        for r in plan.kept + plan.deferred + plan.orphans:
+            writer.writerow(r)
+        out_f.flush()
+        try:
+            os.replace(staging_path, args.output)
+        except OSError as e:
+            raise WorkerError(f"cannot write '{args.output}': {e}") from e
+        staging_path = None
+
+        if not plan.to_verify:
+            log("Nothing new to verify.")
+            return EXIT_OK
+
+        for i, row in enumerate(plan.to_verify, start=1):
+            log(f"[{i}/{len(plan.to_verify)}] {row.get('Title', '')} ...")
+            out_row = verify_one(row, model, cfg, temp_dir, i)
+            writer.writerow(out_row)
+            # Flushed after every row so an abort leaves a complete CSV behind.
+            out_f.flush()
+            completed.add(row_key(row))
+            counts[out_row["Verdict"]] = counts.get(out_row["Verdict"], 0) + 1
+    except (KeyboardInterrupt, WorkerError):
+        # A controlled abort must retain old verdicts that were scheduled
+        # for retry but not replaced yet, including relabelled episodes.
+        if staging_path is None:
+            for key, previous_row in plan.previous_to_verify.items():
+                if key not in completed:
+                    writer.writerow(previous_row)
+            out_f.flush()
+        raise
+    finally:
+        try:
+            out_f.close()
+        finally:
+            if staging_path is not None:
+                os.unlink(staging_path)
+
+    error_count = sum(n for v, n in counts.items() if v in ERROR_VERDICTS)
+    log("\n--- Summary ---")
+    log(f"Reused unchanged:             {len(plan.kept)}")
+    log(f"Dropped (fixed, unflagged):   {plan.dropped_stale}")
+    log(f"Dropped (relabelled):         {plan.dropped_superseded}")
+    log(f"Mistagged (actually Italian): {counts.get(VERDICT_MISTAGGED, 0)}")
+    log(f"Confirmed not Italian:        {counts.get(VERDICT_CONFIRMED, 0)}")
+    log(f"Low confidence:               {counts.get(VERDICT_LOW_CONFIDENCE, 0)}")
+    log(f"Errors this run:              {error_count}")
+    log(f"\nFull results written to: {args.output}")
+
+    if error_count == len(plan.to_verify):
+        log("ERROR: every file errored this run -- nothing was verified.")
+        log("Check that the media paths are mounted and readable.")
+        return EXIT_ALL_FAILED
+    return EXIT_OK
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

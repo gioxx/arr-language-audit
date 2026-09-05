@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Fake curl: record the command line, then hand the call to the real curl.
+#
+# It exists so a test can prove what never reached argv -- an API key passed
+# through a --config file must not be visible here.
+#
+#   FAKE_CURL_LOG  file each invocation's argv is appended to, one per line.
+#   REAL_CURL      the real curl to exec; exported by helpers/common.bash.
+set -u
+
+if [[ -n "${FAKE_CURL_LOG:-}" ]]; then
+    printf '%s\n' "$*" >> "$FAKE_CURL_LOG"
+fi
+
+exec "${REAL_CURL:-/usr/bin/curl}" "$@"

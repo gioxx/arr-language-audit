@@ -1,0 +1,8 @@
+# Repository-wide shellcheck configuration.
+shell=bash
+external-sources=true
+source-path=SCRIPTDIR
+source-path=SCRIPTDIR/..
+# The bats helpers and the product scripts source paths built at run time
+# (.env files, bats libraries): shellcheck cannot follow those statically.
+disable=SC1090,SC1091

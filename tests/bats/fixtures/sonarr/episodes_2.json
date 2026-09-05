@@ -1,0 +1,18 @@
+[
+  {
+    "id": 21,
+    "seriesId": 2,
+    "seasonNumber": 1,
+    "episodeNumber": 1,
+    "title": "Due North",
+    "hasFile": true,
+    "episodeFileId": 81,
+    "episodeFile": {
+      "id": 81,
+      "path": "/media/tv/Northbound/Season 01/S01E01.mkv",
+      "mediaInfo": {
+        "audioLanguages": "English"
+      }
+    }
+  }
+]

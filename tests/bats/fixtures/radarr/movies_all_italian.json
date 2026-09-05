@@ -1,0 +1,24 @@
+[
+  {
+    "id": 1,
+    "title": "Il Cammino Lungo",
+    "year": 2019,
+    "hasFile": true,
+    "movieFile": {
+      "id": 101,
+      "path": "/media/movies/Il Cammino Lungo (2019)/Il Cammino Lungo (2019).mkv",
+      "mediaInfo": { "audioLanguages": "Italian" }
+    }
+  },
+  {
+    "id": 2,
+    "title": "Nebbia Bassa",
+    "year": 2021,
+    "hasFile": true,
+    "movieFile": {
+      "id": 102,
+      "path": "/media/movies/Nebbia Bassa (2021)/Nebbia Bassa (2021).mkv",
+      "mediaInfo": { "audioLanguages": "ita" }
+    }
+  }
+]

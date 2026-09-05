@@ -1,0 +1,68 @@
+[
+  {
+    "id": 1,
+    "title": "Il Cammino Lungo",
+    "year": 2019,
+    "hasFile": true,
+    "movieFile": {
+      "id": 101,
+      "path": "/media/movies/Il Cammino Lungo (2019)/Il Cammino Lungo (2019).mkv",
+      "mediaInfo": { "audioLanguages": "Italian" }
+    }
+  },
+  {
+    "id": 2,
+    "title": "Nebbia Bassa",
+    "year": 2021,
+    "hasFile": true,
+    "movieFile": {
+      "id": 102,
+      "path": "/media/movies/Nebbia Bassa (2021)/Nebbia Bassa (2021).mkv",
+      "mediaInfo": { "audioLanguages": "ita" }
+    }
+  },
+  {
+    "id": 3,
+    "title": "Vento di Marzo",
+    "year": 2017,
+    "hasFile": true,
+    "movieFile": {
+      "id": 103,
+      "path": "/media/movies/Vento di Marzo (2017)/Vento di Marzo (2017).mkv",
+      "mediaInfo": { "audioLanguages": "it-IT" }
+    }
+  },
+  {
+    "id": 4,
+    "title": "The Quiet Harbour",
+    "year": 2020,
+    "hasFile": true,
+    "movieFile": {
+      "id": 104,
+      "path": "/media/movies/The Quiet Harbour (2020)/The Quiet Harbour (2020).mkv",
+      "mediaInfo": { "audioLanguages": "English / Italian" }
+    }
+  },
+  {
+    "id": 5,
+    "title": "Salt and Iron",
+    "year": 2018,
+    "hasFile": true,
+    "movieFile": {
+      "id": 105,
+      "path": "/media/movies/Salt and Iron (2018)/Salt and Iron (2018).mkv",
+      "mediaInfo": { "audioLanguages": "English" }
+    }
+  },
+  {
+    "id": 6,
+    "title": "Hoshi no Michi",
+    "year": 2016,
+    "hasFile": true,
+    "movieFile": {
+      "id": 106,
+      "path": "/media/movies/Hoshi no Michi (2016)/Hoshi no Michi (2016).mkv",
+      "mediaInfo": { "audioLanguages": "Japanese / English" }
+    }
+  }
+]

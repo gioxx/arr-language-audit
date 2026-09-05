@@ -1,0 +1,84 @@
+name: ci
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - uses: astral-sh/setup-uv@v5
+      # scripts/test.sh owns the file list, so CI cannot drift from local runs.
+      - name: shellcheck + ruff
+        run: scripts/test.sh lint
+
+  bats:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # Installs bats plus bats-support/assert/file under /usr/lib/bats; the
+      # helpers prefer the copies vendored in tests/bats/lib and fall back to
+      # $BATS_LIB_PATH, so either source works.
+      - uses: bats-core/bats-action@3.0.1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install jq if missing (both images normally ship it)
+        if: runner.os == 'macOS'
+        run: command -v jq >/dev/null || brew install jq
+      # PATH is forced so macOS runs /bin/bash 3.2 rather than Homebrew's 5.x:
+      # bash 3.2 portability is one of the things this suite proves.
+      - name: bats
+        run: PATH="/bin:/usr/bin:$PATH" bats -r tests/bats
+        env:
+          BASH_UNDER_TEST: /bin/bash
+
+  pytest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: pytest
+        run: uvx --python ${{ matrix.python }} pytest -q
+
+  report-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: tests/report-ui/package-lock.json
+      - name: report interactions
+        run: scripts/test.sh ui
+
+  whisper-contract:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: real decoder and detection API without model weights
+        run: scripts/test.sh contract
+        env:
+          CONTRACT_PYTHON: ${{ matrix.python }}

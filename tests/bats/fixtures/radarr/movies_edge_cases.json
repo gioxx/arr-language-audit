@@ -1,0 +1,95 @@
+[
+  {
+    "id": 10,
+    "title": "Null Tag",
+    "year": 2015,
+    "hasFile": true,
+    "movieFile": {
+      "id": 201,
+      "path": "/media/Italian Movies/null-tag.mkv",
+      "mediaInfo": {
+        "audioLanguages": null
+      }
+    }
+  },
+  {
+    "id": 11,
+    "title": "No Year At All",
+    "hasFile": true,
+    "movieFile": {
+      "id": 202,
+      "path": "/media/movies/No Year At All/No Year At All.mkv",
+      "mediaInfo": {
+        "audioLanguages": "English"
+      }
+    }
+  },
+  {
+    "id": 12,
+    "title": "Never Downloaded",
+    "year": 2022,
+    "hasFile": false
+  },
+  {
+    "id": 13,
+    "title": "No Media Info",
+    "year": 2014,
+    "hasFile": true,
+    "movieFile": {
+      "id": 203,
+      "path": "/media/movies/No Media Info/No Media Info.mkv"
+    }
+  },
+  {
+    "id": 14,
+    "title": "Hello, \"World\"",
+    "year": 2013,
+    "hasFile": true,
+    "movieFile": {
+      "id": 204,
+      "path": "/m/a, \"b\".mkv",
+      "mediaInfo": {
+        "audioLanguages": "English"
+      }
+    }
+  },
+  {
+    "id": 15,
+    "title": "Windows Share",
+    "year": 2012,
+    "hasFile": true,
+    "movieFile": {
+      "id": 205,
+      "path": "\\\\nas\\share\\a.mkv",
+      "mediaInfo": {
+        "audioLanguages": "English"
+      }
+    }
+  },
+  {
+    "id": 16,
+    "title": "A\tB\nC",
+    "year": 2011,
+    "hasFile": true,
+    "movieFile": {
+      "id": 206,
+      "path": "/media/movies/Tabbed Title/tabbed.mkv",
+      "mediaInfo": {
+        "audioLanguages": "English"
+      }
+    }
+  },
+  {
+    "id": 17,
+    "title": "Lenga d'Oc",
+    "year": 2010,
+    "hasFile": true,
+    "movieFile": {
+      "id": 207,
+      "path": "/media/movies/Lenga d'Oc/Lenga d'Oc.mkv",
+      "mediaInfo": {
+        "audioLanguages": "Occitan"
+      }
+    }
+  }
+]

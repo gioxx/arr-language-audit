@@ -1,0 +1,20 @@
+[
+  {
+    "id": 1,
+    "title": "Le Colline Silenziose",
+    "year": 2018,
+    "statistics": {
+      "episodeFileCount": 10,
+      "sizeOnDisk": 123456
+    }
+  },
+  {
+    "id": 2,
+    "title": "Northbound",
+    "year": 2020,
+    "statistics": {
+      "episodeFileCount": 1,
+      "sizeOnDisk": 654321
+    }
+  }
+]
