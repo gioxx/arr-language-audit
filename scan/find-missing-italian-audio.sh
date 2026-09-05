@@ -773,8 +773,21 @@ report_summary() {
 cleanup() {
     if [[ -n "${TMP_DIR:-}" ]]; then
         rm -rf "$TMP_DIR"
+        TMP_DIR=""
     fi
     return 0
+}
+
+# on_signal <name> -- clean up and *stop*. A bare `trap cleanup INT` would
+# delete the temporary directory and let the run carry on with nowhere left to
+# write; the EXIT trap is cleared first so the removal is not attempted twice.
+on_signal() {
+    cleanup
+    trap - EXIT
+    case "${1:-TERM}" in
+        INT) exit 130 ;;
+        *)   exit 143 ;;
+    esac
 }
 
 main() {
@@ -799,7 +812,9 @@ main() {
     SONARR_CACHE_FILE="${OUTPUT_CSV%.csv}.cache.json"
 
     TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ala-scan.XXXXXX")"
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+    trap 'on_signal INT' INT
+    trap 'on_signal TERM' TERM
     CACHE_JSON_FILE="$TMP_DIR/cache.json"
     FRAG_FILE="$TMP_DIR/cache-fragments.jsonl"
 
@@ -823,7 +838,10 @@ main() {
     return "$rc"
 }
 
+# `main "$@"` and nothing else: putting it on the left of a `||` would place
+# the whole run inside a tested command, and errexit is disabled there -- a
+# failed mkdir or a report that cannot be written would be reported as a clean
+# run. The script's exit status is main's either way.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    main "$@" || exit $?
-    exit 0
+    main "$@"
 fi

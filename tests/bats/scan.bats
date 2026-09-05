@@ -244,11 +244,17 @@ print(rows[0]["Path"])
 
     run_scan
     assert_success
+    # Saved before the next `run` overwrites $output with the request count.
+    local hit_lines="$output"
 
     run arr_request_count "/radarr/"
     assert_output "0"
 
-    refute_output --partial "[Radarr]"
+    [ -n "$hit_lines" ]
+    if [[ "$hit_lines" == *"[Radarr]"* ]]; then
+        printf 'stdout carried a Radarr hit line:\n%s\n' "$hit_lines" >&2
+        return 1
+    fi
 }
 
 @test "S12 twin: SKIP_SONARR makes no Sonarr request at all" {
@@ -257,11 +263,18 @@ print(rows[0]["Path"])
 
     run_scan
     assert_success
+    local hit_lines="$output"
 
     run arr_request_count "/sonarr/"
     assert_output "0"
 
     [ ! -f "$CACHE" ]
+
+    [ -n "$hit_lines" ]
+    if [[ "$hit_lines" == *"[Sonarr]"* ]]; then
+        printf 'stdout carried a Sonarr hit line:\n%s\n' "$hit_lines" >&2
+        return 1
+    fi
 }
 
 @test "S13: zero findings still leaves a header-only report" {
@@ -333,6 +346,29 @@ print(rows[0]["Path"])
 
     run "$REAL_JQ" -r '."1".sig' "$CACHE"
     assert_output "10:999999"
+}
+
+@test "S15 twin: a changed episode file count also re-fetches the series" {
+    local dir
+    dir="$(fixture_copy)"
+    start_fake_arr "$dir"
+
+    run_scan
+    assert_success
+
+    cp "$dir/sonarr/series_changed_count.json" "$dir/sonarr/series.json"
+    : > "$FAKE_ARR_LOG"
+
+    run_scan
+    assert_success
+
+    run episode_requests 1
+    assert_output "1"
+    run episode_requests 2
+    assert_output "0"
+
+    run "$REAL_JQ" -r '."1".sig' "$CACHE"
+    assert_output "11:123456"
 }
 
 @test "S16: --refresh and REFRESH=true both ignore the cache" {
@@ -649,4 +685,52 @@ EOF
 [Sonarr] Northbound - S01E01 - Due North -> audio: English
 EOF
 )"
+}
+
+# --------------------------------------------------------------------------
+# S39-S40: errexit and signals
+# --------------------------------------------------------------------------
+
+@test "S39: a report that cannot be written fails the run" {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        skip "running as root: an unwritable directory is still writable"
+    fi
+
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+
+    local locked="$BATS_TEST_TMPDIR/locked"
+    mkdir -p "$locked"
+    chmod 500 "$locked"
+    OUT="$locked/report.csv"
+
+    run_scan
+    chmod 700 "$locked"
+
+    # errexit has to be live for the whole run: with `main "$@" || exit $?` the
+    # failed redirection was swallowed and the script still claimed success.
+    [ "$status" -ne 0 ]
+    refute_stderr_contains "Results exported to"
+    refute_stderr_contains "No files missing Italian audio were found."
+    [ ! -f "$OUT" ]
+}
+
+@test "S40: a signal removes the temporary directory and ends the run" {
+    # The handler is called directly: sourcing the script defines its functions
+    # without running main (the BASH_SOURCE guard), which makes the contract
+    # testable without racing a real SIGINT.
+    run "$BASH_UNDER_TEST" -c '
+. "$1"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ala-signal.XXXXXX")"
+printf "%s\n" "$TMP_DIR"
+on_signal INT
+printf "kept running\n"
+' bash "$SCAN"
+
+    assert_failure 130
+    refute_output --partial "kept running"
+
+    local leftover
+    leftover="$(printf '%s\n' "$output" | head -1)"
+    [ -n "$leftover" ]
+    [ ! -d "$leftover" ]
 }
