@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Counting jq: record the invocation, then hand the call to the real jq.
+#
+# It exists so a test can assert how many processes a scan spawns -- the whole
+# point of the phase 1 rewrite is that the count no longer grows with the
+# library.
+#
+#   FAKE_JQ_LOG  file each invocation's argv is appended to, one line each.
+#   REAL_JQ      the real jq to exec; exported by helpers/common.bash.
+set -u
+
+if [[ -n "${FAKE_JQ_LOG:-}" ]]; then
+    # One line per invocation, so the log can simply be counted: a jq program
+    # spans several lines and would otherwise be logged as several.
+    _fake_jq_args="$*"
+    printf '%s\n' "${_fake_jq_args//$'\n'/ }" >> "$FAKE_JQ_LOG"
+fi
+
+exec "${REAL_JQ:-/usr/bin/jq}" "$@"

@@ -129,14 +129,20 @@ cp .env.example .env
 ```
 
 Output: `reports/missing-italian-audio.csv` con colonne
-`App,Title,Year,Episode,AudioLanguages,Path`. Se non ci sono risultati, il file
-non viene lasciato sul disco.
+`App,Title,Year,Episode,AudioLanguages,Path`. Se non ci sono risultati il file
+viene comunque scritto, con la sola riga di intestazione. Uscita 0 a scansione
+completata, 2 se un'app abilitata non e' stata raggiunta (il CSV contiene
+comunque cio' che era stato scansionato).
 
 Tag non aggiornati? Forza prima Radarr/Sonarr a rileggere ogni file dal disco:
 
 ```bash
 FORCE_RESCAN=true ./scan/find-missing-italian-audio.sh
 ```
+
+`FORCE_RESCAN=true` implica `REFRESH=true`: un rescan puo' cambiare i tag
+senza cambiare la firma della serie, e la cache nasconderebbe proprio cio'
+per cui e' stato chiesto.
 
 **Cache Sonarr.** Sonarr viene interrogato una volta per serie (episodi con il
 file incluso nella risposta). Accanto al CSV viene scritto un file
@@ -443,14 +449,20 @@ cp .env.example .env
 ```
 
 Output: `reports/missing-italian-audio.csv` with columns
-`App,Title,Year,Episode,AudioLanguages,Path`. If there are no findings the
-file is not left behind.
+`App,Title,Year,Episode,AudioLanguages,Path`. With no findings the file is
+still written, with its header row and nothing else. Exit 0 once the scan
+completes, 2 when an enabled app could not be reached (the CSV still holds
+everything that was scanned).
 
 Stale tags? Force Radarr/Sonarr to re-read every file from disk first:
 
 ```bash
 FORCE_RESCAN=true ./scan/find-missing-italian-audio.sh
 ```
+
+`FORCE_RESCAN=true` implies `REFRESH=true`: a rescan can change the tags
+without changing a series' signature, and a cache hit would hide exactly what
+the rescan was asked for.
 
 **Sonarr cache.** Sonarr is queried once per series (episodes with the file
 embedded in the response). A `missing-italian-audio.cache.json` file is

@@ -7,8 +7,6 @@
 load helpers/common
 
 @test "L3: no bash 4 builtins in the product scripts" {
-    skip "fixed in Task 7"
-
     run bash -c "cd '$ROOT' && grep -nE 'mapfile|readarray|declare -A|\\\$\\{[A-Za-z_]+(,,|\\^\\^)|\\|&|&>>|local -n' arr-language-audit.sh scan/*.sh verify/*.sh lib/*.sh 2>/dev/null"
     assert_output ""
 }
