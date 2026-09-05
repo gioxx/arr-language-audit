@@ -80,6 +80,7 @@ Usage:
 Environment:
   ARR_PLAIN_MENU     set to anything to force the plain menu even when
                      whiptail is installed
+  ARR_PROBE_TIMEOUT  seconds a single pre-flight probe may take (default 3)
   ALA_DOTENV_FILE    read this .env instead of searching the repository
 
 Exit codes:
@@ -211,6 +212,15 @@ pause() {
     read -r -p "Press Enter to continue... " _ || true
 }
 
+# run_without_keys <command>... -- run a child with the *arr API keys removed
+# from its environment. Every child this script starts goes through here: the
+# keys are of no use to ffmpeg, whisper, the launcher or the report, and one
+# function is one place to audit rather than a copy-paste convention repeated
+# at five call sites.
+run_without_keys() {
+    env -u RADARR_API_KEY -u SONARR_API_KEY "$@"
+}
+
 # ---------------------------------------------------------------------------
 # Pre-flight: environment + connectivity
 # ---------------------------------------------------------------------------
@@ -223,6 +233,20 @@ ENV_READY=false
 TOOLS_LINE=""
 PHASE2_READY=false ; PHASE2_NOTE="" ; PHASE2_PYTHON="" ; PHASE2_HINT=""
 
+# Which allow-listed keys the PROCESS environment itself provided, non-empty,
+# before anything here touched them -- a space-padded list, so a lookup is one
+# case pattern on bash 3.2. Taken once, at source time, and never updated: it
+# is what tells a genuine `RADARR_API_KEY=... ./arr-language-audit.sh` apart
+# from a value this script read out of .env a moment ago. run_preflight clears
+# every OTHER allow-listed key before load_dotenv, so an edited .env is really
+# re-read while an explicit override still wins. Assignments only: sourcing
+# this file must stay free of side effects.
+ARR_ENV_FROM_PROCESS=" "
+for _ala_key in $ALA_DOTENV_KEYS; do
+    [[ -n "${!_ala_key:-}" ]] && ARR_ENV_FROM_PROCESS="$ARR_ENV_FROM_PROCESS$_ala_key "
+done
+unset _ala_key
+
 # The *arr configuration. Seeded from the environment (never overwritten with
 # an empty string: load_dotenv treats set-but-empty as unset, so a .env can
 # still fill in what the environment left out).
@@ -233,7 +257,9 @@ SKIP_RADARR="${SKIP_RADARR:-false}" ; SKIP_SONARR="${SKIP_SONARR:-false}"
 # How long a single pre-flight probe may take. One attempt, a short timeout:
 # this runs before the menu is drawn, and the retries that a real scan needs
 # belong to the scan script, which is where a slow *arr actually matters.
-PROBE_TIMEOUT="${ALA_PROBE_TIMEOUT:-3}"
+# ARR_PROBE_TIMEOUT raises it for a slow *arr -- and lets the test suite make
+# the two probes long enough that a sequential pre-flight cannot hide.
+PROBE_TIMEOUT="${ARR_PROBE_TIMEOUT:-3}"
 
 # Query one app's /api/v3/system/status. Echoes "OK  vX  [instance]  url"
 # on success (return 0), or a short reason otherwise (return 1).
@@ -301,7 +327,7 @@ preflight_phase2() {
     PHASE2_PYTHON=""
     PHASE2_HINT=""
     local out=""
-    if out="$(env -u RADARR_API_KEY -u SONARR_API_KEY "$VERIFY_SH" --check 2>&1)"; then
+    if out="$(run_without_keys "$VERIFY_SH" --check 2>&1)"; then
         PHASE2_READY=true
         PHASE2_PYTHON="$(printf '%s\n' "$out" | sed -n 's/.*python via: \([^)]*\)).*/\1/p' | head -1)"
         PHASE2_NOTE="phase 2: ready (python: ${PHASE2_PYTHON:-unknown})"
@@ -320,6 +346,12 @@ preflight_apps() {
         SONARR_LINE="$RADARR_LINE"
         return 1
     fi
+
+    # Cleanup on every path out of here, not just the normal one: a Ctrl-C
+    # while both probes are stalling is exactly when this is reached.
+    trap 'rm -rf "$tmp"' EXIT
+    trap 'rm -rf "$tmp"; exit 130' INT
+    trap 'rm -rf "$tmp"; exit 143' TERM
 
     RADARR_OK=false
     if is_true "$SKIP_RADARR"; then
@@ -347,13 +379,31 @@ preflight_apps() {
     fi
 
     rm -rf "$tmp"
+    trap - EXIT INT TERM
 }
 
 run_preflight() {
+    # load_dotenv skips any key that is already set and non-empty, so without
+    # this a second pre-flight would silently re-use what the first one read:
+    # "Reconfigure (.env) + re-check" would re-probe with the old API key.
+    # Clearing only the keys the process environment did not itself provide
+    # keeps `RADARR_API_KEY=... ./arr-language-audit.sh` winning over the file.
+    local key
+    for key in $ALA_DOTENV_KEYS; do
+        case "$ARR_ENV_FROM_PROCESS" in
+            *" $key "*) continue ;;
+        esac
+        unset "$key"
+    done
+
     local dotenv
     if dotenv="$(find_dotenv)"; then
         load_dotenv "$dotenv" || warn "could not read $dotenv"
     fi
+    # Back to set-but-empty for the four the menu reads: they are referenced
+    # under `set -u` from here on, and the unset above may have removed them.
+    RADARR_URL="${RADARR_URL:-}" ; RADARR_API_KEY="${RADARR_API_KEY:-}"
+    SONARR_URL="${SONARR_URL:-}" ; SONARR_API_KEY="${SONARR_API_KEY:-}"
     SKIP_RADARR="${SKIP_RADARR:-false}"
     SKIP_SONARR="${SKIP_SONARR:-false}"
 
@@ -508,7 +558,7 @@ $PHASE2_HINT"
     local rc=0
     # The keys are of no use to ffmpeg and whisper, and phase 2 shells out for
     # every single file.
-    env -u RADARR_API_KEY -u SONARR_API_KEY \
+    run_without_keys \
         WHISPER_MODEL="$model" LIMIT="$limit" RETRY_ERRORS="$retry" \
         "$VERIFY_SH" "$CSV" "$VERIFIED_CSV" || rc=$?
     case "$rc" in
@@ -527,7 +577,7 @@ action_setup_phase2() {
 
     log ""
     log "Checking the phase 2 environment..."
-    if env -u RADARR_API_KEY -u SONARR_API_KEY "$VERIFY_SH" --check; then
+    if run_without_keys "$VERIFY_SH" --check; then
         info_box "Phase 2 environment is already ready. Nothing to do."
         run_preflight
         pause
@@ -593,7 +643,7 @@ action_report() {
     local py
     py=$(phase2_python) || { pause; return; }
 
-    env -u RADARR_API_KEY -u SONARR_API_KEY "$py" "$REPORT_PY" "$VERIFIED_CSV" \
+    run_without_keys "$py" "$REPORT_PY" "$VERIFIED_CSV" \
         || err "report generation failed."
     log "HTML report: $HTML"
     pause
@@ -617,7 +667,7 @@ action_serve() {
 
     log ""
     log "Starting the report webserver. Press Enter in this terminal to stop it."
-    env -u RADARR_API_KEY -u SONARR_API_KEY \
+    run_without_keys \
         "$py" "$REPORT_PY" "$VERIFIED_CSV" --serve ${extra[@]+"${extra[@]}"} \
         || err "the report server exited with an error."
     pause

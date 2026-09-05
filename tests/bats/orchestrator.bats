@@ -266,7 +266,7 @@ verdict_row() {
 }
 
 # --------------------------------------------------------------------------
-# O5-O6, O18: the pre-flight
+# O5-O6, O18, O21: the pre-flight
 # --------------------------------------------------------------------------
 
 @test "O5: probe_app reports one attempt per app and never puts the key on argv" {
@@ -349,6 +349,10 @@ verdict_row() {
     # instead of a fast connection refused.
     export RADARR_URL="http://192.0.2.1:7878" RADARR_API_KEY=k1
     export SONARR_URL="http://192.0.2.1:8989" SONARR_API_KEY=k2
+    # 5s per probe against the 8s bound below: concurrent is ~5s, sequential
+    # would be ~10s. At the default 3s BOTH shapes fit under 8s and the bound
+    # would prove nothing about concurrency.
+    export ARR_PROBE_TIMEOUT=5
 
     local started elapsed
     started="$(date +%s)"
@@ -363,8 +367,10 @@ verdict_row() {
     assert_line "sonarr=false"
     assert_line "env_ready=false"
 
-    # One attempt each, and both in flight at once: sequentially, with the old
-    # three attempts of 5s plus a 1s sleep, this was 36 seconds of dead menu.
+    # One attempt each, and both in flight at once: two 5s probes one after
+    # the other cannot fit in 8s, so this bound fails on a sequential
+    # pre-flight. Sequentially, with the old three attempts of 5s plus a 1s
+    # sleep, this was 36 seconds of dead menu.
     run grep -c "api/v3/system/status" "$FAKE_CURL_LOG"
     assert_output "2"
     [ "$elapsed" -lt 8 ] || {
@@ -399,6 +405,54 @@ ENVFILE
     }
     assert_stderr_contains "ignoring malformed line"
     assert_stderr_contains "ignoring unknown key PATH"
+}
+
+@test "O21: a second pre-flight re-reads a .env that changed under it" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    local url="$RADARR_URL" good_key="$RADARR_API_KEY"
+    # start_fake_arr exports a working configuration; take it back out of the
+    # environment, or it would (correctly) win over the file.
+    unset RADARR_URL RADARR_API_KEY SONARR_URL SONARR_API_KEY
+    export SKIP_SONARR=true
+    export ALA_DOTENV_FILE="$TMP/reload.env"
+    printf 'RADARR_URL=%s\nRADARR_API_KEY=%s\n' "$url" "stale-key" > "$ALA_DOTENV_FILE"
+
+    # This is what "Reconfigure (.env) + re-check" does: the operator pastes
+    # the real API key and asks for another pre-flight. The second probe must
+    # use the new key, not the one the first pre-flight read.
+    run_ala "run_preflight
+             echo \"first=\$RADARR_OK\"
+             printf 'RADARR_URL=%s\nRADARR_API_KEY=%s\n' '$url' '$good_key' > '$ALA_DOTENV_FILE'
+             run_preflight
+             echo \"second=\$RADARR_OK\"
+             echo \"key=\$RADARR_API_KEY\""
+    assert_success
+    assert_line "first=false"
+    assert_line "second=true"
+    assert_line "key=$good_key"
+
+    # And the server agrees: the key it was given was wrong the first time and
+    # right the second.
+    run arr_requests '.key_ok'
+    assert_line --index 0 "false"
+    assert_line --index 1 "true"
+
+    # The other direction: a key given in the environment is an explicit
+    # override and keeps winning, however often the file changes.
+    export SKIP_RADARR=true SKIP_SONARR=true
+    export RADARR_URL="http://env.test:7878" RADARR_API_KEY="from-environment"
+    printf 'RADARR_URL=http://file.test:7878\nRADARR_API_KEY=file-key-a\n' > "$ALA_DOTENV_FILE"
+
+    run_ala "run_preflight
+             echo \"first=\$RADARR_API_KEY\"
+             printf 'RADARR_URL=http://file.test:7878\nRADARR_API_KEY=file-key-b\n' > '$ALA_DOTENV_FILE'
+             run_preflight
+             echo \"second=\$RADARR_API_KEY\"
+             echo \"url=\$RADARR_URL\""
+    assert_success
+    assert_line "first=from-environment"
+    assert_line "second=from-environment"
+    assert_line "url=http://env.test:7878"
 }
 
 # --------------------------------------------------------------------------
@@ -659,6 +713,17 @@ ENVFILE
     # All three children ran: --check, the worker and the report.
     run grep -c "^argv:" "$RECORDER_LOG"
     assert_output "3"
+
+    # The report server is the fourth way out of this script, and it carries
+    # the same guarantee. Its own log, so the assertion is about that child.
+    : > "$RECORDER_LOG"
+    run_ala "PHASE2_PYTHON='$FAKEPY'
+             action_serve" <<< $'\n\n\n'
+    assert_success
+    assert_log_contains "argv: $FAKEPY $REPORT_PY $VERIFIED_CSV --serve"
+    assert_log_contains "env: RADARR_URL=http://radarr.test:7878"
+    run grep -c "API_KEY" "$RECORDER_LOG"
+    assert_output "0"
 }
 
 # --------------------------------------------------------------------------
