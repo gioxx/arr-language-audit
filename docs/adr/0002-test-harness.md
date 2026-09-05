@@ -40,9 +40,12 @@ fake, driven purely by environment variables:
   `ffmpeg` shim wrote into the "sample" and answers from a JSON script, so a
   test declares what language a file "is" without decoding a byte of audio.
 
-`scripts/test.sh {lint|py|bats|all}` is the single entry point, and CI calls the
-same script, so the two cannot drift. `ruff` and `pytest` run through `uvx`:
-nothing is installed into the project.
+`scripts/test.sh {lint|py|bats|all}` is the developer entry point. CI's lint
+job calls it; the bats and pytest jobs run their commands inline because they
+need the OS and interpreter matrix (the local script covers Python 3.9 and
+3.12, CI adds 3.13), so the two must be kept in step by hand when a stage
+changes. `ruff` and `pytest` run through `uvx`: nothing is installed into the
+project.
 
 ## Consequences
 
@@ -54,6 +57,7 @@ nothing is installed into the project.
 - The shims mean a test asserts on argv, not on effects: `ffprobe` is pinned to
   an exact argument list, which catches a silent flag change and also breaks on
   a harmless one.
+
 ## Alternatives considered
 
 - **shunit2 / a hand-rolled bash runner.** Rejected: bats-core has TAP output,

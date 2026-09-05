@@ -100,6 +100,8 @@ Unreleased.
 
 ### Fixed
 
+- `verify/report.py`: a CSV that the `csv` module cannot parse is reported
+  with a clean `could not parse` message and exit 1 instead of a traceback.
 - `scan/find-missing-italian-audio.sh`: an empty `audioLanguages` value no
   longer shifts the file path into the language column of the CSV.
 - `scan/find-missing-italian-audio.sh`: the wizard validates what it is given
@@ -124,6 +126,12 @@ Unreleased.
 
 ### Security
 
+- `verify/report.py`: every `<` inside the JSON embedded in the page is
+  written as `\u003c`, so a title containing `<!--` or `<script` can neither
+  break the page nor close the script block.
+- `verify/report.py`: the access token is compared in constant time with
+  `hmac.compare_digest` on bytes; a non-ASCII `?k=` now gets a 403 instead of
+  a server-side exception.
 - `lib/common.sh`: the `.env` file is parsed, never sourced or `eval`'d, and
   only allow-listed keys are set — a `.env` can no longer reach `PATH`,
   `LD_PRELOAD` or `IFS`, nor execute anything. Values are not shell-expanded.

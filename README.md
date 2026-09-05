@@ -50,6 +50,7 @@ arr-language-audit/
 ├── LICENSE                       MIT
 ├── .gitignore
 ├── .env.example                  template di configurazione (copia in .env)
+├── pyproject.toml                configurazione di ruff e pytest
 ├── lib/
 │   └── common.sh                 helper condivisi: .env, log, curl *arr, scelta di Python
 ├── scan/
@@ -281,7 +282,8 @@ rimossa, e il verdetto si sposta su quella nuova finché la firma del file non
 cambia — rinominare un episodio non costa un nuovo ascolto e non lascia lo
 stesso file due volte nel report.
 
-`LIMIT` (o `--limit`) limita quanti file vengono (ri)verificati in un run: le
+`LIMIT` (variabile d'ambiente del launcher; il worker accetta `--limit`)
+limita quanti file vengono (ri)verificati in un run: le
 righe che taglia conservano il verdetto che avevano già, quindi un run limitato
 non svuota mai il report. Per ripartire davvero da zero usa "Reset reports"
 nell'orchestratore, oppure `NO_RESUME=true` per rigenerare solo questo CSV. Per
@@ -498,10 +500,12 @@ così nel progetto non viene installato nulla.
 ./scripts/test.sh bats     # la suite bats, forzata su /bin/bash
 ```
 
-La CI (`.github/workflows/ci.yml`) gira gli stessi comandi: il job *lint* su
-`ubuntu-latest`, il job *bats* su `ubuntu-latest` e `macos-latest`, e il job
-*pytest* sulla matrice `ubuntu-latest` × `macos-latest` per Python `3.9`,
-`3.12` e `3.13`.
+La CI (`.github/workflows/ci.yml`) copre le stesse tre fasi: il job *lint* su
+`ubuntu-latest` richiama `scripts/test.sh lint`; i job *bats* (`ubuntu-latest`
+e `macos-latest`) e *pytest* (matrice `ubuntu-latest` × `macos-latest` per
+Python `3.9`, `3.12` e `3.13`) lanciano i comandi direttamente, perché hanno
+bisogno della matrice di sistemi e interpreti; lo script locale copre `3.9` e
+`3.12`, la CI aggiunge `3.13`.
 
 **Il gate su bash 3.2.** Sia in locale sia in CI la suite bats gira con
 `PATH="/bin:/usr/bin:$PATH"` e `BASH_UNDER_TEST=/bin/bash`, così su macOS gli
@@ -511,8 +515,9 @@ un altro cerca nei sorgenti i costrutti che richiedono bash 4 (`mapfile`,
 `declare -A`, `${var,,}`, …) e fallisce se ne trova.
 
 **Come funzionano i fake.** Nessun test tocca la rete, `ffmpeg` o whisper: la
-suite bats mette in testa al `PATH` degli shim per `curl`, `ffmpeg`,
-`ffprobe`, `python3`, `df`, `uname`, `whiptail` e `apt`, tutti pilotati da
+suite bats mette in testa al `PATH` degli shim per `curl`, `jq`, `ffmpeg`,
+`ffprobe`, `python3`, `df`, `uname`, `whiptail`, `apt` e un `recorder`
+generico, tutti pilotati da
 variabili d'ambiente, e affianca un finto Radarr/Sonarr HTTP che risponde dai
 fixture JSON in `tests/bats/fixtures`. Sul lato Python, un pacchetto
 `faster_whisper` stub su `PYTHONPATH` legge il marcatore che lo shim di
@@ -588,6 +593,7 @@ arr-language-audit/
 ├── LICENSE                       MIT
 ├── .gitignore
 ├── .env.example                  config template (copy to .env)
+├── pyproject.toml                ruff and pytest configuration
 ├── lib/
 │   └── common.sh                 shared helpers: .env, logging, *arr curl, Python discovery
 ├── scan/
@@ -814,7 +820,8 @@ under the old label is superseded and dropped, and the verdict moves to the new
 one as long as the file's signature is unchanged — renaming an episode never
 costs a re-listen and never leaves the same file in the report twice.
 
-`LIMIT` (or `--limit`) caps how many files are (re)verified in one run; the
+`LIMIT` (an environment variable of the launcher; the worker takes `--limit`)
+caps how many files are (re)verified in one run; the
 rows it cuts keep the verdict they already had, so a limited run never empties
 out the report. To really start from scratch use "Reset reports" in the
 orchestrator, or `NO_RESUME=true` to regenerate just this CSV. To retry the
@@ -1026,10 +1033,12 @@ vendored in `tests/bats/lib`), `shellcheck` and
 ./scripts/test.sh bats     # the bats suite, forced onto /bin/bash
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same commands: the *lint* job on
-`ubuntu-latest`, the *bats* job on `ubuntu-latest` and `macos-latest`, and the
-*pytest* job over the `ubuntu-latest` × `macos-latest` matrix for Python `3.9`,
-`3.12` and `3.13`.
+CI (`.github/workflows/ci.yml`) covers the same three stages: the *lint* job
+on `ubuntu-latest` calls `scripts/test.sh lint`; the *bats* job (`ubuntu-latest`
+and `macos-latest`) and the *pytest* job (`ubuntu-latest` × `macos-latest`
+matrix for Python `3.9`, `3.12` and `3.13`) run their commands inline because
+they need the OS and interpreter matrix; the local script covers `3.9` and
+`3.12`, CI adds `3.13`.
 
 **The bash 3.2 gate.** Locally and in CI the bats suite runs with
 `PATH="/bin:/usr/bin:$PATH"` and `BASH_UNDER_TEST=/bin/bash`, so on macOS the
@@ -1039,8 +1048,9 @@ sources for constructs that need bash 4 (`mapfile`, `declare -A`, `${var,,}`, �
 and fails if it finds any.
 
 **How the fakes work.** No test touches the network, `ffmpeg` or whisper: the
-bats suite puts shims for `curl`, `ffmpeg`, `ffprobe`, `python3`, `df`,
-`uname`, `whiptail` and `apt` at the head of `PATH`, all driven purely by
+bats suite puts shims for `curl`, `jq`, `ffmpeg`, `ffprobe`, `python3`, `df`,
+`uname`, `whiptail`, `apt` and a generic `recorder` at the head of `PATH`, all
+driven purely by
 environment variables, next to a fake Radarr/Sonarr HTTP server answering from
 the JSON fixtures in `tests/bats/fixtures`. On the Python side, a stub
 `faster_whisper` package on `PYTHONPATH` reads the marker the `ffmpeg` shim
