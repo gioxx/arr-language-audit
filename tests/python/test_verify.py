@@ -345,6 +345,14 @@ def test_disk_filling_up_mid_run_exits_1_with_a_valid_csv(tmp_path, shim_path,
     assert [r["Path"] for r in rows] == [a]
 
 
+def test_usage_error_exits_2(capsys):
+    """The --help epilog promises 2 for a bad flag; argparse must keep it."""
+    with pytest.raises(SystemExit) as excinfo:
+        vam.main(["--bogus"])
+    assert excinfo.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
 def test_missing_input_exits_1(tmp_path, capsys):
     """Y26."""
     rc = vam.main(["--input", str(tmp_path / "nope.csv"), "--output", str(tmp_path / "o.csv")])
@@ -363,9 +371,14 @@ def test_output_directory_created(tmp_path, shim_path, whisper_script):
 
 
 def test_unusable_output_path_exits_1(tmp_path, shim_path, whisper_script, capsys):
-    """Y29 twin: an output path that cannot be created is exit 1, not a
-    traceback -- and the model is never downloaded for a run that cannot
-    write its results."""
+    """Y29 twin: an output path that cannot be used is exit 1, not a traceback.
+
+    The two cases fail at different points, and the assertions say so: a
+    directory that cannot be created is caught in the pre-flight, before any
+    model is loaded; an output path that is itself a directory only fails when
+    the file is opened, which is after the model load (the model is loaded
+    first on purpose, so that a failure there cannot truncate the previous
+    results -- see test_model_load_failure_leaves_previous_output_untouched)."""
     path = media(tmp_path, "a.mkv")
     whisper_script({path: ["it", 0.97]})
     inp = write_phase1(tmp_path, [phase1_row(path)])
@@ -374,11 +387,13 @@ def test_unusable_output_path_exits_1(tmp_path, shim_path, whisper_script, capsy
     blocker.write_text("I am a file, not a directory", encoding="utf-8")
     assert vam.main(["--input", inp, "--output", str(blocker / "out.csv")]) == 1
     assert "cannot create the output directory" in capsys.readouterr().err
+    assert faster_whisper.WhisperModel.instances == []
 
     a_directory = tmp_path / "adir"
     a_directory.mkdir()
     assert vam.main(["--input", inp, "--output", str(a_directory)]) == 1
     assert "cannot write" in capsys.readouterr().err
+    assert len(faster_whisper.WhisperModel.instances) == 1
 
 
 # --- Y11-Y13, Y28, Y32: the detection loop ---------------------------------
@@ -546,7 +561,9 @@ def test_output_has_header_and_kept_rows_even_if_detection_crashes(
     inp = write_phase1(tmp_path, [phase1_row(kept), phase1_row(fresh)])
     rc = vam.main(["--input", inp, "--output", out])
 
-    assert rc != 0
+    # 130 is the contract the launcher and the orchestrator key off, not
+    # merely "something non-zero".
+    assert rc == vam.EXIT_INTERRUPTED == 130
     header, rows = read_rows(out)
     assert header == audit_common.PHASE2_COLUMNS
     assert [r["Path"] for r in rows] == [kept]

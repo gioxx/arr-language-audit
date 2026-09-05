@@ -46,8 +46,9 @@ Verdicts written to the output CSV:
 
 Exit codes:
     0   finished (including "nothing new to verify")
-    1   usage, configuration, input or disk-space problem, or the model
-        could not be loaded (the previous output CSV is left untouched)
+    1   configuration, input, output path or disk-space problem, or the
+        model could not be loaded (the previous output CSV is untouched)
+    2   usage error: an unknown flag or a bad value (argparse)
     3   every file this run tried to verify errored
     130 interrupted (Ctrl-C); the CSV written so far stays valid
 
@@ -350,7 +351,8 @@ def build_parser() -> argparse.ArgumentParser:
             "\n"
             "Exit codes:\n"
             "  0   finished (including 'nothing new to verify')\n"
-            "  1   usage, configuration, input, disk space, or model loading failed\n"
+            "  1   configuration, input, disk or model-load error\n"
+            "  2   usage error (argparse)\n"
             "  3   every file this run tried to verify errored\n"
             "  130 interrupted\n"
             "\n"
@@ -554,15 +556,21 @@ def _run(args, cfg: Config, temp_dir: str) -> int:
         confirmed_foreign_count = 0
         error_count = 0
 
+        def record_error(row, verdict, size=None, mtime=None):
+            """One file this run could not verify: a row on disk, a bump in
+            the count, flushed so an abort leaves a complete CSV behind."""
+            nonlocal error_count
+            writer.writerow(make_row(row, verdict=verdict, size=size, mtime=mtime))
+            error_count += 1
+            out_f.flush()
+
         for i, row in enumerate(to_verify, start=1):
             path = (row.get("Path", "") or "").strip()
             title = row.get("Title", "")
             log(f"[{i}/{len(to_verify)}] {title} ...")
 
             if not path or not os.path.isfile(path):
-                writer.writerow(make_row(row, verdict=VERDICT_FILE_NOT_FOUND))
-                error_count += 1
-                out_f.flush()
+                record_error(row, VERDICT_FILE_NOT_FOUND)
                 continue
 
             cur_size, cur_mtime = file_signature(path)
@@ -571,10 +579,7 @@ def _run(args, cfg: Config, temp_dir: str) -> int:
             sample_path = os.path.join(temp_dir, f"sample_{i}.wav")
 
             if not extract_sample(path, sample_path, cfg):
-                writer.writerow(make_row(row, verdict=VERDICT_EXTRACTION_FAILED,
-                                         size=cur_size, mtime=cur_mtime))
-                error_count += 1
-                out_f.flush()
+                record_error(row, VERDICT_EXTRACTION_FAILED, cur_size, cur_mtime)
                 continue
 
             try:
@@ -582,10 +587,7 @@ def _run(args, cfg: Config, temp_dir: str) -> int:
             except Exception as e:  # noqa: BLE001
                 # Whisper can fail in many ways; each is a DETECTION_FAILED row.
                 log(f"  Whisper detection failed: {str(e)[:MAX_ERROR_CHARS]}")
-                writer.writerow(make_row(row, verdict=VERDICT_DETECTION_FAILED,
-                                         size=cur_size, mtime=cur_mtime))
-                error_count += 1
-                out_f.flush()
+                record_error(row, VERDICT_DETECTION_FAILED, cur_size, cur_mtime)
                 continue
             finally:
                 # Always clean up the sample immediately to keep disk usage minimal
@@ -595,10 +597,7 @@ def _run(args, cfg: Config, temp_dir: str) -> int:
             if lang is None:
                 # Silence, or VAD stripped everything: no language to compare.
                 log("  Whisper detection failed: no language identified.")
-                writer.writerow(make_row(row, verdict=VERDICT_DETECTION_FAILED,
-                                         size=cur_size, mtime=cur_mtime))
-                error_count += 1
-                out_f.flush()
+                record_error(row, VERDICT_DETECTION_FAILED, cur_size, cur_mtime)
                 continue
 
             declared = row.get("AudioLanguages", "")
