@@ -15,6 +15,9 @@ install_shim() {
             printf 'install_shim: no such shim: %s\n' "$name" >&2
             return 1
         fi
+        # rm first: make_bin may have symlinked the real tool here (curl, jq)
+        # and cp would follow the symlink and overwrite the real binary.
+        rm -f "$BATS_TEST_TMPDIR/bin/$name"
         cp "$BATS_TESTS_DIR/fakes/bin/$name" "$BATS_TEST_TMPDIR/bin/$name"
         chmod +x "$BATS_TEST_TMPDIR/bin/$name"
     done
