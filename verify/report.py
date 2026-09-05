@@ -93,6 +93,8 @@ def read_rows(csv_path: str) -> list[dict]:
             return [{col: (r.get(col, "") or "").strip() for col in DISPLAY_COLUMNS} for r in reader]
     except UnicodeDecodeError as e:
         raise ReportError(f"could not read {csv_path}: the file is not valid UTF-8 ({e})") from e
+    except csv.Error as e:
+        raise ReportError(f"could not parse {csv_path}: {e}") from e
     except OSError as e:
         raise ReportError(f"could not read {csv_path}: {e}") from e
 
@@ -450,11 +452,15 @@ render();
 
 
 def _js(value) -> str:
-    """JSON for embedding inside a <script>: nothing may close the block or
-    break the line."""
+    """JSON for embedding inside a <script>: nothing may steer the HTML
+    tokenizer out of the script element, and nothing may break the line."""
     return (
         json.dumps(value, ensure_ascii=False)
-        .replace("</", "<\\/")
+        # Every "<", not just "</": "<!--" moves the tokenizer into
+        # script-data-escaped state and a following "<script" into
+        # double-escaped, where the template's own "</script>" stops closing
+        # the element. "\u003c" is plain JSON, so the value round-trips.
+        .replace("<", "\\u003c")
         # Legal in JSON, a line terminator in JavaScript.
         .replace("\u2028", "\\u2028")
         .replace("\u2029", "\\u2029")
@@ -609,7 +615,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    check_python_floor()
+    try:
+        check_python_floor()
+    except SystemExit:
+        # The floor check exits; main() is contracted to return a code, and
+        # __main__ turns it back into the same exit status.
+        return 1
+
     args = build_parser().parse_args(argv)
 
     try:

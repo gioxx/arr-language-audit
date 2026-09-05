@@ -7,6 +7,7 @@ Nothing here binds anything but 127.0.0.1 and nothing reaches the network.
 from __future__ import annotations
 
 import contextlib
+import csv
 import http.client
 import http.server
 import json
@@ -38,7 +39,7 @@ def js_const(html, name):
     """Read back a `const NAME = <json>;` line injected into the report."""
     m = re.search(rf"^const {re.escape(name)}\s*=\s*(.*);\s*$", html, re.M)
     assert m, f"no injected const {name} in the HTML"
-    return json.loads(m.group(1).replace("<\\/", "</"))
+    return json.loads(m.group(1))
 
 
 def head_of(html):
@@ -103,7 +104,7 @@ def test_r1_script_close_in_a_title_cannot_break_out_of_the_script_block(tmp_pat
     html = report.build_html(rows, "x.csv")
 
     assert html.count("</script>") == 1
-    assert "<\\/script>" in html
+    assert "\\u003c/script>" in html
     assert js_const(html, "DATA") == rows
 
 
@@ -377,3 +378,60 @@ def test_r19_the_table_script_is_written_for_large_reports():
 
 def test_r19_the_row_cap_is_two_thousand():
     assert "const ROW_CAP = 2000;" in report.HTML_TEMPLATE
+
+
+# --- R20: a comment open in the data cannot change how the script parses -----
+def test_r20_a_comment_open_in_a_title_cannot_change_the_script_parsing(tmp_path):
+    # <!-- puts the HTML tokenizer into script-data-escaped state, and a
+    # following <script into double-escaped, where the template's own
+    # </script> stops closing the element.
+    title = "<!--<script>alert(1)</script>-->"
+    rows = report.read_rows(write_csv(tmp_path, [dict(ROW, Title=title)]))
+
+    html = report.build_html(rows, "x.csv")
+
+    assert html.count("</script>") == 1
+    assert html.count("<script") == 1
+    assert "<!--" not in html
+    assert js_const(html, "DATA")[0]["Title"] == title
+
+
+# --- R21: an unparseable CSV is an error, not a traceback --------------------
+def unparseable_csv(tmp_path):
+    """A CSV the csv module refuses on every supported interpreter.
+
+    A NUL byte only raises up to 3.10 -- 3.11 accepts it -- so the portable
+    trigger is a field past csv.field_size_limit().
+    """
+    huge = "x" * (csv.field_size_limit() + 1)
+    path = tmp_path / "broken.csv"
+    path.write_text(f'{HEADER}\nsonarr,"{huge}",2019,,,,,,,,\n', encoding="utf-8")
+    return str(path)
+
+
+def test_r21_an_unparseable_csv_raises_a_report_error(tmp_path):
+    with pytest.raises(report.ReportError) as excinfo:
+        report.read_rows(unparseable_csv(tmp_path))
+
+    assert "could not parse" in str(excinfo.value)
+
+
+def test_r21_main_reports_an_unparseable_csv_and_returns_one(tmp_path, capsys):
+    code = report.main([unparseable_csv(tmp_path)])
+
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "could not parse" in err
+    assert "Traceback" not in err
+
+
+# --- main returns a code even when the interpreter is below the floor --------
+def test_main_returns_one_below_the_python_floor_instead_of_exiting(tmp_path, monkeypatch, capsys):
+    def too_old():
+        raise SystemExit(1)
+
+    monkeypatch.setattr(report, "check_python_floor", too_old)
+    code = report.main([write_csv(tmp_path, [ROW])])
+
+    capsys.readouterr()
+    assert code == 1
