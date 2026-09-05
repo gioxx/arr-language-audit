@@ -203,6 +203,19 @@ poll_command_status() {
     assert_output "0d0a"
 }
 
+@test "control delay holds a response for the scripted number of seconds" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    arr_control '{"delay": 1}'
+
+    local before after
+    before="$(date +%s)"
+    run curl -sf -o /dev/null -H "X-Api-Key: radarr-key" "$RADARR_URL/api/v3/movie"
+    assert_success
+    after="$(date +%s)"
+
+    [ "$((after - before))" -ge 1 ]
+}
+
 @test "write_csv writes CRLF line endings like csv.DictWriter" {
     write_csv "$BATS_TEST_TMPDIR/rows.csv" "App,Title" "Radarr,Il Cammino Lungo"
 

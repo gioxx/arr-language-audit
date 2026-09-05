@@ -714,10 +714,70 @@ EOF
     [ ! -f "$OUT" ]
 }
 
-@test "S40: a signal removes the temporary directory and ends the run" {
-    # The handler is called directly: sourcing the script defines its functions
-    # without running main (the BASH_SOURCE guard), which makes the contract
-    # testable without racing a real SIGINT.
+@test "S40: a real SIGINT stops a running scan and removes its temp directory" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    # Every response is held for five seconds, so the signal lands while the
+    # scan is still blocked inside curl -- the state Ctrl-C actually finds.
+    arr_control '{"delay": 5}'
+
+    export TMPDIR="$BATS_TEST_TMPDIR/tmp"
+    mkdir -p "$TMPDIR"
+
+    # Measured on this machine, and the reason this test needs both of the
+    # unusual things it does:
+    #
+    #   * without `set -m`, a non-interactive shell starts an asynchronous
+    #     command with SIGINT set to SIG_IGN, and a signal ignored at entry
+    #     cannot be trapped: the scan ran to completion and `wait` returned 0.
+    #     `set -m` gives the job its own process group and a live disposition.
+    #   * `kill -INT "$pid"` alone reaches bash but not curl, and bash defers a
+    #     trap until the foreground child returns: 9s against a 10s sleep.
+    #     Signalling the whole group is what a terminal's Ctrl-C does, and it
+    #     returned in 0s.
+    set -m
+    "$BASH_UNDER_TEST" "$SCAN" "$OUT" \
+        > "$BATS_TEST_TMPDIR/s40.out" 2> "$BATS_TEST_TMPDIR/s40.err" &
+    local pid=$!
+    set +m
+
+    # Wait until the server has logged the first request: from here the scan is
+    # inside curl and the server is holding the response.
+    local waited=0
+    while [[ "$(arr_request_count "/radarr/api/v3/movie")" == "0" ]]; do
+        if [[ "$waited" -ge 100 ]]; then
+            kill -9 "$pid" 2>/dev/null || true
+            printf 'the scan never reached the fake server\n' >&2
+            return 1
+        fi
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+
+    kill -INT -- "-$pid"
+    local rc=0
+    wait "$pid" || rc=$?
+
+    [ "$rc" -eq 130 ] || {
+        printf 'expected exit 130 from the interrupted scan, got %s\nstderr:\n' "$rc" >&2
+        cat "$BATS_TEST_TMPDIR/s40.err" >&2
+        return 1
+    }
+
+    # Nothing left behind, and no success claimed.
+    run bash -c "ls -d '$TMPDIR'/ala-scan.* 2>/dev/null | wc -l | tr -d ' '"
+    assert_output "0"
+    run grep -c "Results exported to" "$BATS_TEST_TMPDIR/s40.err"
+    assert_failure
+
+    # The report holds its header and no half-written row: the scan was
+    # interrupted before it could flag anything.
+    run cat "$OUT"
+    assert_output "App,Title,Year,Episode,AudioLanguages,Path"
+}
+
+@test "S40 twin: on_signal cleans up and exits 130 without falling through" {
+    # The handler's own contract, without a race: sourcing the script defines
+    # its functions without running main (the BASH_SOURCE guard).
     run "$BASH_UNDER_TEST" -c '
 . "$1"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ala-signal.XXXXXX")"

@@ -15,17 +15,22 @@ Environment:
     FAKE_ARR_LOG        JSONL request log: {"method","path","query","key_ok","body"}
     FAKE_ARR_CONTROL    JSON control file, re-read on every request:
                         {"fail_count": {"<path>": N}, "command_status": [...],
-                         "crlf": false}
+                         "crlf": false, "delay": 0}
+                        "delay" holds every response for that many seconds
+                        (float), so a test can signal a client while it is
+                        still waiting inside curl.
     FAKE_RADARR_KEY     expected X-Api-Key for /radarr (default "radarr-key")
     FAKE_SONARR_KEY     expected X-Api-Key for /sonarr (default "sonarr-key")
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -140,6 +145,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _hold(self) -> None:
+        """Sleep for control.delay seconds, re-read per request like fail_count."""
+        delay = _read_control().get("delay")
+        if not delay:
+            return
+        # A non-numeric delay is a typo in a test, not a reason to hang.
+        with contextlib.suppress(TypeError, ValueError):
+            time.sleep(float(delay))
+
     def _read_body(self) -> str:
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
@@ -173,6 +187,10 @@ class Handler(BaseHTTPRequestHandler):
                 "body": body,
             }
         )
+
+        # After the log entry, so a client polling the log knows the request
+        # arrived and the server is now holding it.
+        self._hold()
 
         status, payload = self._dispatch(
             method, app, rest, query, key_ok=key_ok, request_path=parsed.path

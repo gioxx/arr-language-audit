@@ -73,7 +73,9 @@ arr_request_count() {
 }
 
 # arr_control <json> -- overwrite the control file the server re-reads on every
-# request: {"fail_count": {"<path>": N}, "command_status": [...], "crlf": bool}.
+# request: {"fail_count": {"<path>": N}, "command_status": [...], "crlf": bool,
+#           "delay": seconds}. "delay" holds every response for that long, so a
+#           test can act on a client while it is still waiting inside curl.
 arr_control() {
     printf '%s\n' "$1" > "$FAKE_ARR_CONTROL"
 }
