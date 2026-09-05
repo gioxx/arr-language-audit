@@ -19,6 +19,7 @@ unaffected by them.
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 
 import audit_common
 import faster_whisper
@@ -74,6 +75,12 @@ def bump_mtime(path, delta=120):
 
 def key(path, episode=""):
     return (path, episode)
+
+
+def assert_precise_signature(row, path):
+    stat = os.stat(path)
+    assert row["FileSize"] == str(stat.st_size)
+    assert Decimal(row["FileMtime"]) * 1_000_000_000 == stat.st_mtime_ns
 
 
 class Signatures:
@@ -410,7 +417,7 @@ def test_plan_rows_never_stamps_a_signature_on_a_kept_error_row():
     by_path = {r["Path"]: r for r in plan.kept}
     assert (by_path["/m/gone.mkv"]["FileSize"], by_path["/m/gone.mkv"]["FileMtime"]) == ("", "")
     assert (by_path["/m/legacy.mkv"]["FileSize"],
-            by_path["/m/legacy.mkv"]["FileMtime"]) == ("7", "8")
+            by_path["/m/legacy.mkv"]["FileMtime"]) == ("", "")
 
 
 def test_plan_rows_retry_errors_reprocesses_retryable_verdicts_only():
@@ -442,8 +449,8 @@ def test_plan_rows_row_without_a_path_is_left_for_the_worker():
     assert sig.calls == []
 
 
-def test_row_key_strips_and_pairs_path_with_episode():
-    assert vam.row_key({"Path": " /m/a.mkv ", "Episode": " S01E01 "}) == ("/m/a.mkv", "S01E01")
+def test_row_key_preserves_path_and_normalises_only_episode():
+    assert vam.row_key({"Path": " /m/a.mkv ", "Episode": " S01E01 "}) == (" /m/a.mkv ", "S01E01")
     assert vam.row_key({"Path": "/m/a.mkv"}) == ("/m/a.mkv", "")
     assert vam.row_key({"Path": None, "Episode": None}) == ("", "")
 
@@ -475,7 +482,7 @@ def test_resume_reverifies_only_the_changed_file(tmp_path, shim_path, whisper_sc
 
     _header, rows = read_rows(out)
     assert [r["Path"] for r in rows] == [a, c, b]
-    assert (rows[2]["FileSize"], rows[2]["FileMtime"]) == signature_of(b)
+    assert_precise_signature(rows[2], b)
 
 
 def test_resume_reverifies_on_an_mtime_only_change(tmp_path, shim_path, whisper_script):
@@ -493,11 +500,10 @@ def test_resume_reverifies_on_an_mtime_only_change(tmp_path, shim_path, whisper_
     assert faster_whisper.WhisperModel.calls == [a]
 
 
-def test_legacy_rows_are_stamped_only_when_the_verdict_is_not_an_error(
+def test_legacy_rows_keep_their_missing_signatures_until_verification(
     tmp_path, shim_path, whisper_script
 ):
-    """Y16: a pre-signature CSV picks up signatures without re-verification --
-    except on an error row, which must stay retryable."""
+    """A pre-signature CSV must not invent evidence from a later stat call."""
     a = media(tmp_path, "a.mkv")
     gone = str(tmp_path / "gone.mkv")
     whisper_script({"*": ["en", 0.9]})
@@ -516,7 +522,7 @@ def test_legacy_rows_are_stamped_only_when_the_verdict_is_not_an_error(
     header, rows = read_rows(out)
     assert header == audit_common.PHASE2_COLUMNS
     assert [r["Path"] for r in rows] == [a, gone]
-    assert (rows[0]["FileSize"], rows[0]["FileMtime"]) == signature_of(a)
+    assert (rows[0]["FileSize"], rows[0]["FileMtime"]) == ("", "")
     assert (rows[1]["FileSize"], rows[1]["FileMtime"]) == ("", "")
     assert rows[1]["Verdict"] == audit_common.VERDICT_FILE_NOT_FOUND
     # Nothing needed detection, so no model was ever built.
@@ -728,7 +734,7 @@ def test_relabelled_episode_keeps_its_verdict_without_relistening(
     assert rows[0]["Episode"] == "S01E01 - The Pilot"
     assert rows[0]["Verdict"] == audit_common.VERDICT_CONFIRMED
     assert rows[0]["DetectedLanguage"] == "en"
-    assert (rows[0]["FileSize"], rows[0]["FileMtime"]) == signature_of(path)
+    assert_precise_signature(rows[0], path)
 
     # A third run must be a no-op too: the old label is gone for good, not
     # carried along as an orphan that reappears on every run.
@@ -785,7 +791,7 @@ def test_file_not_found_row_is_retried_once_the_file_appears(tmp_path, shim_path
     _header, rows = read_rows(out)
     assert len(rows) == 1
     assert rows[0]["Verdict"] == audit_common.VERDICT_MISTAGGED
-    assert (rows[0]["FileSize"], rows[0]["FileMtime"]) == signature_of(path)
+    assert_precise_signature(rows[0], path)
 
 
 # --- Y27: quoting survives the round trip ----------------------------------

@@ -40,8 +40,8 @@
 # case. Non-interactive runs (cron, CI, piped input) skip the wizard and
 # rely purely on environment variables / an existing .env file.
 #
-# The report is written to "<OUTPUT_CSV>.tmp.<pid>" and moved into place only
-# by a run that completed. A run that could not list an enabled app, or that
+# The report is written to a private "<OUTPUT_CSV>.tmp.<random>" and moved into
+# place only by a run that completed. A run with any failed API fetch, or that
 # was interrupted, therefore leaves the previous report exactly as it was: a
 # half-scanned library must never overwrite a good report.
 #
@@ -53,7 +53,7 @@
 # Exit codes:
 #   0   completed (with or without findings); the report was replaced
 #   1   missing dependency (jq / curl) or bad arguments
-#   2   an enabled app could not be listed; any previous report is untouched
+#   2   an API fetch or payload failed; any previous report/cache is untouched
 
 set -euo pipefail
 
@@ -106,54 +106,87 @@ def csvq: "\"" + (clean | gsub("\""; "\"\"")) + "\"";
 def pad2: if length < 2 then "0" + . else . end;
 def us: "\u001f";
 def audio_label($al): if $al == "" then "<none>" else ($al | logsafe) end;
+# Original paths travel as JSON, never through clean: filename whitespace and
+# control characters must survive the output/media collision check unchanged.
+def media_path($p):
+  if ($p | type) == "string" and ($p | length) > 0
+  then "PATH" + us + ($p | tojson) else empty end;
+def one_payload:
+  if length == 1 then .[0] else error("expected one JSON response") end;
+def records:
+  if type == "array" and all(.[]; type == "object") then .[]
+  else error("expected an array of records") end;
+def natural: type == "number" and . >= 0 and floor == .;
+def optional_string: . == null or type == "string";
+def checked_file:
+  if type == "object" and (.path | type == "string" and length > 0)
+     and (.mediaInfo == null or (.mediaInfo | type) == "object")
+     and (.mediaInfo.audioLanguages | optional_string)
+  then . else error("unusable media file") end;
 '
 
 # Radarr: the whole /movie payload in one pass. Emits "<csv row>US<log line>".
 JQ_RADARR='
-.[]
-| select(.hasFile == true)
+one_payload | records
+| if (.hasFile | type) == "boolean" and (.title | optional_string)
+     and (.year == null or (.year | natural))
+  then . else error("unusable movie record") end
+| media_path(.movieFile.path),
+  (select(.hasFile == true)
+| .movieFile |= checked_file
 | (.movieFile.mediaInfo.audioLanguages // "") as $al
 | select($al | test($re; "i") | not)
 | ("Radarr," + ((.title // "") | csvq) + "," + ((.year // "") | tostring)
    + ",," + ($al | csvq) + "," + ((.movieFile.path // "") | csvq))
   + us
   + ("[Radarr] " + ((.title // "") | logsafe) + " (" + ((.year // "") | tostring)
-     + ") -> audio: " + audio_label($al))
+     + ") -> audio: " + audio_label($al)))
 '
 
 # Sonarr, pass 1: join /series with the cache in one go. Emits
-# "<id>US<title>US<sig>US<HIT|STALE|MISS>". STALE means "the cache holds an
-# entry for this series but its signature moved", which is the only state
-# where a failed episode fetch may fall back to the previous rows.
+# "<id>US<title>US<sig>US<HIT|STALE|MISS>US<identity>". Both the file
+# statistics and series identity must match before cached rows are reusable.
 JQ_SERIES='
 ($cache[0] // {}) as $c
-| .[]
+| one_payload | records
+| if (.id | natural and . > 0) and (.title | optional_string)
+  then . else error("unusable series record") end
 | ((.id // "") | tostring) as $id
-| "\((.statistics.episodeFileCount // 0)):\((.statistics.sizeOnDisk // 0))" as $sig
+| (if (.statistics.episodeFileCount | natural) and (.statistics.sizeOnDisk | natural)
+   then "\(.statistics.episodeFileCount):\(.statistics.sizeOnDisk)"
+   else "unknown" end) as $sig
+| ([.title, .path, .tvdbId, .added] | tojson) as $identity
 | ($c[$id] // null) as $entry
 | $id + us + ((.title // "") | logsafe) + us + $sig + us
   + (if $entry == null then "MISS"
-     elif (($entry.sig // "") == $sig) then "HIT"
+     elif ($sig != "unknown" and $entry.sig == $sig and $entry.identity == $identity)
+     then "HIT"
      else "STALE"
-     end)
+     end) + us + $identity
 '
 
-# Sonarr, pass 2: every cached row of every cache hit, in one pass over the
-# cache, as "<id>US<row>". $ids is in series order, so the reader walks the
-# result with a single index.
+# Sonarr, pass 2: cached rows as "<id>US<row>" and original media paths as
+# "PATH US <JSON string>". $ids is in series order, so the reader walks rows
+# with a single index. Paths include Italian files that produced no CSV row.
 JQ_CACHED_ROWS='
 . as $c
 | $ids[]
 | . as $id
-| ($c[$id].rows[]? | $id + us + .)
+| ($c[$id].paths[] | media_path(.)), ($c[$id].rows[] | $id + us + .)
 '
 
 # Sonarr, per uncached series: the whole /episode payload in one pass. Emits
 # either "<csv row>US<log line>" or, for the rare episode flagged hasFile with
 # no embedded file object, "NEEDFILE" US <episodeFileId> US <label>.
 JQ_EPISODES='
-.[]
-| select(.hasFile == true)
+one_payload | records
+| if (.hasFile | type) == "boolean" and (.title | optional_string)
+  then . else error("unusable episode record") end
+| media_path(.episodeFile.path),
+  (select(.hasFile == true)
+| if (.episodeFileId | natural and . > 0)
+     and ((.seasonNumber // 0) | natural) and ((.episodeNumber // 0) | natural)
+  then . else error("unusable episode file id or number") end
 | ((.episodeFileId // 0) | tostring) as $efid
 | select($efid != "0" and $efid != "")
 | ("S" + ((.seasonNumber // 0) | tostring | pad2)
@@ -163,34 +196,37 @@ JQ_EPISODES='
 | if $path == "" then
     "NEEDFILE" + us + $efid + us + $label
   else
-    (.episodeFile.mediaInfo.audioLanguages // "") as $al
+    (.episodeFile | checked_file) as $file
+    | ($file.mediaInfo.audioLanguages // "") as $al
     | select($al | test($re; "i") | not)
     | ("Sonarr," + ($title | csvq) + ",," + ($label | csvq) + ","
        + ($al | csvq) + "," + ($path | csvq))
       + us
       + ("[Sonarr] " + ($title | logsafe) + " - " + ($label | logsafe)
          + " -> audio: " + audio_label($al))
-  end
+  end)
 '
 
 # The NEEDFILE fallback: one /episodefile/<id> body into the same pair of
-# fields. Fed "{}" when even that request failed, which reproduces the
-# previous behaviour of reporting the episode with no language and no path
-# rather than dropping it.
+# fields. A failed request or an unusable file makes the scan incomplete.
 JQ_EPISODEFILE='
-(.mediaInfo.audioLanguages // "") as $al
+one_payload | checked_file
+| media_path(.path),
+  ((.mediaInfo.audioLanguages // "") as $al
 | (.path // "") as $path
 | select($al | test($re; "i") | not)
 | ("Sonarr," + ($title | csvq) + ",," + ($label | csvq) + ","
    + ($al | csvq) + "," + ($path | csvq))
   + us
   + ("[Sonarr] " + ($title | logsafe) + " - " + ($label | logsafe)
-     + " -> audio: " + audio_label($al))
+     + " -> audio: " + audio_label($al)))
 '
 
 # One rescanned series -> one JSONL cache fragment. Input is its raw rows.
 JQ_CACHE_ENTRY='
-{ id: $id, entry: { sig: $sig, rows: (split("\n") | map(select(length > 0))) } }
+{ id: $id, entry: { sig: $sig, identity: $identity,
+  paths: $paths,
+  rows: (split("\n") | map(select(length > 0))) } }
 '
 
 # The whole cache, from the JSONL fragments: a fragment carrying an "entry"
@@ -200,13 +236,24 @@ JQ_CACHE_MERGE='
 | reduce .[] as $f ({};
     (if ($f | has("entry")) then $f.entry else $old[$f.id] end) as $e
     | if $e == null then . else .[$f.id] = $e end)
-| . + { "__meta": { "version": 2, "regex": $re } }
+| . + { "__meta": { "version": 3, "regex": $re, "source": $source } }
 '
 
 # Cache readability and schema in one pass: the payload without __meta when it
-# is a v2 cache built with this regex, the string "FORMAT" when it is not.
+# is a v3 cache built for this source and regex, the string "FORMAT" otherwise.
 JQ_CACHE_LOAD='
-if ((.__meta? | type) == "object") and (.__meta.version == 2) and (.__meta.regex == $re)
+def csv_field: "\"([^\"]|\"\")*\"";
+def cache_row:
+  type == "string" and (test("[\u0000\r\n\t\u001f]") | not)
+  and test("^Sonarr," + csv_field + ",," + csv_field + "," + csv_field + "," + csv_field + "$");
+one_payload
+| if type == "object" and ((.__meta? | type) == "object")
+     and (.__meta.version == 3) and (.__meta.regex == $re) and (.__meta.source == $source)
+     and (del(.__meta) | to_entries | all(.[];
+       (.key | test("^[1-9][0-9]*$")) and (.value | type == "object"
+         and (.sig | type == "string") and (.identity | type == "string")
+         and (.paths | type == "array" and all(.[]; type == "string" and length > 0))
+         and (.rows | type == "array" and all(.[]; cache_row)))))
 then del(.__meta)
 else "FORMAT"
 end
@@ -254,20 +301,26 @@ Environment variables (also read from a .env file, see below):
                                                               (default: false)
   RESCAN_TIMEOUT      seconds to wait for a rescan to finish. A rescan that
                       reports failed, aborted, cancelled or orphaned is not
-                      waited out; the scan warns and carries on
+                      waited out; the scan warns and carries on. Range:
+                      0-999999999, including time spent in status requests
                                                               (default: 900)
   RESCAN_POLL_INTERVAL
-                      seconds between two rescan status polls (default: 5)
+                      seconds between two rescan status polls, capped to the
+                      remaining timeout; range 1-999999999 (default: 5)
   REFRESH             true to ignore the Sonarr per-series cache
                                                               (default: false)
 
 Sonarr is fetched once per series (episodes with the file embedded). A cache
 file next to OUTPUT_CSV (<name>.cache.json) records a per-series signature
-(file count + size on disk) and the rows that series produced; an unchanged
-series is not re-fetched on the next run. The cache carries a "__meta" block
-with its schema version and the Italian regex it was built with; a cache
-written by another version is discarded and rebuilt. Radarr is one request
-and is not cached.
+(file count + size on disk), series identity, original media paths and CSV rows.
+An unchanged series is not re-fetched on the next run. The v3 cache carries a
+"__meta" block with its schema version, Italian regex and Sonarr URL; an older,
+foreign or malformed cache is discarded and rebuilt. Missing file statistics
+cannot authorize reuse. Radarr is one request and is not cached.
+
+Before publication, report and cache destinations are checked against every
+original media path, including Italian files. A collision through the same
+path, a symlink or a hardlink aborts the run and keeps both outputs untouched.
 
 .env file: looked up in <repo>/.env, then <repo>/scan/.env; first match wins.
 The current working directory is deliberately not searched -- running the
@@ -286,14 +339,13 @@ permissions 600. ARR_ASSUME_TTY=1 runs it without a terminal; ARR_LOCALHOST
 
 Exit codes:
   0   completed (with or without findings). The report is built in
-      "<OUTPUT_CSV>.tmp.<pid>" and moved into place here, so a reader never
-      sees a partial file. Being a rename, it gives the report a new file's
-      permissions rather than those of the one it replaces.
+      "<OUTPUT_CSV>.tmp.<random>" and moved into place here, so a reader never
+      sees a partial file. The report and cache are private files (mode 600).
   1   missing dependency (jq / curl) or bad arguments.
-  2   an enabled app could not be listed after retries. The temporary file is
-      discarded, so a previous report survives untouched rather than being
-      replaced by a half-scanned one; with no previous report, none is
-      written. The findings that were made are still on stdout.
+  2   an enabled app, episode list or episode file could not be fetched, or its
+      response was invalid. Temporary results are discarded and the previous
+      report and cache survive untouched; with no previous report, none is
+      written. Findings from successful requests are still on stdout.
 EOF
 }
 
@@ -318,6 +370,9 @@ parse_args() {
             *)         POSITIONAL+=("$1"); shift ;;
         esac
     done
+    if [[ ${#POSITIONAL[@]} -gt 1 ]]; then
+        die 1 "expected at most one OUTPUT_CSV argument."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -329,7 +384,7 @@ parse_args() {
 # load_dotenv never overwrites a set, non-empty variable, so it has to run
 # before any "${VAR:-default}" of ours would fill one in.
 load_config() {
-    local candidate
+    local candidate var value
     candidate="$(find_dotenv || true)"
     if [[ -n "$candidate" ]]; then
         load_dotenv "$candidate" || true
@@ -351,14 +406,21 @@ load_config() {
     RESCAN_POLL_INTERVAL="${RESCAN_POLL_INTERVAL:-5}"
     REFRESH="${REFRESH:-false}"
 
-    # Both are used in arithmetic and one of them bounds a loop: a value that
-    # is not a number, or a zero interval, would spin forever.
-    if [[ ! "$RESCAN_TIMEOUT" =~ ^[0-9]+$ ]]; then
-        warn "RESCAN_TIMEOUT is not a whole number of seconds; using 900."
+    # Arithmetic must see decimal, bounded integers: leading zeroes otherwise
+    # select octal in bash, and oversized inputs can wrap into negative values.
+    for var in RESCAN_TIMEOUT RESCAN_POLL_INTERVAL; do
+        value="${!var}"
+        if [[ "$value" =~ ^[0-9]+$ ]]; then
+            value="${value#"${value%%[!0]*}"}"
+            printf -v "$var" '%s' "${value:-0}"
+        fi
+    done
+    if [[ ! "$RESCAN_TIMEOUT" =~ ^[0-9]+$ || ${#RESCAN_TIMEOUT} -gt 9 ]]; then
+        warn "RESCAN_TIMEOUT must be 0-999999999 whole seconds; using 900."
         RESCAN_TIMEOUT=900
     fi
-    if [[ ! "$RESCAN_POLL_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
-        warn "RESCAN_POLL_INTERVAL must be at least 1 second; using 5."
+    if [[ ! "$RESCAN_POLL_INTERVAL" =~ ^[1-9][0-9]*$ || ${#RESCAN_POLL_INTERVAL} -gt 9 ]]; then
+        warn "RESCAN_POLL_INTERVAL must be 1-999999999 whole seconds; using 5."
         RESCAN_POLL_INTERVAL=5
     fi
 
@@ -555,7 +617,7 @@ run_wizard() {
 # the grounds that a stale tag is still worth reporting.
 wait_for_command() {
     local base_url="$1" api_key="$2" command_name="$3"
-    local cmd_id body request status elapsed=0
+    local cmd_id body request status started remaining request_timeout pause
     local interval="${RESCAN_POLL_INTERVAL:-5}"
 
     # jq builds the body rather than string interpolation. Every caller passes
@@ -575,9 +637,19 @@ wait_for_command() {
 
     log "  Triggered $command_name (command id $cmd_id), waiting for completion..."
 
-    while [[ "$elapsed" -lt "$RESCAN_TIMEOUT" ]]; do
+    started=$SECONDS
+    while :; do
+        remaining=$((RESCAN_TIMEOUT - (SECONDS - started)))
+        [[ "$remaining" -gt 0 ]] || break
+        # A status request cannot outlive the remaining wait budget. Preserve
+        # a shorter per-request timeout, including curl fractional seconds.
+        request_timeout=$(jq -nr --arg configured "${ARR_TIMEOUT:-120}" \
+            --argjson remaining "$remaining" '
+            ($configured | try tonumber catch 120) as $n
+            | [($n | if . > 0 then . else 120 end), $remaining] | min')
         status=""
-        if body=$(arr_get "$base_url/api/v3/command/$cmd_id" "$api_key" 1); then
+        if body=$(ARR_TIMEOUT="$request_timeout" \
+            arr_get "$base_url/api/v3/command/$cmd_id" "$api_key" 1); then
             status=$(printf '%s' "$body" | jq -r '.status // empty' | tr -d '\r')
         fi
         case "$status" in
@@ -593,8 +665,11 @@ wait_for_command() {
                 return 1
                 ;;
         esac
-        sleep "$interval"
-        elapsed=$((elapsed + interval))
+        remaining=$((RESCAN_TIMEOUT - (SECONDS - started)))
+        [[ "$remaining" -gt 0 ]] || break
+        pause="$interval"
+        if [[ "$pause" -gt "$remaining" ]]; then pause="$remaining"; fi
+        sleep "$pause"
     done
 
     warn "$command_name did not complete within ${RESCAN_TIMEOUT}s, continuing anyway."
@@ -613,6 +688,45 @@ record() {
     write_row "$1"
     printf '%s\n' "$2"
     found_count=$((found_count + 1))
+}
+
+# JSONL preserves raw filenames, including tabs, newlines and trailing spaces.
+# No decoding subprocess is needed per file: one jq pass precedes publication.
+record_media_path() {
+    printf '%s\n' "$1" >> "$MEDIA_PATHS_FILE"
+}
+
+record_series_result() {
+    if [[ "$1" == "PATH" ]]; then
+        record_media_path "$2"
+        printf '%s\n' "$2" >> "$TMP_DIR/series.paths"
+    else
+        record "$1" "$2"
+        printf '%s\n' "$1" >> "$TMP_DIR/series.rows"
+    fi
+}
+
+# Reject destinations naming or aliasing media before replacing either output.
+# Bash -ef compares device/inode for hardlinks and resolves symlinks. NUL is
+# the only byte a filesystem path cannot contain, so this stream is lossless.
+protect_media_files() {
+    local media_path report_absolute cache_absolute
+    report_absolute="$(cd -- "$(dirname -- "$OUTPUT_CSV")" && pwd -P)/${OUTPUT_CSV##*/}"
+    cache_absolute="$(cd -- "$(dirname -- "$SONARR_CACHE_FILE")" && pwd -P)/${SONARR_CACHE_FILE##*/}"
+    jq -j '., "\u0000"' "$MEDIA_PATHS_FILE" > "$TMP_DIR/media-paths.raw"
+    while IFS= read -r -d '' media_path; do
+        if [[ "$media_path" == "$OUTPUT_CSV" || "$media_path" == "$report_absolute" ||
+              "$media_path" -ef "$OUTPUT_CSV" ]]; then
+            err "OUTPUT_CSV would overwrite a media file; choose a different report path."
+            return 1
+        fi
+        if [[ -f "$TMP_DIR/cache.new" ]] &&
+            [[ "$media_path" == "$SONARR_CACHE_FILE" || "$media_path" == "$cache_absolute" ||
+               "$media_path" -ef "$SONARR_CACHE_FILE" ]]; then
+            err "Sonarr cache would overwrite a media file; choose a different report path."
+            return 1
+        fi
+    done < "$TMP_DIR/media-paths.raw"
 }
 
 # ---------------------------------------------------------------------------
@@ -635,7 +749,7 @@ scan_radarr() {
         return 0
     fi
 
-    if ! jq -r --arg re "$ITALIAN_REGEX" "$JQ_DEFS$JQ_RADARR" \
+    if ! jq -s -r --arg re "$ITALIAN_REGEX" "$JQ_DEFS$JQ_RADARR" \
         <<< "$movies_json" > "$TMP_DIR/radarr.lines"; then
         warn "could not read the Radarr response."
         radarr_failed=true
@@ -644,6 +758,10 @@ scan_radarr() {
 
     while IFS="$US" read -r row hit; do
         [[ -n "$row" ]] || continue
+        if [[ "$row" == "PATH" ]]; then
+            record_media_path "$hit"
+            continue
+        fi
         record "$row" "$hit"
     done < "$TMP_DIR/radarr.lines"
 }
@@ -665,7 +783,8 @@ load_sonarr_cache() {
     fi
     [[ -f "$SONARR_CACHE_FILE" ]] || return 0
 
-    payload=$(jq -c --arg re "$ITALIAN_REGEX" "$JQ_CACHE_LOAD" \
+    payload=$(jq -s -c --arg re "$ITALIAN_REGEX" --arg source "$SONARR_URL" \
+        "$JQ_DEFS$JQ_CACHE_LOAD" \
         "$SONARR_CACHE_FILE" 2>/dev/null) || payload=""
 
     if [[ -z "$payload" ]]; then
@@ -692,80 +811,74 @@ ids_json() {
     printf '%s]\n' "$out"
 }
 
-# emit_cached_rows <series-id> -- re-emit the rows the cache holds for one
-# series. The failure path only; the hit path reads them all in one pass.
-emit_cached_rows() {
-    local sid="$1" row
-    while IFS= read -r row; do
-        [[ -n "$row" ]] || continue
-        write_row "$row"
-        found_count=$((found_count + 1))
-    done < <(jq -r --arg id "$sid" '.[$id].rows[]?' "$CACHE_JSON_FILE")
-}
-
 # carry_series <series-id> -- keep this series' previous cache entry.
 carry_series() {
     printf '{"id":"%s"}\n' "$1" >> "$FRAG_FILE"
 }
 
-# scan_series <id> <title> <sig> <state> -- one uncached (or stale) series:
+# scan_series <id> <title> <sig> <identity> -- one uncached (or stale) series:
 # one episode request, one jq to format it, one jq to build its cache entry.
 scan_series() {
-    local sid="$1" stitle="$2" ssig="$3" sstate="$4"
-    local episodes_json epfile_json line f1 f2 f3
+    local sid="$1" stitle="$2" ssig="$3" identity="$4"
+    local episodes_json epfile_json f1 f2 f3 row hit
 
     if ! episodes_json=$(arr_get \
         "$SONARR_URL/api/v3/episode?seriesId=$sid&includeEpisodeFile=true" \
         "$SONARR_API_KEY"); then
-        if [[ "$sstate" == "STALE" ]]; then
-            warn "episode fetch failed for '$stitle'; keeping its previous cache entry."
-            emit_cached_rows "$sid"
-            carry_series "$sid"
-        else
-            warn "episode fetch failed for '$stitle'; skipping it this run."
-        fi
+        warn "episode fetch failed for '$stitle'; scan incomplete."
+        sonarr_failed=true
         return 0
     fi
 
-    if ! jq -r --arg re "$ITALIAN_REGEX" --arg title "$stitle" \
+    if ! jq -s -r --arg re "$ITALIAN_REGEX" --arg title "$stitle" \
         "$JQ_DEFS$JQ_EPISODES" <<< "$episodes_json" > "$TMP_DIR/episodes.lines"; then
         warn "could not read the episode list for '$stitle'; skipping it this run."
+        sonarr_failed=true
         return 0
     fi
 
     : > "$TMP_DIR/series.rows"
+    : > "$TMP_DIR/series.paths"
     while IFS="$US" read -r f1 f2 f3; do
         if [[ "$f1" == "NEEDFILE" ]]; then
-            # hasFile with no embedded episodeFile: one extra request, and an
-            # empty object when even that fails, so the episode is still
-            # reported instead of silently dropped.
+            # hasFile with no embedded episodeFile: one extra request. Missing
+            # details cannot become a successful, permanently cached result.
             if ! epfile_json=$(arr_get \
                 "$SONARR_URL/api/v3/episodefile/$f2" "$SONARR_API_KEY" 2); then
-                epfile_json='{}'
+                warn "episode file fetch failed for '$stitle'; scan incomplete."
+                sonarr_failed=true
+                return 0
             fi
-            line=$(jq -r --arg re "$ITALIAN_REGEX" --arg title "$stitle" \
+            if ! jq -s -r --arg re "$ITALIAN_REGEX" --arg title "$stitle" \
                 --arg label "$f3" "$JQ_DEFS$JQ_EPISODEFILE" \
-                <<< "$epfile_json") || line=""
-            [[ -n "$line" ]] || continue
-            f1="${line%%"$US"*}"
-            f2="${line#*"$US"}"
+                <<< "$epfile_json" > "$TMP_DIR/episodefile.lines"; then
+                warn "could not read the episode file for '$stitle'; scan incomplete."
+                sonarr_failed=true
+                return 0
+            fi
+            while IFS="$US" read -r row hit; do
+                [[ -n "$row" ]] || continue
+                record_series_result "$row" "$hit"
+            done < "$TMP_DIR/episodefile.lines"
+            continue
         fi
         [[ -n "$f1" ]] || continue
-        record "$f1" "$f2"
-        printf '%s\n' "$f1" >> "$TMP_DIR/series.rows"
+        record_series_result "$f1" "$f2"
     done < "$TMP_DIR/episodes.lines"
 
     # An empty rows array is meaningful: "checked, nothing flagged".
-    if ! jq -R -s -c --arg id "$sid" --arg sig "$ssig" "$JQ_CACHE_ENTRY" \
+    if ! jq -R -s -c --arg id "$sid" --arg sig "$ssig" --arg identity "$identity" \
+        --slurpfile paths "$TMP_DIR/series.paths" \
+        "$JQ_CACHE_ENTRY" \
         < "$TMP_DIR/series.rows" >> "$FRAG_FILE"; then
         warn "could not record '$stitle' in the Sonarr cache."
     fi
 }
 
 scan_sonarr() {
-    local series_json sid stitle ssig sstate row
+    local series_json sid stitle ssig sstate identity row
     local i idx total reused
-    local -a series_ids series_titles series_sigs series_states
+    local -a series_ids series_titles series_sigs series_states series_identities
     local -a hits hit_ids hit_rows
 
     if is_true "$FORCE_RESCAN"; then
@@ -783,7 +896,7 @@ scan_sonarr() {
 
     load_sonarr_cache
 
-    if ! jq -r --slurpfile cache "$CACHE_JSON_FILE" "$JQ_DEFS$JQ_SERIES" \
+    if ! jq -s -r --slurpfile cache "$CACHE_JSON_FILE" "$JQ_DEFS$JQ_SERIES" \
         <<< "$series_json" > "$TMP_DIR/series.lines"; then
         warn "could not read the Sonarr series list."
         sonarr_failed=true
@@ -791,7 +904,8 @@ scan_sonarr() {
     fi
 
     series_ids=(); series_titles=(); series_sigs=(); series_states=(); hits=()
-    while IFS="$US" read -r sid stitle ssig sstate; do
+    series_identities=()
+    while IFS="$US" read -r sid stitle ssig sstate identity; do
         if [[ ! "$sid" =~ ^[0-9]+$ ]]; then
             warn "skipping a series with an unusable id."
             continue
@@ -800,6 +914,7 @@ scan_sonarr() {
         series_titles+=("$stitle")
         series_sigs+=("$ssig")
         series_states+=("$sstate")
+        series_identities+=("$identity")
         if [[ "$sstate" == "HIT" ]]; then
             hits+=("$sid")
         fi
@@ -815,6 +930,10 @@ scan_sonarr() {
             > "$TMP_DIR/cached.lines"; then
             while IFS="$US" read -r sid row; do
                 [[ -n "$sid" ]] || continue
+                if [[ "$sid" == "PATH" ]]; then
+                    record_media_path "$row"
+                    continue
+                fi
                 hit_ids+=("$sid")
                 hit_rows+=("$row")
             done < "$TMP_DIR/cached.lines"
@@ -846,18 +965,17 @@ scan_sonarr() {
             carry_series "$sid"
         else
             scan_series "$sid" "${series_titles[$i]}" "${series_sigs[$i]}" \
-                "${series_states[$i]}"
+                "${series_identities[$i]}"
         fi
         i=$((i + 1))
     done
 
-    # The whole cache in one pass over the fragments, through a temporary file
-    # so an interrupted run cannot leave a truncated cache behind.
-    if jq -s --slurpfile cache "$CACHE_JSON_FILE" --arg re "$ITALIAN_REGEX" \
-        "$JQ_CACHE_MERGE" "$FRAG_FILE" > "$TMP_DIR/cache.new" &&
-        mv -f "$TMP_DIR/cache.new" "$SONARR_CACHE_FILE"; then
-        log "Sonarr cache updated: $SONARR_CACHE_FILE"
-    else
+    # Stage the whole cache; main publishes it only after every enabled app
+    # and every episode/file request completed successfully.
+    if ! jq -s --slurpfile cache "$CACHE_JSON_FILE" --arg re "$ITALIAN_REGEX" \
+        --arg source "$SONARR_URL" \
+        "$JQ_CACHE_MERGE" "$FRAG_FILE" > "$TMP_DIR/cache.new"; then
+        rm -f "$TMP_DIR/cache.new"
         warn "could not write Sonarr cache to $SONARR_CACHE_FILE."
     fi
 }
@@ -866,7 +984,7 @@ scan_sonarr() {
 # SUMMARY
 # ---------------------------------------------------------------------------
 
-# failed_apps -- the enabled apps whose list fetch failed, "" if none. The
+# failed_apps -- the enabled apps with any failed API fetch or payload, "" if none. The
 # order is fixed so the message does not depend on which one failed first.
 failed_apps() {
     local failed=""
@@ -923,6 +1041,10 @@ cleanup() {
         rm -f -- "$OUT_TMP"
         OUT_TMP=""
     fi
+    if [[ -n "${CACHE_OUT_TMP:-}" ]]; then
+        rm -f -- "$CACHE_OUT_TMP"
+        CACHE_OUT_TMP=""
+    fi
     return 0
 }
 
@@ -952,6 +1074,11 @@ main() {
     else
         OUTPUT_CSV="$ALA_PHASE1_CSV"
     fi
+    if [[ -d "$OUTPUT_CSV" ]]; then
+        die 1 "OUTPUT_CSV is a directory: $OUTPUT_CSV"
+    fi
+    # Prefix relative paths so mktemp also accepts a basename beginning '-'.
+    if [[ "$OUTPUT_CSV" != /* ]]; then OUTPUT_CSV="./$OUTPUT_CSV"; fi
     mkdir -p "$(dirname -- "$OUTPUT_CSV")"
 
     # The Sonarr per-series cache lives next to the report: a signature
@@ -969,14 +1096,16 @@ main() {
     # is a rename and never a copy across filesystems -- and moved into place
     # only by a run that completed. A reader therefore sees either the previous
     # report or the new one, never half of either.
-    OUT_TMP="$OUTPUT_CSV.tmp.$$"
-
     TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ala-scan.XXXXXX")"
     trap cleanup EXIT
     trap 'on_signal INT' INT
     trap 'on_signal TERM' TERM
+    OUT_TMP="$(mktemp "$OUTPUT_CSV.tmp.XXXXXX")"
+    CACHE_OUT_TMP=""
     CACHE_JSON_FILE="$TMP_DIR/cache.json"
     FRAG_FILE="$TMP_DIR/cache-fragments.jsonl"
+    MEDIA_PATHS_FILE="$TMP_DIR/media-paths.jsonl"
+    : > "$MEDIA_PATHS_FILE"
 
     # Zero findings still leaves a report: a header-only CSV says "this ran and
     # found nothing", where a missing file says nothing at all.
@@ -999,9 +1128,24 @@ main() {
         rm -f -- "$OUT_TMP"
         rc=2
     else
+        protect_media_files
         # "--": OUTPUT_CSV comes from the command line and may start with a
         # dash. Both paths are in the same directory, so this is atomic.
         mv -f -- "$OUT_TMP" "$OUTPUT_CSV"
+        if [[ -f "$TMP_DIR/cache.new" ]]; then
+            # TMPDIR can be on a different filesystem. Copy to a private
+            # sibling first, then rename: the published cache is never copied
+            # into place a byte at a time, and no predictable symlink is opened.
+            if [[ ! -d "$SONARR_CACHE_FILE" ]] &&
+                CACHE_OUT_TMP="$(mktemp "$SONARR_CACHE_FILE.tmp.XXXXXX")" &&
+                cp -- "$TMP_DIR/cache.new" "$CACHE_OUT_TMP" &&
+                mv -f -- "$CACHE_OUT_TMP" "$SONARR_CACHE_FILE"; then
+                CACHE_OUT_TMP=""
+                log "Sonarr cache updated: $SONARR_CACHE_FILE"
+            else
+                warn "could not write Sonarr cache to $SONARR_CACHE_FILE."
+            fi
+        fi
     fi
     OUT_TMP=""
 

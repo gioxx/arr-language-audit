@@ -230,11 +230,17 @@ load_dotenv() {
 arr_curl() {
     local key="${1:-}" escaped
     shift
+    case "$key" in
+        *$'\r'*|*$'\n'*)
+            err "API keys must not contain carriage returns or newlines."
+            return 2
+            ;;
+    esac
     # curl's config parser reads \" and \\ inside a quoted value.
     escaped="${key//\\/\\\\}"
     escaped="${escaped//\"/\\\"}"
     printf 'header = "X-Api-Key: %s"\n' "$escaped" |
-        curl -sf --compressed -K - "$@"
+        curl -q -sf --compressed -K - "$@"
 }
 
 # arr_get <url> <api-key> [attempts] -- echo the response body, rc 1 once the

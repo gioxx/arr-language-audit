@@ -5,8 +5,8 @@ Date: 2026-09-05 · Baseline: `main` @ `3c673b0` · Branch: `perf/deep-audit-har
 Five independent reviews were run over every source file (security, correctness,
 maintainability, performance, test strategy). Findings marked **[repro]** were
 reproduced by running code, not inferred. This document is the deduplicated,
-severity-ranked result; the implementation plan derived from it is in
-`tasks/todo.md`.
+severity-ranked result; the implementation decisions derived from it are recorded in §7. The later
+[PR follow-up audit](2026-09-05-pr-follow-up.md) covers the hardened branch.
 
 Scope of the codebase: `arr-language-audit.sh` (orchestrator, 623 lines),
 `scan/find-missing-italian-audio.sh` (phase 1, 547), `verify/verify-audio-language.sh`

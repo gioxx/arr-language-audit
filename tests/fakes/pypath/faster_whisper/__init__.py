@@ -1,9 +1,9 @@
 """Fake faster-whisper.
 
 Importable in place of the real package (see `pythonpath` in pyproject.toml and
-PYTHONPATH for the launcher e2e tests). It never decodes audio: it reads the
-"FAKEWAV:<media path>" marker the ffmpeg shim writes and answers from a JSON
-script, so a test says what language a given media file "is".
+PYTHONPATH for the launcher e2e tests). Its decoder reads the waveform and
+"FAKEWAV:<media path>" marker the ffmpeg shim writes; detection accepts only
+decoded audio and answers from a JSON script.
 
     FAKE_WHISPER_SCRIPT   path to a JSON file:
         {"<media path>": ["it", 0.97], "<other>": "RAISE", "*": ["en", 0.9]}
@@ -22,6 +22,8 @@ from __future__ import annotations
 import json
 import os
 from typing import ClassVar
+
+from .audio import DecodedAudio
 
 MARKER = b"FAKEWAV:"
 DEFAULT_RULE = ["en", 0.9]
@@ -42,7 +44,7 @@ def _source_of(wav_path) -> str:
     marker = data.rfind(MARKER)
     if marker < 0:
         return ""
-    return data[marker + len(MARKER):].decode("utf-8", "replace").strip()
+    return data[marker + len(MARKER):].decode("utf-8", "replace").removesuffix("\n")
 
 
 def _script() -> dict:
@@ -73,8 +75,7 @@ class WhisperModel:
         self.kwargs = kw
         WhisperModel.instances.append(self)
 
-    def _resolve(self, wav_path):
-        source = _source_of(wav_path)
+    def _resolve(self, source):
         WhisperModel.calls.append(source)
         rule = _rule_for(source)
         if rule == "RAISE":
@@ -83,7 +84,7 @@ class WhisperModel:
 
     def transcribe(self, wav_path, **kw):
         WhisperModel.transcribe_calls.append(wav_path)
-        language, probability = self._resolve(wav_path)
+        language, probability = self._resolve(_source_of(wav_path))
 
         def _segments():
             # Nothing may consume these: decoding segments is the slow path the
@@ -93,19 +94,22 @@ class WhisperModel:
 
         return _segments(), _Info(language, probability)
 
-    def detect_language(
+    def detect_language(  # noqa: PLR0917 - mirrors the upstream public API
         self,
         audio=None,
+        features=None,
         vad_filter=False,
+        vad_parameters=None,
         language_detection_segments=1,
         language_detection_threshold=0.5,
-        **kw,
     ):
+        if not isinstance(audio, DecodedAudio):
+            raise TypeError("detect_language requires a decoded waveform, not a path")
         WhisperModel.detect_calls.append({
             "audio": audio,
             "vad_filter": vad_filter,
             "language_detection_segments": language_detection_segments,
             "language_detection_threshold": language_detection_threshold,
         })
-        language, probability = self._resolve(audio)
+        language, probability = self._resolve(audio.source)
         return language, probability, []

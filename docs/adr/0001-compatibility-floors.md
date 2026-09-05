@@ -8,14 +8,15 @@
 ## Context
 
 The README promises Linux and macOS, and phase 1 is the kind of thing an
-operator runs on whatever box already talks to Radarr and Sonarr. A stock macOS
-install is therefore a first-class target, and it ships:
+operator runs on whatever box already talks to Radarr and Sonarr. The macOS system shell is therefore a first-class target:
 
-- `/bin/bash` at **3.2.57** — Apple has not shipped a GPLv3 bash and will not.
+- `/bin/bash` at **3.2.57** in the development environment.
   Homebrew's bash 5 is on some machines, but `sudo`, a `PATH` without
   `/opt/homebrew/bin`, or a LaunchAgent all land back on 3.2.
-- a system **Python 3.9** — the interpreter phase 2 falls back to when there is
-  no `verify/venv` and no `PYTHON_BIN`.
+- **Python 3.9** is the compatibility floor exercised by this project.
+  Apple's `/usr/bin/python3` is associated with Xcode/Command Line Tools, not a
+  guarantee of a complete, preinstalled phase 2 environment. See the
+  [Python macOS documentation](https://docs.python.org/3/using/mac.html).
 
 Without a stated floor these surface as bug reports: `mapfile: command not
 found` from phase 1, or a `TypeError` from a 3.10-only annotation halfway
@@ -61,6 +62,5 @@ builtins that predate 1.6, so the floor is a support statement, not a gate.
   actually runs would depend on the machine, so a bug reproduces on one box and
   not on another.
 - **Python 3.11 floor (walrus everywhere, `tomllib`, better error messages).**
-  Rejected: it would force every macOS user into a venv before phase 2 can run
-  at all, which is exactly the friction the launcher's fallback chain exists to
-  avoid.
+  Rejected: it would exclude otherwise usable older Python environments;
+  interpreter availability and dependency installation are checked separately.

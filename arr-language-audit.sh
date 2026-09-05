@@ -277,6 +277,11 @@ probe_app() {
         echo "UNREACHABLE ($url) -- check URL / API key / that it is running"
         return 1
     fi
+    if ! jq -e 'type == "object" and (.version | type == "string" and length > 0)' \
+        >/dev/null 2>&1 <<< "$body"; then
+        echo "INVALID RESPONSE ($url) -- expected Radarr/Sonarr system status"
+        return 1
+    fi
     ver=$(jq -r '.version // "?"' <<< "$body" 2>/dev/null)
     inst=$(jq -r '.instanceName // .appName // "?"' <<< "$body" 2>/dev/null)
     strip_cr ver
@@ -402,8 +407,9 @@ run_preflight() {
     fi
     # Back to set-but-empty for the four the menu reads: they are referenced
     # under `set -u` from here on, and the unset above may have removed them.
-    RADARR_URL="${RADARR_URL:-}" ; RADARR_API_KEY="${RADARR_API_KEY:-}"
-    SONARR_URL="${SONARR_URL:-}" ; SONARR_API_KEY="${SONARR_API_KEY:-}"
+    # Environment-only configurations need the same URL normalization as .env.
+    RADARR_URL="$(normalize_url "${RADARR_URL:-}")" ; RADARR_API_KEY="${RADARR_API_KEY:-}"
+    SONARR_URL="$(normalize_url "${SONARR_URL:-}")" ; SONARR_API_KEY="${SONARR_API_KEY:-}"
     SKIP_RADARR="${SKIP_RADARR:-false}"
     SKIP_SONARR="${SKIP_SONARR:-false}"
 
@@ -513,6 +519,7 @@ action_scan() {
         *) err "phase 1 exited with an error." ;;
     esac
     pause
+    return "$rc"
 }
 
 action_verify() {
@@ -521,7 +528,7 @@ action_verify() {
   $CSV
 
 Run 'Scan library (phase 1)' first."
-        return
+        return 1
     fi
 
     if [[ "$PHASE2_READY" != "true" ]]; then
@@ -534,7 +541,7 @@ verify/venv and installs verify/requirements.txt, with your confirmation.
 Or install it yourself -- this is what the launcher reports:
 
 $PHASE2_HINT"
-        return
+        return 1
     fi
 
     local model
@@ -543,7 +550,7 @@ $PHASE2_HINT"
         tiny   "fastest, least accurate" \
         base   "fast" \
         medium "most accurate, slowest") || return
-    [[ -z "$model" ]] && return   # cancelled
+    [[ -z "$model" ]] && return 1   # cancelled
 
     local limit
     limit=$(ask_input "Process only the first N files (blank = all, for a quick test):" "") || return
@@ -567,6 +574,7 @@ $PHASE2_HINT"
         *) err "phase 2 exited with an error." ;;
     esac
     pause
+    return "$rc"
 }
 
 action_setup_phase2() {
@@ -590,9 +598,9 @@ action_setup_phase2() {
     log ""
     if [[ ! -x "$VENV_DIR/bin/python" ]]; then
         log "Creating virtual environment: $VENV_DIR"
-        if ! python3 -m venv "$VENV_DIR"; then
+        if ! run_without_keys python3 -I -m venv "$VENV_DIR"; then
             local pv
-            pv=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
+            pv=$(run_without_keys python3 -I -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
             info_box "Could not create the venv (ensurepip / python3-venv missing).
 On Debian/Ubuntu install it first, then run this again:
 
@@ -604,10 +612,10 @@ On Debian/Ubuntu install it first, then run this again:
     # A pip that cannot upgrade itself is not a reason to stop: the pinned
     # requirements install perfectly well with the pip the venv already has.
     log "Installing the phase 2 requirements into the venv..."
-    "$VENV_DIR/bin/pip" install --upgrade pip \
+    run_without_keys "$VENV_DIR/bin/pip" install --upgrade pip \
         || warn "could not upgrade pip inside the venv; continuing with the one it has."
     local irc=0
-    "$VENV_DIR/bin/pip" install -r "$REQUIREMENTS" || irc=$?
+    run_without_keys "$VENV_DIR/bin/pip" install -r "$REQUIREMENTS" || irc=$?
 
     run_preflight
     if [[ "$irc" -eq 0 && "$PHASE2_READY" == "true" ]]; then
@@ -640,13 +648,18 @@ phase2_python() {
 
 action_report() {
     require_phase2_csv || return 0   # explained, not a failure
-    local py
-    py=$(phase2_python) || { pause; return; }
+    local py rc=0
+    py=$(phase2_python) || { pause; return 1; }
 
     run_without_keys "$py" "$REPORT_PY" "$VERIFIED_CSV" \
-        || err "report generation failed."
-    log "HTML report: $HTML"
+        || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        log "HTML report: $HTML"
+    else
+        err "report generation failed."
+    fi
     pause
+    return "$rc"
 }
 
 action_serve() {
@@ -675,10 +688,10 @@ action_serve() {
 
 action_pipeline() {
     ask_yesno "Full pipeline: scan -> verify -> HTML report. Continue?" yes || return
-    action_scan
-    [[ -f "$CSV" ]] || { info_box "Phase 1 produced no CSV; stopping the pipeline."; return; }
-    action_verify
-    [[ -f "$VERIFIED_CSV" ]] || { info_box "Phase 2 produced no CSV; stopping the pipeline."; return; }
+    action_scan || return $?
+    [[ -f "$CSV" ]] || { info_box "Phase 1 produced no CSV; stopping the pipeline."; return 1; }
+    action_verify || return $?
+    [[ -f "$VERIFIED_CSV" ]] || { info_box "Phase 2 produced no CSV; stopping the pipeline."; return 1; }
     action_report
 }
 
@@ -755,10 +768,16 @@ be undone." no || return
 }
 
 action_configure() {
-    if [[ ! -f "$ENV_FILE" ]]; then
-        cp "$ROOT/.env.example" "$ENV_FILE"
-        chmod 600 "$ENV_FILE"
-        log "Created $ENV_FILE from .env.example."
+    local config_file="${ALA_DOTENV_FILE:-}"
+    if [[ -z "$config_file" ]]; then
+        config_file="$(find_dotenv)" || config_file="$ENV_FILE"
+    fi
+    if [[ ! -f "$config_file" ]]; then
+        if ! (umask 077; cp "$ROOT/.env.example" "$config_file" && chmod 600 "$config_file"); then
+            err "could not create configuration file: $config_file"
+            return 1
+        fi
+        log "Created $config_file from .env.example."
     fi
     local editor="${EDITOR:-${VISUAL:-}}"
     if [[ -z "$editor" ]]; then
@@ -766,10 +785,10 @@ action_configure() {
         for e in nano vim vi; do have "$e" && { editor="$e"; break; }; done
     fi
     if [[ -n "$editor" ]] && have "$editor"; then
-        "$editor" "$ENV_FILE"
+        "$editor" "$config_file"
     else
         info_box "No editor found (set \$EDITOR). Edit this file by hand:
-  $ENV_FILE"
+  $config_file"
     fi
     log "Re-checking Radarr/Sonarr..."
     run_preflight

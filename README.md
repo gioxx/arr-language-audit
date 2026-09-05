@@ -79,9 +79,10 @@ arr-language-audit/
 **Fase 1:** `bash` ≥ 3.2, `curl`, `jq` ≥ 1.6 e accesso di rete alle API di
 Radarr/Sonarr.
 
-I minimi sono scelti perché il toolkit deve girare su un macOS appena
-installato: `bash` ≥ 3.2 è la `/bin/bash` che Apple distribuisce e Python ≥ 3.9
-è l'interprete di sistema. Vedi
+Bash 3.2 mantiene la compatibilità con `/bin/bash` di macOS. Python 3.9 è
+il minimo supportato dal codice: non implica che Python e tutte le dipendenze
+siano già installati. Il Python Apple dipende dagli strumenti Xcode/Command
+Line Tools; per la fase 2 serve un interprete utilizzabile con le dipendenze. Vedi
 [docs/adr/0001-compatibility-floors.md](docs/adr/0001-compatibility-floors.md).
 
 **Fase 2:** tutto quanto sopra, più:
@@ -143,7 +144,9 @@ menu numerato anche con `whiptail` installato. Tutti gli output finiscono in
 
 Se la fase 1 esce con 2 (un'app abilitata non raggiunta) o la fase 2 esce con 3
 (nessun file verificato con successo), l'orchestratore lo dice a schermo e
-lascia intatto il report precedente invece di far passare l'errore in silenzio.
+lascia intatto il report HTML precedente invece di far passare l'errore in silenzio.
+La pipeline si ferma anche quando una fase viene annullata o restituisce un
+errore; non usa i CSV precedenti per completare le fasi successive.
 Le API key non vengono mai esportate: `ffmpeg`, whisper e il report girano con
 `RADARR_API_KEY` / `SONARR_API_KEY` rimosse dall'ambiente.
 
@@ -179,17 +182,17 @@ Output: `reports/missing-italian-audio.csv` con colonne
 `App,Title,Year,Episode,AudioLanguages,Path`. Se non ci sono risultati il file
 viene comunque scritto, con la sola riga di intestazione.
 
-Il report viene costruito in `<OUTPUT_CSV>.tmp.<pid>` e spostato al suo posto
-alla fine, così nessun lettore vede un file parziale. Essendo una rinomina, il
-report prende i permessi di un file nuovo, non quelli di quello che sostituisce.
+Il report viene costruito in `<OUTPUT_CSV>.tmp.<random>` e spostato al suo posto
+alla fine, così nessun lettore vede un file parziale. Il file temporaneo è
+creato con `mktemp` e permessi `0600`, mantenuti anche dopo la sostituzione.
 
 Codici di uscita:
 
 | Codice | Significato |
 |--------|-------------|
 | `0`    | scansione completata (con o senza risultati); il report è stato sostituito |
-| `1`    | dipendenza mancante (`jq` / `curl`) oppure argomenti errati |
-| `2`    | un'app abilitata non è stata elencata dopo i retry: il file temporaneo viene scartato, quindi un report precedente sopravvive intatto |
+| `1`    | dipendenza mancante (`jq` / `curl`), argomenti errati o destinazione di output rifiutata/non scrivibile |
+| `2`    | una richiesta API (anche dettagli episodio/file) fallisce dopo i retry o restituisce un payload invalido; CSV e cache precedenti restano intatti |
 
 Tag non aggiornati? Forza prima Radarr/Sonarr a rileggere ogni file dal disco:
 
@@ -212,11 +215,16 @@ file incluso nella risposta). Accanto al CSV viene scritto un file
 serie ha prodotto. Al run successivo una serie con firma invariata non viene
 ri-scaricata: le sue righe vengono riemesse dalla cache.
 
-La cache è alla versione 2: porta un blocco `__meta` con la versione dello
-schema e la regex italiana con cui è stata costruita. Una cache scritta da
-un'altra versione, o con un'altra regex, viene scartata e ricostruita — così
-cambiare `ITALIAN_REGEX` non lascia in giro verdetti calcolati con la regex
-precedente. Per forzare una scansione completa:
+La cache è alla versione 3: `__meta` registra schema, regex italiana e URL
+Sonarr. Ogni serie include anche titolo, percorso, ID TVDB, data di aggiunta e percorsi
+originali di tutti i media (anche quelli con tag italiano):
+cambiare istanza, rinominare o sostituire una serie invalida le vecchie righe.
+Le destinazioni di CSV e cache vengono confrontate con i percorsi dei media
+prima della pubblicazione, anche nei run da cache. Cache precedenti o
+malformate vengono ricostruite; statistiche assenti non
+producono cache hit. CSV e cache vengono pubblicati solo dopo una scansione
+completa: anche errori nei dettagli degli episodi o risposte JSON non valide
+fanno uscire con `2`, mantenendo i report precedenti. Per forzare una scansione completa:
 
 ```bash
 ./scan/find-missing-italian-audio.sh --refresh      # oppure REFRESH=true
@@ -257,6 +265,16 @@ python3 -m venv verify/venv
 "verify/venv/bin/pip" install -r verify/requirements.txt
 ./verify/verify-audio-language.sh          # rileva e usa verify/venv automaticamente
 ```
+
+I CSV vengono validati prima di sostituire qualsiasi output. L'output non
+può coincidere con il CSV di input o con un media elencato, nemmeno tramite
+link simbolico o hardlink; i percorsi conservano gli spazi nei nomi dei file.
+Le nuove firme `FileMtime` mantengono la precisione subsecondo del filesystem;
+le firme precedenti restano confrontabili con la precisione originale.
+Su Ctrl-C o spazio insufficiente rilevato dal worker, i vecchi verdetti ancora
+in attesa di verifica vengono conservati. Un arresto forzato (`SIGKILL`), la
+perdita di alimentazione o un guasto I/O durante l'append restano fuori da
+questa garanzia.
 
 L'esecuzione è riprendibile: interrompila quando vuoi e rilanciala — i file già
 verificati nel CSV di output vengono riusati. Le righe sono accoppiate su
@@ -301,10 +319,14 @@ Codici di uscita del worker:
 | Codice | Significato |
 |--------|-------------|
 | `0`    | terminato (anche quando non c'era niente di nuovo da verificare) |
-| `1`    | problema di configurazione, input, percorso di output, spazio disco, oppure il modello non si è caricato (il CSV precedente resta intatto) |
+| `1`    | problema di configurazione, input, percorso di output, spazio disco, oppure il modello non si è caricato |
 | `2`    | errore d'uso: flag sconosciuta o valore non valido (argparse) |
 | `3`    | ogni file che questo run ha provato a verificare è andato in errore |
 | `130`  | interrotto (Ctrl-C); il CSV scritto fino a quel punto resta valido |
+
+Gli errori prima della pubblicazione lasciano il CSV precedente intatto.
+Durante il lavoro, un arresto controllato conserva risultati completati e
+verdetti precedenti ancora pendenti, come descritto sopra.
 
 Il launcher restituisce `1` per i suoi errori d'uso e per i controlli pre-volo
 falliti, e per il resto lascia passare invariati i codici del worker. Il `2`
@@ -318,8 +340,15 @@ Il CSV è l'output canonico. `verify/report.py` lo trasforma in un singolo file
 HTML autonomo (CSS + JS inline, nessuna risorsa esterna, funziona offline) più
 facile da navigare: chip di filtro per verdetto, ricerca testuale su
 titolo/percorso, colonne ordinabili, barra di riepilogo e pulsanti "copy path" /
-"copy visible paths" per costruire una lista di file da riscaricare. Solo
+"Copy filtered paths" per costruire una lista di file da riscaricare. Solo
 libreria standard, nessuna dipendenza aggiuntiva.
+
+Filtri e ordinamento sono utilizzabili anche da tastiera. La copia include
+tutti i risultati del filtro, anche quelli oltre il limite visualizzato, ed
+elimina percorsi duplicati. Se il browser nega gli appunti (ad esempio via
+HTTP in LAN), mostra il testo selezionato per copiarlo manualmente. L'HTML è
+sostituito atomicamente; CSV malformati e output che coincidono con input o
+media elencati vengono rifiutati.
 
 Per restare leggero su librerie grandi la tabella si ferma a 2000 righe e
 mostra un pulsante *Show all N rows* per renderle tutte.
@@ -362,7 +391,8 @@ controllo del token con `--no-token` se sai che la porta è al sicuro.
 
 Uscita `0` quando l'HTML è stato scritto (e, con `--serve`, il server è stato
 fermato correttamente), `1` se il CSV di input non c'è o non è leggibile, o se
-la porta richiesta non è utilizzabile.
+la porta richiesta non è utilizzabile. Argomenti errati (inclusa una porta
+fuori da `0..65535`) restituiscono `2`, prima di scrivere l'HTML.
 
 ## Configurazione
 
@@ -395,7 +425,11 @@ conseguenza:
 
 **Precedenza:** flag da riga di comando > variabile d'ambiente già impostata e
 non vuota > `.env` > default. Quindi `LIMIT=5 ./verify/verify-audio-language.sh`
-batte quello che dice `.env`, e `--refresh` batte entrambi.
+batte quello che dice `.env`, e `--refresh` batte entrambi. *Reconfigure*
+modifica il file attivo, incluso `ALA_DOTENV_FILE` o il fallback `scan/.env`.
+Le chiamate API usano `curl -q`: `.curlrc` non viene letto, per evitare URL o
+redirect aggiuntivi che ricevano la chiave. Le variabili standard curl per
+proxy e certificati restano utilizzabili.
 
 ### Variabili d'ambiente — fase 1
 
@@ -414,7 +448,10 @@ batte quello che dice `.env`, e `--refresh` batte entrambi.
 
 Il primo argomento posizionale sovrascrive il percorso del CSV di output:
 `./scan/find-missing-italian-audio.sh /tmp/report.csv`. Il flag `--refresh`
-ignora la cache Sonarr per quel run.
+ignora la cache Sonarr per quel run. `RESCAN_TIMEOUT` accetta da `0` a
+`999999999` secondi; `RESCAN_POLL_INTERVAL` da `1` a `999999999`. Le richieste
+HTTP di polling dello stato e le pause rispettano il tempo residuo; il POST
+iniziale che avvia il rescan usa invece `ARR_TIMEOUT`.
 
 ### Variabili d'ambiente — fase 2
 
@@ -477,7 +514,7 @@ probabilità di rilevamento lingua del modello (`0.00`–`1.00`).
   default non è italiano", è probabilmente corretta, ma è bene saperlo.
 - Il rilevamento gira sull'API `detect_language` di faster-whisper con il
   filtro VAD attivo e fino a **due** finestre: la seconda viene provata quando
-  la prima resta sotto la soglia di rilevamento, che è ciò che serve a un
+  la prima resta sotto la soglia di rilevamento (`0.5`), che è ciò che serve a un
   campione che si apre su musica o su un cartello silenzioso. Su una
   `faster-whisper` troppo vecchia per quel metodo si ricade su `transcribe()`.
   Film che si aprono con un lungo tratto senza dialoghi, o che mescolano
@@ -491,21 +528,32 @@ probabilità di rilevamento lingua del modello (`0.00`–`1.00`).
 Servono `bats-core` (le librerie `bats-support` / `bats-assert` sono già
 incluse in `tests/bats/lib`), `shellcheck` e
 [`uv`](https://github.com/astral-sh/uv) — `ruff` e `pytest` girano via `uvx`,
-così nel progetto non viene installato nulla.
+senza installare pacchetti Python nel progetto. I test del report richiedono
+anche Node.js ≥ 22 e npm: `npm ci` installa solo dipendenze di test in
+`tests/report-ui/node_modules`, escluse da Git.
 
 ```bash
-./scripts/test.sh all      # lint, poi pytest, poi bats
+./scripts/test.sh all      # lint, pytest, bats, report e contratto audio reale
 ./scripts/test.sh lint     # shellcheck -S warning sugli script + ruff check .
 ./scripts/test.sh py       # pytest su 3.12 e sul floor 3.9
 ./scripts/test.sh bats     # la suite bats, forzata su /bin/bash
+./scripts/test.sh ui       # interazioni del report in jsdom, senza browser
+./scripts/test.sh contract # decoder/API faster-whisper reali, senza pesi del modello
 ```
 
-La CI (`.github/workflows/ci.yml`) copre le stesse tre fasi: il job *lint* su
+La CI (`.github/workflows/ci.yml`) copre le stesse cinque fasi: il job *lint* su
 `ubuntu-latest` richiama `scripts/test.sh lint`; i job *bats* (`ubuntu-latest`
 e `macos-latest`) e *pytest* (matrice `ubuntu-latest` × `macos-latest` per
 Python `3.9`, `3.12` e `3.13`) lanciano i comandi direttamente, perché hanno
 bisogno della matrice di sistemi e interpreti; lo script locale copre `3.9` e
-`3.12`, la CI aggiunge `3.13`.
+`3.12`, la CI aggiunge `3.13`. Il job `report-ui` su Linux esegue
+`scripts/test.sh ui`: filtri, ordinamento, copia, errori degli appunti e limite
+di righe sono verificati eseguendo il JavaScript generato. Node.js non è
+necessario per usare il toolkit o visualizzare il report. Il job
+`whisper-contract` su Linux (Python 3.9 e 3.12) installa la dipendenza fissata
+in `verify/requirements.txt` e verifica decoder PyAV, array float32 a 16 kHz e
+API di rilevamento reali, senza scaricare pesi. Il test sostituisce solo VAD e
+output neurale: non misura l'accuratezza del riconoscimento linguistico.
 
 **Il gate su bash 3.2.** Sia in locale sia in CI la suite bats gira con
 `PATH="/bin:/usr/bin:$PATH"` e `BASH_UNDER_TEST=/bin/bash`, così su macOS gli
@@ -514,12 +562,13 @@ Homebrew; un test asserisce di essere davvero su bash 3 quando gira su macOS, e
 un altro cerca nei sorgenti i costrutti che richiedono bash 4 (`mapfile`,
 `declare -A`, `${var,,}`, …) e fallisce se ne trova.
 
-**Come funzionano i fake.** Nessun test tocca la rete, `ffmpeg` o whisper: la
-suite bats mette in testa al `PATH` degli shim per `curl`, `jq`, `ffmpeg`,
-`ffprobe`, `python3`, `df`, `uname`, `whiptail`, `apt` e un `recorder`
-generico, tutti pilotati da
-variabili d'ambiente, e affianca un finto Radarr/Sonarr HTTP che risponde dai
-fixture JSON in `tests/bats/fixtures`. Sul lato Python, un pacchetto
+**Come funzionano i fake.** I test non contattano servizi esterni né modelli
+reali; i server finti usano solo la rete locale di loopback. Il primo setup
+di uv/npm può scaricare gli strumenti di test. La suite bats usa `curl` e
+`jq` reali contro un finto Radarr/Sonarr HTTP, con fixture JSON in
+`tests/bats/fixtures`. Gli shim di `ffmpeg`, `ffprobe`, `python3`, `df`,
+`uname`, `whiptail`, `apt` e `recorder` sono pilotati da variabili d'ambiente.
+Nella suite Python standard, un pacchetto
 `faster_whisper` stub su `PYTHONPATH` legge il marcatore che lo shim di
 `ffmpeg` ha scritto nel "campione" e risponde da uno script JSON, così un test
 dichiara che lingua "è" un dato file senza decodificare un byte di audio.
@@ -622,9 +671,10 @@ arr-language-audit/
 **Phase 1:** `bash` ≥ 3.2, `curl`, `jq` ≥ 1.6, and network access to your
 Radarr/Sonarr API.
 
-Those floors exist because the toolkit has to run on a stock macOS install:
-`bash` ≥ 3.2 is the `/bin/bash` Apple ships, and Python ≥ 3.9 is its system
-interpreter. See
+Bash 3.2 keeps compatibility with macOS `/bin/bash`. Python 3.9 is the
+minimum supported by the code, not a promise that Python or its dependencies
+are preinstalled. Apple's Python depends on Xcode/Command Line Tools; phase 2
+needs a usable interpreter with the required packages. See
 [docs/adr/0001-compatibility-floors.md](docs/adr/0001-compatibility-floors.md).
 
 **Phase 2:** everything above plus:
@@ -685,8 +735,9 @@ menu even when `whiptail` is installed. All output lands in `reports/`.
 
 When phase 1 exits 2 (an enabled app could not be reached) or phase 2 exits 3
 (no file could be verified), the orchestrator says so on screen and leaves the
-previous report alone rather than letting the failure pass unnoticed. The API
-keys are never exported: `ffmpeg`, whisper and the report run with
+previous HTML report alone rather than letting the failure pass unnoticed.
+The pipeline also stops after a failed or cancelled stage, without using older
+CSV files for subsequent stages. API keys are never exported: `ffmpeg`, whisper and the report run with
 `RADARR_API_KEY` / `SONARR_API_KEY` removed from their environment.
 
 The sections below document each script for running them by hand. You no
@@ -721,17 +772,17 @@ Output: `reports/missing-italian-audio.csv` with columns
 `App,Title,Year,Episode,AudioLanguages,Path`. With no findings the file is
 still written, with its header row and nothing else.
 
-The report is built in `<OUTPUT_CSV>.tmp.<pid>` and moved into place at the
-end, so a reader never sees a partial file. Being a rename, it gives the report
-a new file's permissions rather than those of the one it replaces.
+The report is built in `<OUTPUT_CSV>.tmp.<random>` and moved into place at the
+end, so a reader never sees a partial file. `mktemp` creates the temporary
+file with private `0600` permissions, retained when the report is replaced.
 
 Exit codes:
 
 | Code  | Meaning |
 |-------|---------|
 | `0`   | the scan completed (with or without findings); the report was replaced |
-| `1`   | missing dependency (`jq` / `curl`) or bad arguments |
-| `2`   | an enabled app could not be listed after retries: the temporary file is discarded, so a previous report survives untouched |
+| `1`   | missing dependency (`jq` / `curl`), bad arguments or refused/unwritable output destination |
+| `2`   | an API request (including episode/file details) fails after retries or returns an invalid payload; previous CSV and cache stay intact |
 
 Stale tags? Force Radarr/Sonarr to re-read every file from disk first:
 
@@ -753,11 +804,15 @@ on disk as reported by Sonarr) and the rows that series produced. On the next
 run a series whose signature is unchanged is not re-fetched: its rows are
 re-emitted from the cache.
 
-The cache is at version 2: it carries a `__meta` block with its schema version
-and the Italian regex it was built with. A cache written by another version, or
-with another regex, is discarded and rebuilt — so changing `ITALIAN_REGEX` does
-not leave rows behind that were computed with the previous one. Force a full
-re-scan with:
+The cache is at version 3: `__meta` records the schema, Italian regex and
+Sonarr URL. Each series also records its title, path, TVDB ID, addition date and original
+paths of all media (including Italian-tagged files). Switching instances,
+renaming or replacing a series invalidates old rows. Output and cache
+destinations are checked against media paths before publication, including
+on cached runs. Older or malformed caches are rebuilt; absent statistics never produce
+a cache hit. CSV and cache are published only after a complete scan: episode
+detail failures and invalid JSON responses also exit `2`, preserving previous
+reports. Force a full re-scan with:
 
 ```bash
 ./scan/find-missing-italian-audio.sh --refresh      # or REFRESH=true
@@ -804,6 +859,14 @@ verified in the output CSV are reused. Rows are matched on `(path, episode)`,
 not on the path alone: a single file holding a double episode is two Sonarr
 rows sharing one path, and each of them keeps its own verdict.
 
+CSV inputs are validated before output replacement. The output cannot alias
+the input CSV or listed media, including through symlinks or hardlinks; file
+paths retain filename whitespace. New `FileMtime` signatures preserve the
+filesystem's subsecond precision, while older signatures keep their original
+precision. Ctrl-C and disk-space aborts detected by the worker retain previous
+verdicts still waiting for verification. Forced termination (`SIGKILL`), power
+loss and I/O failures during append are outside that guarantee.
+
 A file is **re-verified automatically** when its size or mtime changed since
 the last run (you replaced, re-encoded or re-downloaded it), even though its
 path is unchanged. Rows written by older versions have no
@@ -839,10 +902,14 @@ Worker exit codes:
 | Code  | Meaning |
 |-------|---------|
 | `0`   | finished (including "nothing new to verify") |
-| `1`   | configuration, input, output path or disk-space problem, or the model could not be loaded (the previous output CSV is untouched) |
+| `1`   | configuration, input, output path or disk-space problem, or the model could not be loaded |
 | `2`   | usage error: an unknown flag or a bad value (argparse) |
 | `3`   | every file this run tried to verify errored |
 | `130` | interrupted (Ctrl-C); the CSV written so far stays valid |
+
+Errors before publication leave the previous CSV untouched. During processing,
+a controlled abort preserves completed results and pending previous verdicts,
+as described above.
 
 The launcher returns `1` for its own usage errors and for a failed pre-flight,
 and otherwise passes the worker's codes through unchanged. `2` always comes from
@@ -855,11 +922,17 @@ The CSV is the canonical output. `verify/report.py` turns it into a single
 self-contained HTML file (inline CSS + JS, no external resources, works
 offline) that is easier to browse: filter chips per verdict, free-text
 search on title/path, sortable columns, a summary bar, and "copy path" /
-"copy visible paths" buttons to build a redownload list. Standard library
+"Copy filtered paths" buttons to build a redownload list. Standard library
 only, no extra dependencies.
 
 To stay light on big libraries the table stops at 2000 rows and offers a
 *Show all N rows* button to render the rest.
+
+Filters and sorting also work with the keyboard. Copy includes all filtered
+results, including those beyond the display cap, with duplicate paths removed.
+If the browser denies clipboard access (for example over LAN HTTP), selected
+text is shown for manual copying. HTML replacement is atomic; malformed CSV
+and output paths aliasing the input or listed media are refused.
 
 ```bash
 ./verify/report.py                       # reads reports/verified-language-results.csv
@@ -898,7 +971,8 @@ token check entirely with `--no-token` if you know the port is safe.
 
 It exits `0` once the HTML is written (and, with `--serve`, the server was
 stopped cleanly), `1` when the input CSV is missing or unreadable, or the
-requested port cannot be bound.
+requested port cannot be bound. Invalid arguments (including a port outside
+`0..65535`) exit `2` before writing the HTML.
 
 ## Configuration
 
@@ -930,7 +1004,11 @@ Consequently:
 
 **Precedence:** command-line flag > an already-set, non-empty environment
 variable > `.env` > default. So `LIMIT=5 ./verify/verify-audio-language.sh`
-beats what `.env` says, and `--refresh` beats both.
+beats what `.env` says, and `--refresh` beats both. *Reconfigure* edits the
+active file, including `ALA_DOTENV_FILE` or the `scan/.env` fallback. API calls
+use `curl -q`, ignoring `.curlrc` so implicit extra URLs or redirects cannot
+receive the key. Standard curl environment variables for proxies and
+certificates remain available.
 
 ### Phase 1 environment variables
 
@@ -949,7 +1027,10 @@ beats what `.env` says, and `--refresh` beats both.
 
 The first positional argument overrides the output CSV path:
 `./scan/find-missing-italian-audio.sh /tmp/report.csv`. The `--refresh` flag
-ignores the Sonarr cache for that run.
+ignores the Sonarr cache for that run. `RESCAN_TIMEOUT` accepts `0` through
+`999999999` seconds and `RESCAN_POLL_INTERVAL` accepts `1` through `999999999`.
+Status-polling HTTP requests and sleeps respect the remaining timeout budget;
+the initial POST that queues the rescan uses `ARR_TIMEOUT` instead.
 
 ### Phase 2 environment variables
 
@@ -1011,7 +1092,7 @@ model's language-detection probability (`0.00`–`1.00`).
   Italian" is arguably correct, but worth knowing.
 - Detection runs through faster-whisper's `detect_language` API with the VAD
   filter on and up to **two** windows: the second is tried when the first comes
-  back under the detection threshold, which is what a sample opening on music
+  back under the detection threshold (`0.5`), which is what a sample opening on music
   or on a silent title card needs. On a `faster-whisper` too old for that
   method it falls back to `transcribe()`. Films that open with a long
   non-dialogue stretch, or that mix languages, can still fool it — adjust
@@ -1024,21 +1105,32 @@ model's language-detection probability (`0.00`–`1.00`).
 You need `bats-core` (the `bats-support` / `bats-assert` libraries are already
 vendored in `tests/bats/lib`), `shellcheck` and
 [`uv`](https://github.com/astral-sh/uv) — `ruff` and `pytest` run through
-`uvx`, so nothing is installed into the project.
+`uvx`, without installing Python packages into the project. Report tests also
+need Node.js ≥ 22 and npm; `npm ci` installs test-only dependencies under
+`tests/report-ui/node_modules`, ignored by Git.
 
 ```bash
-./scripts/test.sh all      # lint, then pytest, then bats
+./scripts/test.sh all      # lint, pytest, bats, report and real audio contract
 ./scripts/test.sh lint     # shellcheck -S warning over the scripts + ruff check .
 ./scripts/test.sh py       # pytest on 3.12 and on the 3.9 floor
 ./scripts/test.sh bats     # the bats suite, forced onto /bin/bash
+./scripts/test.sh ui       # report interactions in jsdom, without a browser
+./scripts/test.sh contract # real faster-whisper decoder/API, without model weights
 ```
 
-CI (`.github/workflows/ci.yml`) covers the same three stages: the *lint* job
+CI (`.github/workflows/ci.yml`) covers the same five stages: the *lint* job
 on `ubuntu-latest` calls `scripts/test.sh lint`; the *bats* job (`ubuntu-latest`
 and `macos-latest`) and the *pytest* job (`ubuntu-latest` × `macos-latest`
 matrix for Python `3.9`, `3.12` and `3.13`) run their commands inline because
 they need the OS and interpreter matrix; the local script covers `3.9` and
-`3.12`, CI adds `3.13`.
+`3.12`, CI adds `3.13`. The Linux `report-ui` job runs `scripts/test.sh ui`,
+executing the generated JavaScript to check filtering, sorting, copying,
+clipboard failures and the row cap. Node.js is not needed to use the toolkit
+or view the report. The Linux `whisper-contract` job (Python 3.9 and 3.12)
+installs the dependency pinned in `verify/requirements.txt`, testing the real
+PyAV decoder, 16 kHz float32 waveform and detection API without downloading
+weights. Only VAD decisions and neural outputs are stubbed; this does not
+measure language-recognition accuracy.
 
 **The bash 3.2 gate.** Locally and in CI the bats suite runs with
 `PATH="/bin:/usr/bin:$PATH"` and `BASH_UNDER_TEST=/bin/bash`, so on macOS the
@@ -1047,12 +1139,12 @@ asserts it really is on bash 3 when running on macOS, and another greps the
 sources for constructs that need bash 4 (`mapfile`, `declare -A`, `${var,,}`, …)
 and fails if it finds any.
 
-**How the fakes work.** No test touches the network, `ffmpeg` or whisper: the
-bats suite puts shims for `curl`, `jq`, `ffmpeg`, `ffprobe`, `python3`, `df`,
-`uname`, `whiptail`, `apt` and a generic `recorder` at the head of `PATH`, all
-driven purely by
-environment variables, next to a fake Radarr/Sonarr HTTP server answering from
-the JSON fixtures in `tests/bats/fixtures`. On the Python side, a stub
+**How the fakes work.** Tests do not contact external services or real
+models; fake servers use loopback networking only. Initial uv/npm setup may
+download the test tools. The bats suite uses real `curl` and `jq` against a
+fake Radarr/Sonarr HTTP server answering from `tests/bats/fixtures`. Shims for
+`ffmpeg`, `ffprobe`, `python3`, `df`, `uname`, `whiptail`, `apt` and `recorder`
+are controlled through environment variables. In the standard Python suite, a stub
 `faster_whisper` package on `PYTHONPATH` reads the marker the `ffmpeg` shim
 wrote into the "sample" and answers from a JSON script, so a test declares what
 language a given file "is" without decoding a byte of audio.

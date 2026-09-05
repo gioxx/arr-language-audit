@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from decimal import Decimal
 from pathlib import Path
 
 import audit_common
@@ -340,7 +341,8 @@ def test_e2e_fresh_run_writes_all_verdicts(tmp_path, shim_path, whisper_script,
     assert rows[0]["DetectedLanguage"] == "it"
     assert [r["DeclaredAudioLanguages"] for r in rows] == ["eng", "ita", "eng", "eng"]
     assert (rows[2]["FileSize"], rows[2]["FileMtime"]) == ("", "")
-    assert (rows[3]["FileSize"], rows[3]["FileMtime"]) == signature_of(broken)
+    assert rows[3]["FileSize"] == str(os.stat(broken).st_size)
+    assert Decimal(rows[3]["FileMtime"]) * 1_000_000_000 == os.stat(broken).st_mtime_ns
     assert "Errors this run:" in capsys.readouterr().err
 
 

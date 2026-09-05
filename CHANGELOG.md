@@ -10,6 +10,14 @@ Unreleased.
 
 ### Added
 
+- A contract test executes the pinned faster-whisper decoder, feature extractor
+  and detection method without model weights. `scripts/test.sh contract` and
+  Linux CI on Python 3.9/3.12 keep the fake-backed tests honest.
+
+- Report interaction tests execute the generated JavaScript in jsdom: keyboard
+  controls, filtering, sorting, clipboard failures and the large-report cap.
+  `scripts/test.sh ui` and a Linux CI job run the test-only Node.js environment.
+
 - `lib/common.sh`: one shared implementation of the `.env` loader, the logger,
   the `curl` wrapper for the Radarr/Sonarr API and the phase 2 interpreter
   discovery, used by all three shell entry points.
@@ -39,7 +47,7 @@ Unreleased.
 - `scan/find-missing-italian-audio.sh`: `RESCAN_POLL_INTERVAL` (default `5`)
   sets how often a queued rescan is polled.
 - Test suite and CI: bats-core for the shell scripts and pytest for the Python
-  modules, both hermetic; `scripts/test.sh {lint|py|bats|all}` is the single
+  modules, both hermetic; `scripts/test.sh {lint|py|bats|ui|contract|all}` is the single
   entry point locally, and `.github/workflows/ci.yml` runs lint through it and
   the two suites directly, on Linux and macOS, across Python 3.9, 3.12 and
   3.13.
@@ -63,12 +71,13 @@ Unreleased.
   single `jq` pass that emits CSV rows and cache entries directly, with a US
   (`\x1f`) field separator between jq and bash.
 - `scan/find-missing-italian-audio.sh`: the Sonarr cache is at schema
-  version 2 and carries a `__meta` block with its version and the Italian
-  regex it was built with; a cache from another version or regex is discarded
-  and rebuilt.
+  version 3: its metadata includes the source Sonarr URL and regex, and entries
+  include series identity and original media paths. Missing statistics or
+  malformed cache records force a refresh. Switching instances or renaming a
+  series can no longer reuse unrelated rows.
 - `scan/find-missing-italian-audio.sh`: the report is written to
-  `<OUTPUT_CSV>.tmp.<pid>` and renamed into place, so a reader never sees a
-  partial file — and the report takes a new file's permissions.
+  `<OUTPUT_CSV>.tmp.<random>` using `mktemp` and renamed into place, so a
+  reader never sees a partial file. Report and cache retain private `0600` modes.
 - `verify/verify_audio_language.py`: resume is keyed on `(path, episode)`
   rather than on the path alone, so a file holding a double episode keeps one
   verdict per row; an episode phase 1 relabels carries its verdict over, and
@@ -100,6 +109,30 @@ Unreleased.
 
 ### Fixed
 
+- The faster-whisper 1.2.1 detection API receives a decoded 16 kHz float32
+  waveform instead of a WAV filename. Passing the path directly failed with
+  the real package while the earlier fake silently accepted it.
+
+- Phase 1 treats failed episode/file requests and invalid response schemas as
+  incomplete scans, preserving previous reports and cache. Rescan status-polling
+  calls and sleeps use the remaining timeout; the initial POST uses
+  `ARR_TIMEOUT`. Decimal limits are validated.
+- The pipeline stops after a failed or cancelled stage. Preflight rejects
+  non-status HTTP responses; reconfiguration edits the active dotenv file;
+  report generation preserves its real exit status.
+- Worker CSV inputs and resume files are validated before publication; invalid
+  numbers, probabilities and detector results fail explicitly. Pending previous
+  verdicts survive controlled interrupts, including relabels deferred by LIMIT.
+  New file signatures preserve subsecond precision without inventing precision
+  for legacy results. Failed extractions immediately remove partial samples.
+- The report substitutes template placeholders once, preserving identical text
+  in titles and paths. Unknown verdicts named `__proto__` or `constructor` render
+  normally. Invalid CSV and port arguments fail before replacing HTML.
+- Report filters and sorting are keyboard-operable buttons with announced state.
+  Copy uses the current filter even during debounce, removes duplicate paths,
+  includes filtered rows beyond the display cap, and offers selected text for
+  manual copying if clipboard access is absent or denied.
+
 - `verify/report.py`: a CSV that the `csv` module cannot parse is reported
   with a clean `could not parse` message and exit 1 instead of a traceback.
 - `scan/find-missing-italian-audio.sh`: an empty `audioLanguages` value no
@@ -125,6 +158,14 @@ Unreleased.
   minutes to startup.
 
 ### Security
+
+- API requests ignore `.curlrc` to prevent extra destinations from inheriting
+  API keys; keys containing CR/LF are refused. Interpreter probes and setup
+  subprocesses run without Arr credentials, as do directly invoked media tools.
+- Temporary report paths are unpredictable; output guards reject destinations
+  aliasing input CSV or enumerated media, including symlinks, hardlinks and
+  filenames containing whitespace. HTML and initial worker snapshots are
+  published atomically, preserving prior output when preparation fails.
 
 - `verify/report.py`: every `<` inside the JSON embedded in the page is
   written as `\u003c`, so a title containing `<!--` or `<script` can neither

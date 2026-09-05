@@ -7,6 +7,7 @@ from __future__ import annotations
 import audit_common
 import faster_whisper
 import pytest
+from faster_whisper.audio import decode_audio
 
 
 def test_detect_language_returns_the_scripted_verdict(fake_wav, whisper_script):
@@ -15,7 +16,13 @@ def test_detect_language_returns_the_scripted_verdict(fake_wav, whisper_script):
 
     model = faster_whisper.WhisperModel("small", device="cpu", compute_type="int8")
 
-    assert model.detect_language(audio=wav) == ("it", 0.97, [])
+    assert model.detect_language(audio=decode_audio(wav)) == ("it", 0.97, [])
+
+
+def test_detection_fake_rejects_undecoded_paths(fake_wav):
+    model = faster_whisper.WhisperModel("small")
+    with pytest.raises(TypeError, match="decoded waveform"):
+        model.detect_language(audio=fake_wav("/media/x.mkv"))
 
 
 def test_transcribe_returns_the_scripted_verdict_without_decoding_segments(fake_wav, whisper_script):
@@ -37,7 +44,7 @@ def test_unscripted_media_falls_back_to_the_wildcard_rule(fake_wav, whisper_scri
 
     model = faster_whisper.WhisperModel("small")
 
-    assert model.detect_language(audio=wav) == ("en", 0.9, [])
+    assert model.detect_language(audio=decode_audio(wav)) == ("en", 0.9, [])
 
 
 def test_a_scripted_raise_propagates(fake_wav, whisper_script):
@@ -73,7 +80,7 @@ def test_a_scripted_null_language_is_returned_as_none(fake_wav, whisper_script):
 
     model = faster_whisper.WhisperModel("small")
 
-    assert model.detect_language(audio=wav) == (None, 0.0, [])
+    assert model.detect_language(audio=decode_audio(wav)) == (None, 0.0, [])
 
 
 def test_product_modules_import_on_floor():

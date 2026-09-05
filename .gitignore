@@ -22,6 +22,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+node_modules/
 
 # Leftover temp sample dirs, if TEMP_DIR points into the repo
 lang-check-*/

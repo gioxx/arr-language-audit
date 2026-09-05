@@ -330,7 +330,13 @@ check_disk_space() {
         return 1
     fi
 
-    if [[ "$avail_mb" -lt "$min_mb" ]]; then
+    # Compare normalized decimal strings: Bash interprets leading zeroes as
+    # octal and silently wraps large integers, either of which can let an
+    # insufficient-space run through this guard.
+    while [[ "$min_mb" == 0* && ${#min_mb} -gt 1 ]]; do min_mb="${min_mb#0}"; done
+    while [[ "$avail_mb" == 0* && ${#avail_mb} -gt 1 ]]; do avail_mb="${avail_mb#0}"; done
+    if [[ ${#avail_mb} -lt ${#min_mb} ||
+        ( ${#avail_mb} -eq ${#min_mb} && "$avail_mb" < "$min_mb" ) ]]; then
         err "Only ${avail_mb} MB free in '$dir', need at least ${min_mb} MB."
         err "Free up space, or set TEMP_DIR to a location with more room, e.g.:"
         err "    TEMP_DIR=/path/with/space ./verify/verify-audio-language.sh"
@@ -396,6 +402,10 @@ main() {
     parse_args "$@"
     check_only="$CHECK_ONLY"
 
+    # No phase 2 child needs credentials, including interpreter imports and
+    # dependency probes before the worker is launched. Clear export attributes
+    # before loading .env; values parsed there remain local to this shell.
+    unset RADARR_API_KEY SONARR_API_KEY
     load_config
 
     # Paths default to <repo>/reports/ so phase 1, phase 2 and the HTML report

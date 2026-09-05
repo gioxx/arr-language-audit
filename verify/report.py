@@ -46,9 +46,11 @@ import hmac
 import http.server
 import json
 import os
+import re
 import secrets
 import socket
 import sys
+import tempfile
 import threading
 from urllib.parse import parse_qs, urlparse
 
@@ -87,10 +89,21 @@ def read_rows(csv_path: str) -> list[dict]:
 
     try:
         with open(csv_path, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
+            reader = csv.DictReader(f, strict=True)
+            fields = reader.fieldnames or []
+            if not {"Path", "Verdict"}.issubset(fields) or len(fields) != len(set(fields)):
+                raise ReportError(
+                    f"invalid CSV header in {csv_path}: unique Path and Verdict columns required"
+                )
             # Normalise every row to exactly the columns we know about, so a
             # slightly older/newer CSV still renders without surprises.
-            return [{col: (r.get(col, "") or "").strip() for col in DISPLAY_COLUMNS} for r in reader]
+            rows = []
+            for row in reader:
+                if None in row or any(value is None for value in row.values()):
+                    raise ReportError(f"invalid CSV row at line {reader.line_num} in {csv_path}")
+                rows.append({col: (row.get(col, "") or "") if col == "Path"
+                             else (row.get(col, "") or "").strip() for col in DISPLAY_COLUMNS})
+            return rows
     except UnicodeDecodeError as e:
         raise ReportError(f"could not read {csv_path}: the file is not valid UTF-8 ({e})") from e
     except csv.Error as e:
@@ -161,6 +174,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     background: var(--bg); color: var(--fg); cursor: pointer; font-size: .85rem;
   }
   button:hover { border-color: var(--accent); }
+  button:focus-visible, input:focus-visible, textarea:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 3px;
+  }
+  th button { padding: 0; border: 0; font: inherit; font-weight: bold; }
+  #manualCopy { margin-bottom: 1rem; }
+  #manualCopy textarea { display: block; width: 100%; margin-top: .4rem; }
   .count { color: var(--muted); font-size: .85rem; }
 
   .wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
@@ -200,10 +219,16 @@ HTML_TEMPLATE = r"""<!doctype html>
 <div class="bar" id="chips"></div>
 
 <div class="tools" id="tools">
-  <input type="search" id="q" placeholder="Filter by title, path, episode, language...">
-  <button id="copyPaths">Copy visible paths</button>
+  <input type="search" id="q" aria-label="Filter report"
+         placeholder="Filter by title, path, episode, language...">
+  <button id="copyPaths">Copy filtered paths</button>
   <button id="showAll" hidden></button>
-  <span class="count" id="count"></span>
+  <span class="count" id="count" role="status"></span>
+</div>
+<p id="copyStatus" role="status"></p>
+<div id="manualCopy" hidden>
+  <label for="copyText">Copy these paths manually (Ctrl+C or Command+C):</label>
+  <textarea id="copyText" rows="5" readonly></textarea>
 </div>
 
 <div class="wrap">
@@ -233,7 +258,8 @@ document.getElementById("src").textContent = SRC;
 document.getElementById("gen").textContent = GEN;
 
 function verdictMeta(v) {
-  return VERDICTS[v] || {cls: "badge-warn", label: v || "(none)"};
+  return Object.prototype.hasOwnProperty.call(VERDICTS, v)
+    ? VERDICTS[v] : {cls: "badge-warn", label: v || "(none)"};
 }
 
 const COL_LABELS = {
@@ -270,8 +296,9 @@ const state = {
 
 // --- summary chips -------------------------------------------------------
 // Built node by node: nothing from the CSV is ever parsed as markup.
-function makeChip(cls, label, count) {
-  const c = document.createElement("span");
+function makeChip(cls, label, count, interactive = false) {
+  const c = document.createElement(interactive ? "button" : "span");
+  if (interactive) { c.type = "button"; c.setAttribute("aria-pressed", "true"); }
   c.className = cls;
   c.textContent = label + " ";
   const n = document.createElement("span");
@@ -281,7 +308,7 @@ function makeChip(cls, label, count) {
   return c;
 }
 
-const counts = {};
+const counts = Object.create(null);
 for (const r of DATA) counts[r.Verdict] = (counts[r.Verdict] || 0) + 1;
 
 const chips = document.getElementById("chips");
@@ -289,7 +316,7 @@ chips.appendChild(makeChip("chip", "Total", DATA.length));
 
 for (const v of Object.keys(counts).sort()) {
   const meta = verdictMeta(v);
-  const c = makeChip("chip " + meta.cls + " on", meta.label, counts[v]);
+  const c = makeChip("chip " + meta.cls + " on", meta.label, counts[v], true);
   c.dataset.verdict = v;
   chips.appendChild(c);
 }
@@ -300,6 +327,7 @@ chips.addEventListener("click", e => {
   const v = c.dataset.verdict;
   if (state.hidden.has(v)) { state.hidden.delete(v); c.classList.add("on"); c.classList.remove("off"); }
   else { state.hidden.add(v); c.classList.remove("on"); c.classList.add("off"); }
+  c.setAttribute("aria-pressed", String(!state.hidden.has(v)));
   render();
 });
 
@@ -307,16 +335,22 @@ chips.addEventListener("click", e => {
 const head = document.getElementById("head");
 for (const col of COLS) {
   const th = document.createElement("th");
-  th.textContent = col.label + " ";
+  th.scope = "col";
   th.dataset.key = col.key;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = col.label + " ";
   const arrow = document.createElement("span");
   arrow.className = "arrow";
   arrow.dataset.for = col.key;
-  th.appendChild(arrow);
+  arrow.setAttribute("aria-hidden", "true");
+  button.appendChild(arrow);
+  th.appendChild(button);
   head.appendChild(th);
 }
 const thCopy = document.createElement("th");
-thCopy.textContent = "";
+thCopy.scope = "col";
+thCopy.textContent = "Copy path";
 head.appendChild(thCopy);
 
 head.addEventListener("click", e => {
@@ -385,6 +419,7 @@ function render() {
       b.className = "copy";
       b.textContent = "copy";
       b.dataset.path = r.Path;
+      b.setAttribute("aria-label", "Copy path: " + r.Path);
       tdCopy.appendChild(b);
     }
     tr.appendChild(tdCopy);
@@ -405,6 +440,28 @@ function render() {
 
   for (const a of document.querySelectorAll(".arrow")) {
     a.textContent = (a.dataset.for === state.sortKey) ? (state.sortDir > 0 ? "▲" : "▼") : "";
+    a.closest("th").setAttribute("aria-sort", a.dataset.for === state.sortKey
+      ? (state.sortDir > 0 ? "ascending" : "descending") : "none");
+  }
+}
+
+async function copyPaths(paths) {
+  const status = document.getElementById("copyStatus");
+  const manual = document.getElementById("manualCopy");
+  manual.hidden = true;
+  if (!paths.length) { status.textContent = "No paths match the current filters."; return; }
+  const text = paths.join("\n");
+  try {
+    if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error("Clipboard unavailable");
+    await navigator.clipboard.writeText(text);
+    status.textContent = "Copied " + paths.length + " path(s).";
+  } catch {
+    status.textContent = "Automatic copy is unavailable. Use the selected text below.";
+    manual.hidden = false;
+    const field = document.getElementById("copyText");
+    field.value = text;
+    field.focus();
+    field.select();
   }
 }
 
@@ -412,10 +469,7 @@ function render() {
 document.getElementById("body").addEventListener("click", e => {
   const b = e.target.closest("button.copy");
   if (!b || !b.dataset.path) return;
-  navigator.clipboard.writeText(b.dataset.path).then(() => {
-    b.textContent = "ok";
-    setTimeout(() => { b.textContent = "copy"; }, 900);
-  });
+  copyPaths([b.dataset.path]);
 });
 
 // --- toolbar: one listener for both buttons -------------------------------
@@ -428,11 +482,11 @@ document.getElementById("tools").addEventListener("click", e => {
     return;
   }
   if (btn.id === "copyPaths") {
-    const paths = currentRows().map(r => r.Path).filter(Boolean);
-    navigator.clipboard.writeText(paths.join("\n"));
-    const old = "Copy visible paths";
-    btn.textContent = "copied " + paths.length;
-    setTimeout(() => { btn.textContent = old; }, 1200);
+    // A click can beat the pending debounce: use what the search field says now.
+    clearTimeout(searchTimer);
+    state.q = document.getElementById("q").value;
+    render();
+    copyPaths([...new Set(currentRows().map(r => r.Path).filter(Boolean))]);
   }
 });
 
@@ -473,14 +527,15 @@ def build_html(rows: list[dict], csv_path: str, generated: str | None = None) ->
                      .astimezone().strftime("%Y-%m-%d %H:%M:%S"))
     # Ordered by ALL_VERDICTS so the injected blob is byte-stable between runs.
     verdict_meta = {v: VERDICT_META[v] for v in ALL_VERDICTS if v in VERDICT_META}
-    return (
-        HTML_TEMPLATE
-        .replace("__DATA_JSON__", _js(rows))
-        .replace("__SRC_JSON__", _js(os.path.basename(csv_path)))
-        .replace("__GEN_JSON__", _js(generated))
-        .replace("__VERDICT_META_JSON__", _js(verdict_meta))
-        .replace("__COLUMNS_JSON__", _js(DISPLAY_COLUMNS))
-    )
+    replacements = {
+        "__DATA_JSON__": _js(rows),
+        "__SRC_JSON__": _js(os.path.basename(csv_path)),
+        "__GEN_JSON__": _js(generated),
+        "__VERDICT_META_JSON__": _js(verdict_meta),
+        "__COLUMNS_JSON__": _js(DISPLAY_COLUMNS),
+    }
+    # Substitute only in the original template, never in data already inserted.
+    return re.sub("|".join(replacements), lambda match: replacements[match.group()], HTML_TEMPLATE)
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +647,16 @@ def serve(html_text: str, host: str, port: int, use_token: bool) -> None:
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+def port_number(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("port must be an integer from 0 to 65535") from e
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 0 and 65535")
+    return port
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build an HTML report from the phase 2 CSV, and optionally serve it.",
@@ -607,7 +672,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1",
                         help="bind address when serving (default: 127.0.0.1; "
                              "use 0.0.0.0 to expose on the LAN)")
-    parser.add_argument("--port", type=int, default=0,
+    parser.add_argument("--port", type=port_number, default=0,
                         help="bind port when serving (default: 0 = pick a free port)")
     parser.add_argument("--no-token", action="store_true",
                         help="serve without the ?k=<token> access check")
@@ -630,13 +695,28 @@ def main(argv: list[str] | None = None) -> int:
         out_path = args.output or (os.path.splitext(args.csv)[0] + ".html")
         out_dir = os.path.dirname(os.path.abspath(out_path))
         html_text = build_html(rows, args.csv)
+        temp_path = None
         try:
+            if (os.path.realpath(out_path) == os.path.realpath(args.csv)
+                    or (os.path.exists(out_path) and os.path.samefile(out_path, args.csv))):
+                raise ReportError("output HTML must not overwrite the input CSV")
+            for path in {row["Path"] for row in rows} - {""}:
+                if (os.path.realpath(out_path) == os.path.realpath(path)
+                        or (os.path.exists(out_path) and os.path.exists(path)
+                            and os.path.samefile(out_path, path))):
+                    raise ReportError("output HTML must not overwrite a media file")
             if out_dir:
                 os.makedirs(out_dir, exist_ok=True)
-            with open(out_path, "w", encoding="utf-8") as f:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=out_dir,
+                                             prefix=".arr-report-", suffix=".tmp", delete=False) as f:
+                temp_path = f.name
                 f.write(html_text)
+            os.replace(temp_path, out_path)
         except OSError as e:
             raise ReportError(f"could not write {out_path}: {e}") from e
+        finally:
+            if temp_path is not None and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
         log(f"Wrote {out_path} ({len(rows)} row(s)).")
 

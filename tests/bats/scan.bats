@@ -115,7 +115,7 @@ file_mode() {
 tmp_leftovers() {
     local dir
     dir="$(dirname -- "$OUT")"
-    ls -1 "$dir" 2>/dev/null | grep -c '\.tmp\.[0-9]*$' || true
+    ls -1 "$dir" 2>/dev/null | grep -c '\.tmp\.[^.]*$' || true
 }
 
 # command_posts <app> -- the bodies of every POST /<app>/api/v3/command, joined
@@ -343,14 +343,14 @@ print(rows[0]["Path"])
 # S14-S18: the Sonarr per-series cache
 # --------------------------------------------------------------------------
 
-@test "S14: the cache is v2 and a second run reuses it" {
+@test "S14: the cache is v3 and a second run reuses it" {
     start_fake_arr "$BATS_TESTS_DIR/fixtures"
 
     run_scan
     assert_success
 
     run "$REAL_JQ" -r '.__meta.version' "$CACHE"
-    assert_output "2"
+    assert_output "3"
     run "$REAL_JQ" -r '."1".sig' "$CACHE"
     assert_output "10:123456"
     run "$REAL_JQ" -r '.__meta.regex' "$CACHE"
@@ -474,7 +474,7 @@ print(rows[0]["Path"])
     assert_output "1"
 
     run "$REAL_JQ" -r '.__meta.version' "$CACHE"
-    assert_output "2"
+    assert_output "3"
 }
 
 # --------------------------------------------------------------------------
@@ -515,13 +515,15 @@ print(rows[0]["Path"])
     assert_success
 }
 
-@test "S20: a failed episode fetch reuses a cached series and skips a new one" {
+@test "S20: a failed episode fetch keeps the previous report and cache" {
     local dir
     dir="$(fixture_copy)"
     start_fake_arr "$dir"
 
     run_scan
     assert_success
+    cp "$OUT" "$BATS_TEST_TMPDIR/report-before.csv"
+    cp "$CACHE" "$BATS_TEST_TMPDIR/cache-before.json"
 
     # Both known series move, and a third one appears that the cache has never
     # seen. Then every episode request fails: 3 series x 3 attempts.
@@ -535,10 +537,14 @@ EOF
     arr_control '{"fail_count": {"/sonarr/api/v3/episode": 9}}'
 
     run_scan
-    assert_success
+    assert_failure 2
 
-    assert_stderr_contains "episode fetch failed for 'Le Colline Silenziose'; keeping its previous cache entry."
-    assert_stderr_contains "episode fetch failed for 'Brand New'; skipping it this run."
+    assert_stderr_contains "episode fetch failed for 'Le Colline Silenziose'"
+    assert_stderr_contains "episode fetch failed for 'Brand New'"
+    run diff "$BATS_TEST_TMPDIR/report-before.csv" "$OUT"
+    assert_success
+    run diff "$BATS_TEST_TMPDIR/cache-before.json" "$CACHE"
+    assert_success
 
     # The cached series is still reported from its previous rows...
     assert_csv_has 'Sonarr,"Le Colline Silenziose",,"S01E02 - Cold Front","English","/media/tv/Le Colline Silenziose/Season 01/S01E02.mkv"'
@@ -547,6 +553,412 @@ EOF
     assert_output "false"
     run "$REAL_JQ" -r '."1".sig' "$CACHE"
     assert_output "10:123456"
+}
+
+@test "S41: a first-run episode fetch failure publishes no report or cache" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    arr_control '{"fail_count": {"/sonarr/api/v3/episode": 3}}'
+
+    run_scan
+    assert_failure 2
+    [ ! -e "$OUT" ]
+    [ ! -e "$CACHE" ]
+    run tmp_leftovers
+    assert_output "0"
+}
+
+@test "S42: a failed episodefile fallback keeps the report and retries next run" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    run_scan
+    assert_success
+    cp "$OUT" "$BATS_TEST_TMPDIR/report-before.csv"
+    cp "$CACHE" "$BATS_TEST_TMPDIR/cache-before.json"
+    arr_control '{"fail_count": {"/sonarr/api/v3/episodefile/77": 2}}'
+
+    run_scan --refresh
+    assert_failure 2
+    run diff "$BATS_TEST_TMPDIR/report-before.csv" "$OUT"
+    assert_success
+    run diff "$BATS_TEST_TMPDIR/cache-before.json" "$CACHE"
+    assert_success
+
+    run_scan --refresh
+    assert_success
+    assert_csv_has 'Sonarr,"Le Colline Silenziose",,"S01E04 - Deferred File","German","/tv/s/S01E04.mkv"'
+}
+
+@test "S43: a malformed episode payload keeps the report and cache" {
+    local dir payload
+    dir="$(fixture_copy)"
+    start_fake_arr "$dir"
+    run_scan
+    assert_success
+    cp "$OUT" "$BATS_TEST_TMPDIR/report-before.csv"
+    cp "$CACHE" "$BATS_TEST_TMPDIR/cache-before.json"
+
+    for payload in '{}' '[{}]' '[{"hasFile":true,"episodeFileId":0}]'; do
+        printf '%s\n' "$payload" > "$dir/sonarr/episodes_1.json"
+        run_scan --refresh
+        assert_failure 2
+        run diff "$BATS_TEST_TMPDIR/report-before.csv" "$OUT"
+        assert_success
+        run diff "$BATS_TEST_TMPDIR/cache-before.json" "$CACHE"
+        assert_success
+    done
+}
+
+@test "S44: malformed list payloads cannot replace a report with empty findings" {
+    local dir app payload
+    dir="$(fixture_copy)"
+    start_fake_arr "$dir"
+    run_scan
+    assert_success
+    cp "$OUT" "$BATS_TEST_TMPDIR/report-before.csv"
+    cp "$CACHE" "$BATS_TEST_TMPDIR/cache-before.json"
+
+    for app in radarr/movies sonarr/series; do
+        for payload in '{}' '[{}]'; do
+            printf '%s\n' "$payload" > "$dir/$app.json"
+            run_scan --refresh
+            assert_failure 2
+            run diff "$BATS_TEST_TMPDIR/report-before.csv" "$OUT"
+            assert_success
+            run diff "$BATS_TEST_TMPDIR/cache-before.json" "$CACHE"
+            assert_success
+        done
+        cp "$BATS_TESTS_DIR/fixtures/$app.json" "$dir/$app.json"
+    done
+}
+
+@test "S45: Radarr failure does not commit a newly computed Sonarr cache" {
+    local dir
+    dir="$(fixture_copy)"
+    start_fake_arr "$dir"
+    run_scan
+    assert_success
+    cp "$CACHE" "$BATS_TEST_TMPDIR/cache-before.json"
+    cp "$dir/sonarr/series_changed_size.json" "$dir/sonarr/series.json"
+    arr_control '{"fail_count": {"/radarr/api/v3/movie": 3}}'
+
+    run_scan
+    assert_failure 2
+    run diff "$BATS_TEST_TMPDIR/cache-before.json" "$CACHE"
+    assert_success
+}
+
+@test "S46: a malformed episodefile response is an incomplete scan" {
+    local dir payload
+    dir="$(fixture_copy)"
+    start_fake_arr "$dir"
+
+    for payload in '{}' '{"path":"/tv/x.mkv","mediaInfo":{"audioLanguages":[]}}'; do
+        printf '%s\n' "$payload" > "$dir/sonarr/episodefile_77.json"
+        run_scan
+        assert_failure 2
+        [ ! -e "$OUT" ]
+        [ ! -e "$CACHE" ]
+    done
+}
+
+@test "S47: changing the Sonarr server invalidates matching series signatures" {
+    local dir
+    dir="$(fixture_copy)"
+    start_fake_arr "$dir"
+    run_scan
+    assert_success
+
+    # Same IDs and sizes on another endpoint must never reuse the first library.
+    SONARR_URL="${SONARR_URL/127.0.0.1/localhost}"
+    export SONARR_URL
+    "$REAL_JQ" 'map(.episodeFile.mediaInfo.audioLanguages = "Italian")' \
+        "$dir/sonarr/episodes_2.json" > "$dir/sonarr/changed.json"
+    mv "$dir/sonarr/changed.json" "$dir/sonarr/episodes_2.json"
+    : > "$FAKE_ARR_LOG"
+
+    run_scan
+    assert_success
+    run episode_requests 2
+    assert_output "1"
+    run grep -F 'Northbound' "$OUT"
+    assert_failure
+    run grep -F "$SONARR_API_KEY" "$CACHE"
+    assert_failure
+}
+
+@test "S48: changes to series identity invalidate unchanged file statistics" {
+    local dir field
+    dir="$(fixture_copy)"
+    start_fake_arr "$dir"
+    run_scan
+    assert_success
+
+    for field in title path tvdbId added; do
+        "$REAL_JQ" --arg field "$field" '.[0][$field] =
+            (if $field == "tvdbId" then 9876 else "Changed" end)' \
+            "$dir/sonarr/series.json" > "$dir/sonarr/changed.json"
+        mv "$dir/sonarr/changed.json" "$dir/sonarr/series.json"
+        : > "$FAKE_ARR_LOG"
+        run_scan
+        assert_success
+        run episode_requests 1
+        assert_output "1"
+        run episode_requests 2
+        assert_output "0"
+    done
+    assert_csv_has 'Sonarr,"Changed",,"S01E04 - Deferred File","German","/tv/s/S01E04.mkv"'
+}
+
+@test "S49: an incomplete or corrupt cache entry is rebuilt instead of hiding findings" {
+    local expr
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    run_scan
+    assert_success
+    cp "$OUT" "$BATS_TEST_TMPDIR/report-before.csv"
+
+    for expr in '."1".rows = null' '."1" = 42' \
+        '."1".rows = ["Sonarr,forged\nrow"]' '."1".rows = ["not csv"]'; do
+        "$REAL_JQ" "$expr" "$CACHE" > "$BATS_TEST_TMPDIR/broken.json"
+        mv "$BATS_TEST_TMPDIR/broken.json" "$CACHE"
+        : > "$FAKE_ARR_LOG"
+        run_scan
+        assert_success
+        run episode_requests 1
+        assert_output "1"
+        run diff "$BATS_TEST_TMPDIR/report-before.csv" "$OUT"
+        assert_success
+    done
+}
+
+@test "S50: missing series statistics cannot authorize a cache hit" {
+    local dir
+    dir="$(fixture_copy)"
+    "$REAL_JQ" 'map(del(.statistics))' "$dir/sonarr/series.json" \
+        > "$dir/sonarr/changed.json"
+    mv "$dir/sonarr/changed.json" "$dir/sonarr/series.json"
+    start_fake_arr "$dir"
+    run_scan
+    assert_success
+    : > "$FAKE_ARR_LOG"
+
+    run_scan
+    assert_success
+    run episode_requests 1
+    assert_output "1"
+    run episode_requests 2
+    assert_output "1"
+}
+
+@test "S51: the rescan timeout bounds a slow status request" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    arr_control '{"delay": 3, "command_status": ["started"]}'
+    local started elapsed
+    started="$(date +%s)"
+    run --separate-stderr "$BASH_UNDER_TEST" -c '
+        . "$1"
+        arr_post() { printf "{\"id\":42}\n"; }
+        RESCAN_TIMEOUT=1 RESCAN_POLL_INTERVAL=1
+        wait_for_command "$SONARR_URL" "$SONARR_API_KEY" RescanSeries
+    ' bash "$SCAN"
+    elapsed=$(( $(date +%s) - started ))
+    assert_failure 1
+    assert_stderr_contains "did not complete within 1s"
+    [ "$elapsed" -lt 3 ]
+}
+
+@test "S52: rescan sleep is capped to the remaining timeout" {
+    run --separate-stderr "$BASH_UNDER_TEST" -c '
+        . "$1"
+        arr_post() { printf "{\"id\":42}\n"; }
+        arr_get() { printf "{\"status\":\"started\"}\n"; }
+        sleep() { printf "sleep:%s\n" "$1"; SECONDS=$((SECONDS + $1)); }
+        RESCAN_TIMEOUT=1 RESCAN_POLL_INTERVAL=9
+        wait_for_command http://example.invalid unused RescanSeries
+    ' bash "$SCAN"
+    assert_failure 1
+    assert_output "sleep:1"
+}
+
+@test "S53: an output directory is rejected before making API calls" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    mkdir "$OUT"
+    run_scan
+    assert_failure 1
+    run arr_request_count "/api/"
+    assert_output "0"
+    run find "$OUT" -type f
+    assert_output ""
+}
+
+@test "S54: extra positional arguments are rejected without writing a report" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    run_scan ignored.csv
+    assert_failure 1
+    [ ! -e "$OUT" ]
+    run arr_request_count "/api/"
+    assert_output "0"
+}
+
+@test "S55: rescan durations are decimal and overflow values fall back safely" {
+    run --separate-stderr "$BASH_UNDER_TEST" -c '
+        . "$1"
+        REFRESH_FLAG=false
+        RESCAN_TIMEOUT=0008 RESCAN_POLL_INTERVAL=0002
+        load_config
+        printf "%s:%s\n" "$RESCAN_TIMEOUT" "$RESCAN_POLL_INTERVAL"
+        RESCAN_TIMEOUT=99999999999999999999 RESCAN_POLL_INTERVAL=99999999999999999999
+        load_config
+        printf "%s:%s\n" "$RESCAN_TIMEOUT" "$RESCAN_POLL_INTERVAL"
+    ' bash "$SCAN"
+    assert_success
+    assert_output $'8:2\n900:5'
+}
+
+@test "S56: a pre-existing predictable report-temp symlink cannot overwrite another file" {
+    printf 'keep this file\n' > "$BATS_TEST_TMPDIR/victim"
+    run --separate-stderr "$BASH_UNDER_TEST" -c '
+        . "$1"
+        ln -s "$3" "$2.tmp.$$"
+        SKIP_RADARR=true SKIP_SONARR=true
+        main "$2"
+    ' bash "$SCAN" "$OUT" "$BATS_TEST_TMPDIR/victim"
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/victim"
+    assert_output "keep this file"
+    [ -f "$OUT" ]
+    [ ! -L "$OUT" ]
+}
+
+@test "S57: a directory at the cache destination is not treated as a cache update" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    mkdir "$CACHE"
+    run_scan
+    assert_success
+    assert_stderr_contains "could not write Sonarr cache"
+    run find "$CACHE" -type f
+    assert_output ""
+}
+
+@test "S58: the report cannot replace a Radarr media path, including unflagged raw paths" {
+    local dir language suffix
+    dir="$(fixture_copy)"
+    start_fake_arr "$dir"
+    export SKIP_SONARR=true
+
+    for language in English Italian; do
+        for suffix in normal $'trailing \t\n\x1f '; do
+            OUT="$BATS_TEST_TMPDIR/movie-$suffix"
+            printf 'original media bytes\n' > "$OUT"
+            "$REAL_JQ" -n --arg path "$OUT" --arg language "$language" \
+                '[{hasFile:true, title:"Collision", movieFile:{path:$path,
+                  mediaInfo:{audioLanguages:$language}}}]' > "$dir/radarr/movies.json"
+
+            run_scan
+            assert_failure 1
+            assert_stderr_contains "would overwrite a media file"
+            run cat "$OUT"
+            assert_output "original media bytes"
+        done
+    done
+}
+
+@test "S59: report aliases through symlinks and hardlinks cannot replace media" {
+    local dir alias
+    dir="$(fixture_copy)"
+    start_fake_arr "$dir"
+    export SKIP_SONARR=true
+    printf 'original media bytes\n' > "$BATS_TEST_TMPDIR/movie.mkv"
+    "$REAL_JQ" -n --arg path "$BATS_TEST_TMPDIR/movie.mkv" \
+        '[{hasFile:true, movieFile:{path:$path, mediaInfo:{audioLanguages:"Italian"}}}]' \
+        > "$dir/radarr/movies.json"
+
+    for alias in symbolic hard; do
+        rm -f "$OUT"
+        if [[ "$alias" == symbolic ]]; then
+            ln -s "$BATS_TEST_TMPDIR/movie.mkv" "$OUT"
+        else
+            ln "$BATS_TEST_TMPDIR/movie.mkv" "$OUT"
+        fi
+        run_scan
+        assert_failure 1
+        run cat "$OUT"
+        assert_output "original media bytes"
+        [[ "$OUT" -ef "$BATS_TEST_TMPDIR/movie.mkv" ]]
+    done
+}
+
+@test "S60: the cache cannot replace an Italian media file and leaves the report intact" {
+    local dir
+    dir="$(fixture_copy)"
+    start_fake_arr "$dir"
+    printf 'previous report\n' > "$OUT"
+    printf 'original media bytes\n' > "$CACHE"
+    "$REAL_JQ" -n --arg path "$CACHE" \
+        '[{hasFile:true, movieFile:{path:$path, mediaInfo:{audioLanguages:"Italian"}}}]' \
+        > "$dir/radarr/movies.json"
+
+    run_scan
+    assert_failure 1
+    run cat "$OUT"
+    assert_output "previous report"
+    run cat "$CACHE"
+    assert_output "original media bytes"
+}
+
+@test "S61: episodefile fallback paths are protected even when the file is Italian" {
+    local dir
+    dir="$(fixture_copy)"
+    start_fake_arr "$dir"
+    export SKIP_RADARR=true
+    printf 'original media bytes\n' > "$OUT"
+    "$REAL_JQ" -n --arg path "$OUT" \
+        '{path:$path, mediaInfo:{audioLanguages:"Italian"}}' \
+        > "$dir/sonarr/episodefile_77.json"
+
+    run_scan
+    assert_failure 1
+    run cat "$OUT"
+    assert_output "original media bytes"
+    [ ! -e "$CACHE" ]
+}
+
+@test "S62: warm Sonarr cache protects raw paths of files excluded from the CSV" {
+    local dir media
+    dir="$(fixture_copy)"
+    media="$BATS_TEST_TMPDIR/Italian "
+    printf 'original media bytes\n' > "$media"
+    "$REAL_JQ" --arg path "$media" \
+        'map(.episodeFile.path = $path | .episodeFile.mediaInfo.audioLanguages = "Italian")' \
+        "$dir/sonarr/episodes_2.json" > "$dir/sonarr/changed.json"
+    mv "$dir/sonarr/changed.json" "$dir/sonarr/episodes_2.json"
+    start_fake_arr "$dir"
+    run_scan
+    assert_success
+    cp "$CACHE" "$BATS_TEST_TMPDIR/cache-before.json"
+    rm "$OUT"
+    ln "$media" "$OUT"
+    : > "$FAKE_ARR_LOG"
+
+    run_scan
+    assert_failure 1
+    run episode_request_total
+    assert_output "0"
+    run cat "$OUT"
+    assert_output "original media bytes"
+    run diff "$BATS_TEST_TMPDIR/cache-before.json" "$CACHE"
+    assert_success
+}
+
+@test "S63: a cache missing original media paths is rebuilt before reuse" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    run_scan
+    assert_success
+    "$REAL_JQ" 'del(."1".paths)' "$CACHE" > "$BATS_TEST_TMPDIR/old-cache.json"
+    mv "$BATS_TEST_TMPDIR/old-cache.json" "$CACHE"
+    : > "$FAKE_ARR_LOG"
+    run_scan
+    assert_success
+    run episode_requests 1
+    assert_output "1"
 }
 
 @test "S21: hasFile with no embedded file falls back to /episodefile" {
@@ -1150,7 +1562,7 @@ EOF
     refute_stderr_contains "[cache]"
 
     run "$REAL_JQ" -r '.__meta.version' "$CACHE"
-    assert_output "2"
+    assert_output "3"
 
     # And the rows the old cache claimed were empty are back in the report.
     assert_csv_has 'Sonarr,"Northbound",,"S01E01 - Due North","English","/media/tv/Northbound/Season 01/S01E01.mkv"'
@@ -1158,13 +1570,12 @@ EOF
 
 @test "S35 twin: a cache built with a different regex is discarded" {
     start_fake_arr "$BATS_TESTS_DIR/fixtures"
-
-    cat > "$CACHE" <<'EOF'
-{
-  "1": { "sig": "10:123456", "rows": [] },
-  "__meta": { "version": 2, "regex": "italian|ita|it-it" }
-}
-EOF
+    run_scan
+    assert_success
+    "$REAL_JQ" '.__meta.regex = "italian|ita|it-it"' "$CACHE" \
+        > "$BATS_TEST_TMPDIR/old-regex.json"
+    mv "$BATS_TEST_TMPDIR/old-regex.json" "$CACHE"
+    : > "$FAKE_ARR_LOG"
 
     run_scan
     assert_success

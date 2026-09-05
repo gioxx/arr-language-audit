@@ -53,3 +53,32 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: pytest
         run: uvx --python ${{ matrix.python }} pytest -q
+
+  report-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: tests/report-ui/package-lock.json
+      - name: report interactions
+        run: scripts/test.sh ui
+
+  whisper-contract:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: real decoder and detection API without model weights
+        run: scripts/test.sh contract
+        env:
+          CONTRACT_PYTHON: ${{ matrix.python }}

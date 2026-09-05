@@ -1,6 +1,7 @@
 # 3. Phase 1: one jq pass per payload, and a versioned Sonarr cache
 
-- Status: accepted
+- Status: accepted; cache identity and output publication extended by
+  [ADR 0004](0004-cache-identity-and-output-integrity.md)
 - Date: 2026-09-05
 - Deciders: repository maintainers
 

@@ -99,7 +99,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -110,7 +112,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from audit_common import (
+    ALL_VERDICTS,
     ERROR_VERDICTS,
+    PHASE1_COLUMNS,
     PHASE2_COLUMNS,
     RETRYABLE_VERDICTS,
     VERDICT_CONFIRMED,
@@ -192,6 +196,8 @@ class Config:
                 raise ConfigError(
                     f"{name} must be a {kinds[cast]}, got '{raw}'."
                 ) from None
+            if cast is float and not math.isfinite(value):
+                raise ConfigError(f"{name} must be a finite number, got '{raw}'.")
             if (low is not None and value < low) or (high is not None and value > high):
                 bounds = f"{low}..{high}" if high is not None else f">= {low}"
                 raise ConfigError(f"{name} must be {bounds}, got '{raw}'.")
@@ -243,6 +249,12 @@ class MediaProbe:
     audio_stream: int | None
 
 
+def media_tool_environment() -> dict[str, str]:
+    """Direct worker invocation must keep Arr credentials out of children too."""
+    return {name: value for name, value in os.environ.items()
+            if name not in {"RADARR_API_KEY", "SONARR_API_KEY"}}
+
+
 def probe_media(file_path: str) -> MediaProbe:
     """Duration and the audio stream to sample, from ONE ffprobe invocation.
 
@@ -267,7 +279,10 @@ def probe_media(file_path: str) -> MediaProbe:
                 file_path,
             ],
             capture_output=True, text=True, timeout=30, check=False,
+            env=media_tool_environment(),
         )
+        if result.returncode:
+            return MediaProbe(None, None)
         data = json.loads(result.stdout)
         if not isinstance(data, dict):
             raise ValueError("ffprobe did not return an object")
@@ -278,18 +293,24 @@ def probe_media(file_path: str) -> MediaProbe:
 
     try:
         duration = float((data.get("format") or {})["duration"])
+        if not math.isfinite(duration):
+            duration = None
     except (AttributeError, KeyError, TypeError, ValueError):
         duration = None
 
     # Defensive on top of -select_streams: a build that ignored it must not
     # shift the numbering by counting a video stream.
-    audio = [s for s in (data.get("streams") or [])
+    streams = data.get("streams") or []
+    if not isinstance(streams, list):
+        return MediaProbe(duration, None)
+    audio = [s for s in streams
              if isinstance(s, dict) and (s.get("codec_type") or "audio") == "audio"]
     if not audio:
         return MediaProbe(duration, None)
     chosen = 0
     for position, stream in enumerate(audio):
-        if (stream.get("disposition") or {}).get("default"):
+        disposition = stream.get("disposition") or {}
+        if isinstance(disposition, dict) and disposition.get("default") in (1, "1"):
             chosen = position
             break
     return MediaProbe(duration, chosen)
@@ -329,6 +350,7 @@ def extract_sample(file_path: str, out_wav: str, cfg: Config, probe: MediaProbe)
         subprocess.run(
             argv,
             capture_output=True, text=True, timeout=120, check=True,
+            env=media_tool_environment(),
         )
         return os.path.exists(out_wav) and os.path.getsize(out_wav) > 0
     except subprocess.CalledProcessError as e:
@@ -362,26 +384,37 @@ def detect_language(model, wav_path: str) -> tuple[str | None, float]:
     dedicated detect_language() takes a second window when the first one comes
     back under language_detection_threshold, which is what a sample opening on
     music or on a silent title card needs. transcribe() stays as the fallback
-    for a faster-whisper too old to have the method -- the package is not
-    pinned, so "too old" has to include a build whose detect_language() does
-    not take these keywords, not only one that lacks the method entirely."""
+    for a faster-whisper too old to have the method -- callers may have older
+    installed builds, so "too old" includes a detect_language() that does not
+    take these keywords, not only a build that lacks the method entirely."""
     detect = getattr(model, "detect_language", None)
     if detect is not None:
+        kwargs = {
+            "audio": wav_path,
+            "vad_filter": True,
+            "language_detection_segments": 2,
+            "language_detection_threshold": 0.5,
+        }
         try:
-            result = detect(
-                audio=wav_path,
-                vad_filter=True,
-                language_detection_segments=2,
-                language_detection_threshold=0.5,
-            )
-        except TypeError:
-            # A signature mismatch is version drift, which is what the
-            # fallback below is for; without this the whole library would
-            # come back DETECTION_FAILED. Deliberately TypeError only and
-            # deliberately once: a detector that really failed must stay
-            # failed, and verify_one turns that into one error row.
-            pass
-        else:
+            signature = inspect.signature(detect)
+        except (TypeError, ValueError):
+            signature = None
+        compatible = True
+        if signature is not None:
+            try:
+                signature.bind(**kwargs)
+            except TypeError:
+                compatible = False
+        if compatible:
+            from faster_whisper.audio import decode_audio  # noqa: PLC0415
+
+            # Only a call-signature mismatch triggers the old API fallback.
+            # A TypeError raised inside detection is a real per-file failure.
+            # Unlike transcribe(), detect_language() requires a mono float
+            # waveform, not a filename. Decode only after checking the API so
+            # legacy models retain their path-based transcribe fallback.
+            kwargs["audio"] = decode_audio(wav_path, sampling_rate=16000)
+            result = detect(**kwargs)
             return result[0], float(result[1] or 0.0)
 
     _segments, info = model.transcribe(
@@ -402,8 +435,10 @@ def classify(lang: str | None, prob: float, min_confidence: float) -> str:
     its own verdict, which --retry-errors picks up again.
 
     The threshold is a floor, not a gap: prob == min_confidence is believed."""
-    if not lang:
+    if not isinstance(lang, str) or not lang.strip():
         # Silence, or VAD stripped everything: no language to compare.
+        return VERDICT_DETECTION_FAILED
+    if not math.isfinite(prob) or not 0.0 <= prob <= 1.0:
         return VERDICT_DETECTION_FAILED
     if prob < min_confidence:
         return VERDICT_LOW_CONFIDENCE
@@ -418,16 +453,32 @@ def is_italian(lang_code: str | None) -> bool:
     return lang_code.lower() in ("it", "ita")
 
 
-def file_signature(path: str) -> tuple[int | None, int | None]:
-    """(size_bytes, mtime_epoch_seconds) for path, or (None, None) if it
+def file_signature(path: str) -> tuple[int | None, str | None]:
+    """(size_bytes, precise_mtime_seconds) for path, or (None, None) if it
     cannot be stat()'d. Comparing this against the value stored on the
     previous run is how we notice a file was replaced even though its path
     did not change."""
     try:
         st = os.stat(path)
-        return int(st.st_size), int(st.st_mtime)
+        seconds, nanos = divmod(abs(st.st_mtime_ns), 1_000_000_000)
+        sign = "-" if st.st_mtime_ns < 0 else ""
+        return int(st.st_size), f"{sign}{seconds}.{nanos:09d}"
     except OSError:
         return None, None
+
+
+def signature_matches(prev_size, prev_mtime, cur_size, cur_mtime) -> bool:
+    """Compare precise signatures while accepting old whole-second mtimes.
+
+    A legacy signature retains its original precision until verification;
+    accepting it never upgrades it to a precision we did not observe then.
+    """
+    if str(cur_size) != prev_size:
+        return False
+    current = str(cur_mtime)
+    return current == prev_mtime or (
+        "." not in prev_mtime and current.partition(".")[0] == prev_mtime
+    )
 
 
 def row_key(row: Mapping[str, str]) -> tuple[str, str]:
@@ -435,8 +486,9 @@ def row_key(row: Mapping[str, str]) -> tuple[str, str]:
 
     The path alone is not enough: a file holding a double episode appears in
     the phase 1 CSV once per episode, and keying on the path made those two
-    rows overwrite each other on every resume."""
-    return ((row.get("Path") or "").strip(), (row.get("Episode") or "").strip())
+    rows overwrite each other on every resume. Path whitespace is part of
+    the filename and must never be stripped or merged with another path."""
+    return (row.get("Path") or "", (row.get("Episode") or "").strip())
 
 
 def load_previous_rows(output_path: str) -> dict[tuple[str, str], dict]:
@@ -445,12 +497,32 @@ def load_previous_rows(output_path: str) -> dict[tuple[str, str], dict]:
     previous: dict[tuple[str, str], dict] = {}
     if not os.path.isfile(output_path):
         return previous
-    with open(output_path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            key = row_key(row)
-            if key[0]:
-                previous[key] = row
+    for row in read_csv_rows(output_path, PHASE2_COLUMNS[:-2]):
+        if row["Verdict"].strip() not in ALL_VERDICTS:
+            raise WorkerError(f"invalid verdict in resume CSV '{output_path}'.")
+        key = row_key(row)
+        if key[0]:
+            previous[key] = row
     return previous
+
+
+def read_csv_rows(path: str, required_columns: list[str]) -> list[dict]:
+    """Read a complete, well-formed CSV before the output can be changed."""
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle, strict=True)
+            columns = reader.fieldnames or []
+            if (len(columns) != len(set(columns))
+                    or not set(required_columns).issubset(columns)):
+                raise WorkerError(f"invalid or missing columns in CSV '{path}'.")
+            rows = []
+            for row in reader:
+                if None in row or any(value is None or "\x00" in value for value in row.values()):
+                    raise WorkerError(f"invalid row at line {reader.line_num} in CSV '{path}'.")
+                rows.append(row)
+            return rows
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise WorkerError(f"cannot read CSV '{path}': {exc}") from exc
 
 
 def resume_decision(entry, cur_size, cur_mtime, retry_errors: bool) -> str:
@@ -482,14 +554,14 @@ def resume_decision(entry, cur_size, cur_mtime, retry_errors: bool) -> str:
             # forward for ever.
             return "verify"
         # Legacy row from before signatures were recorded: fall back to the
-        # old path-only behaviour (keep). It gets a signature stamped on
-        # this run, so change detection works for it from now on.
+        # old path-only behaviour (keep). No signature can be invented for
+        # a file that this run did not actually verify.
         return "keep"
     if cur_size is None or cur_mtime is None:
         # File not visible right now (unmounted share, transient error):
         # do not churn, keep the previous verdict.
         return "keep"
-    unchanged = str(cur_size) == prev_size and str(cur_mtime) == prev_mtime
+    unchanged = signature_matches(prev_size, prev_mtime, cur_size, cur_mtime)
     return "keep" if unchanged else "verify"
 
 
@@ -546,6 +618,7 @@ class Plan:
     orphans: list[dict]
     dropped_stale: int
     dropped_superseded: int
+    previous_to_verify: dict[tuple[str, str], dict]
 
 
 def _carry_over(candidates, *, input_keys, consumed, cur_size, cur_mtime,
@@ -576,7 +649,7 @@ def _carry_over(candidates, *, input_keys, consumed, cur_size, cur_mtime,
         prev_mtime = (entry.get("FileMtime", "") or "").strip()
         if not prev_size or not prev_mtime or cur_size is None or cur_mtime is None:
             continue
-        if str(cur_size) != prev_size or str(cur_mtime) != prev_mtime:
+        if not signature_matches(prev_size, prev_mtime, cur_size, cur_mtime):
             continue
         # --retry-errors still wins: a row it would have re-run under its own
         # key must not sneak through as a relabel.
@@ -612,6 +685,7 @@ def plan_rows(input_rows, previous, *, retry_errors: bool, limit: int,
     kept = []
     pending = []       # (input row, its previous row or None), input order
     consumed = set()   # previous keys claimed by a relabelled input row
+    pending_claimed = set()
     for row in input_rows:
         key = row_key(row)
         if not key[0]:
@@ -635,29 +709,32 @@ def plan_rows(input_rows, previous, *, retry_errors: bool, limit: int,
                     detected=(source.get("DetectedLanguage", "") or ""),
                     confidence=(source.get("Confidence", "") or ""),
                     verdict=(source.get("Verdict", "") or ""),
-                    size=cur_size, mtime=cur_mtime,
+                    size=source.get("FileSize"), mtime=source.get("FileMtime"),
                 ))
                 continue
         if resume_decision(entry, cur_size, cur_mtime, retry_errors) == "verify":
+            if entry is None:
+                # If a relabel needs detection, its old verdict remains the
+                # fallback until that detection is actually completed.
+                entry = next((old for old_key, old in by_path.get(key[0], ())
+                              if old_key not in input_keys and old_key not in consumed
+                              and old_key not in pending_claimed), None)
+                if entry is not None:
+                    pending_claimed.add(row_key(entry))
             pending.append((row, entry))
             continue
-        # A kept error row must not be stamped with a signature it was never
-        # verified against, or resume_decision can never retry it again. This
-        # is deliberately ERROR_VERDICTS and not the wider RETRYABLE_VERDICTS
-        # --retry-errors uses above: a LOW_CONFIDENCE row was really listened
-        # to and owns a true signature, so stamping it again is correct and
-        # costs it nothing -- only rows that never got that far must stay
-        # unstamped, or R3 can never notice their file came back.
-        if (entry.get("Verdict", "") or "").strip() in ERROR_VERDICTS:
-            kept.append(normalise_previous(entry))
-        else:
-            kept.append(normalise_previous(entry, cur_size, cur_mtime))
+        # Keep the signature originally observed, including its precision.
+        kept.append(normalise_previous(entry))
 
     # --limit caps the work, not the report: a row cut from this run keeps
     # the verdict it already had instead of disappearing from the output.
     cut = pending[limit:] if limit > 0 else []
-    to_verify = [row for row, _ in (pending[:limit] if limit > 0 else pending)]
+    selected = pending[:limit] if limit > 0 else pending
+    to_verify = [row for row, _ in selected]
+    previous_to_verify = {row_key(row): normalise_previous(entry)
+                          for row, entry in selected if entry is not None}
     deferred = [normalise_previous(entry) for _row, entry in cut if entry is not None]
+    deferred_keys = {row_key(entry) for entry in deferred}
 
     # Previous verdicts whose file is no longer listed by phase 1. Two cases:
     #  - the file changed on disk (signature differs) and is no longer
@@ -672,7 +749,7 @@ def plan_rows(input_rows, previous, *, retry_errors: bool, limit: int,
     dropped_stale = 0
     dropped_superseded = 0
     for key, entry in previous.items():
-        if key in input_keys or key in consumed:
+        if key in input_keys or key in consumed or key in deferred_keys:
             continue
         if key[0] in input_paths:
             # The input still lists this file, under a different episode
@@ -687,14 +764,15 @@ def plan_rows(input_rows, previous, *, retry_errors: bool, limit: int,
         prev_mtime = (entry.get("FileMtime", "") or "").strip()
         cur_size, cur_mtime = signature_of(key[0])
         if (prev_size and prev_mtime and cur_size is not None
-                and (str(cur_size) != prev_size or str(cur_mtime) != prev_mtime)):
+                and not signature_matches(prev_size, prev_mtime, cur_size, cur_mtime)):
             dropped_stale += 1
             continue
         orphans.append(normalise_previous(entry))
 
     return Plan(kept=kept, to_verify=to_verify, deferred=deferred,
                 orphans=orphans, dropped_stale=dropped_stale,
-                dropped_superseded=dropped_superseded)
+                dropped_superseded=dropped_superseded,
+                previous_to_verify=previous_to_verify)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -735,7 +813,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV from find-missing-italian-audio.sh")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output CSV path")
-    parser.add_argument("--limit", type=int, default=0,
+    parser.add_argument("--limit", type=nonnegative_int, default=0,
                         help="Only (re)verify the first N files that need it (0 = all); "
                              "the rows it cuts keep the verdict they already had")
     parser.add_argument("--retry-errors", action="store_true",
@@ -745,6 +823,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-resume", action="store_true",
                         help="Ignore any existing output file and start fresh (overwrites it)")
     return parser
+
+
+def nonnegative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be greater than or equal to 0")
+    return number
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -764,6 +849,9 @@ def main(argv: list[str] | None = None) -> int:
                 "or pass --input with the correct path."
             )
 
+        if os.path.exists(args.output) and os.path.samefile(args.input, args.output):
+            raise WorkerError("input and output CSV paths must be different files.")
+
         out_dir = os.path.dirname(os.path.abspath(args.output))
         if out_dir:
             try:
@@ -782,6 +870,9 @@ def main(argv: list[str] | None = None) -> int:
     except WorkerError as e:
         log(f"ERROR: {e}")
         return EXIT_ERROR
+    except (OSError, UnicodeError, csv.Error) as e:
+        log(f"ERROR: input/output failure: {e}")
+        return EXIT_ERROR
     except KeyboardInterrupt:
         log("\nInterrupted. The results written so far are complete and valid.")
         return EXIT_INTERRUPTED
@@ -796,7 +887,7 @@ def verify_one(row, model, cfg: Config, temp_dir: str, index: int) -> dict:
 
     Every failure short of "the disk filled up" is a verdict, not an
     exception: one unreadable file must never end the run."""
-    path = (row.get("Path", "") or "").strip()
+    path = row.get("Path", "") or ""
     if not path or not os.path.isfile(path):
         return make_row(row, verdict=VERDICT_FILE_NOT_FOUND)
 
@@ -805,18 +896,19 @@ def verify_one(row, model, cfg: Config, temp_dir: str, index: int) -> dict:
     check_disk_space(temp_dir, cfg.min_free_space_mb)
     sample_path = os.path.join(temp_dir, f"sample_{index}.wav")
 
-    probe = probe_media(path)
-    if not extract_sample(path, sample_path, cfg, probe):
-        return make_row(row, verdict=VERDICT_EXTRACTION_FAILED,
-                        size=cur_size, mtime=cur_mtime)
-
     try:
-        lang, prob = detect_language(model, sample_path)
-    except Exception as e:  # noqa: BLE001
-        # Whisper can fail in many ways; each is a DETECTION_FAILED row.
-        log(f"  Whisper detection failed: {str(e)[:MAX_ERROR_CHARS]}")
-        return make_row(row, verdict=VERDICT_DETECTION_FAILED,
-                        size=cur_size, mtime=cur_mtime)
+        probe = probe_media(path)
+        if not extract_sample(path, sample_path, cfg, probe):
+            return make_row(row, verdict=VERDICT_EXTRACTION_FAILED,
+                            size=cur_size, mtime=cur_mtime)
+
+        try:
+            lang, prob = detect_language(model, sample_path)
+        except Exception as e:  # noqa: BLE001
+            # Whisper can fail in many ways; each is a DETECTION_FAILED row.
+            log(f"  Whisper detection failed: {str(e)[:MAX_ERROR_CHARS]}")
+            return make_row(row, verdict=VERDICT_DETECTION_FAILED,
+                            size=cur_size, mtime=cur_mtime)
     finally:
         # Always clean up the sample immediately to keep disk usage minimal
         if os.path.exists(sample_path):
@@ -857,8 +949,15 @@ def _log_plan(plan: Plan, total: int) -> None:
 def _run(args, cfg: Config, temp_dir: str) -> int:
     check_disk_space(temp_dir, cfg.min_free_space_mb)
 
-    with open(args.input, newline="", encoding="utf-8") as f:
-        all_rows = list(csv.DictReader(f))
+    all_rows = read_csv_rows(args.input, PHASE1_COLUMNS)
+
+    output_real = os.path.realpath(args.output)
+    for path in {row_key(row)[0] for row in all_rows} - {""}:
+        if os.path.realpath(path) == output_real or (
+            os.path.exists(args.output) and os.path.exists(path)
+            and os.path.samefile(args.output, path)
+        ):
+            raise WorkerError(f"output CSV must not overwrite a media file: '{path}'.")
 
     previous = {} if args.no_resume else load_previous_rows(args.output)
     plan = plan_rows(all_rows, previous, retry_errors=args.retry_errors,
@@ -872,29 +971,40 @@ def _run(args, cfg: Config, temp_dir: str) -> int:
     if plan.to_verify:
         try:
             model = load_model(cfg)
-        except (ImportError, OSError) as e:
+        except Exception as e:  # noqa: BLE001
             log(f"ERROR: could not load the Whisper model: {e}")
             log("Install faster_whisper (see the launcher script) and run again.")
             log(f"'{args.output}' was left untouched.")
             return EXIT_ERROR
 
-    # Always rewrite the output in full: every row we already have a verdict
-    # for goes out first, so a crash during detection still leaves a
-    # complete, valid CSV.
+    # Prepare the initial snapshot next to the destination. A failed header
+    # or reuse-row write must not truncate the previous report. Once published,
+    # append completed detections and flush each row for incremental resume.
     # SIM115: deliberately not a context manager -- the handle lives for the
     # whole detection loop and is flushed after every row, so an abort leaves a
     # complete file behind. It is closed in the finally below.
     try:
-        out_f = open(args.output, "w", newline="", encoding="utf-8")  # noqa: SIM115
+        out_f = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            mode="w", newline="", encoding="utf-8", delete=False,
+            dir=os.path.dirname(os.path.abspath(args.output)),
+            prefix=f".{os.path.basename(args.output)}.", suffix=".tmp",
+        )
     except OSError as e:
         raise WorkerError(f"cannot write '{args.output}': {e}") from e
     counts: dict[str, int] = {}
+    completed = set()
+    staging_path = out_f.name
     try:
         writer = csv.DictWriter(out_f, fieldnames=list(PHASE2_COLUMNS))
         writer.writeheader()
         for r in plan.kept + plan.deferred + plan.orphans:
             writer.writerow(r)
         out_f.flush()
+        try:
+            os.replace(staging_path, args.output)
+        except OSError as e:
+            raise WorkerError(f"cannot write '{args.output}': {e}") from e
+        staging_path = None
 
         if not plan.to_verify:
             log("Nothing new to verify.")
@@ -906,9 +1016,23 @@ def _run(args, cfg: Config, temp_dir: str) -> int:
             writer.writerow(out_row)
             # Flushed after every row so an abort leaves a complete CSV behind.
             out_f.flush()
+            completed.add(row_key(row))
             counts[out_row["Verdict"]] = counts.get(out_row["Verdict"], 0) + 1
+    except (KeyboardInterrupt, WorkerError):
+        # A controlled abort must retain old verdicts that were scheduled
+        # for retry but not replaced yet, including relabelled episodes.
+        if staging_path is None:
+            for key, previous_row in plan.previous_to_verify.items():
+                if key not in completed:
+                    writer.writerow(previous_row)
+            out_f.flush()
+        raise
     finally:
-        out_f.close()
+        try:
+            out_f.close()
+        finally:
+            if staging_path is not None:
+                os.unlink(staging_path)
 
     error_count = sum(n for v, n in counts.items() if v in ERROR_VERDICTS)
     log("\n--- Summary ---")

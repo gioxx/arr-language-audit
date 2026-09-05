@@ -9,7 +9,15 @@ updates:
     commit-message:
       prefix: "chore(deps)"
 
-  # GitHub Actions used by any workflow added later. Harmless no-op until then.
+  # Test-only DOM runtime for the report interaction suite.
+  - package-ecosystem: "npm"
+    directory: "/tests/report-ui"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(test-deps)"
+
+  # GitHub Actions used by the CI workflow.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

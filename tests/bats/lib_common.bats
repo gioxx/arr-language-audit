@@ -480,6 +480,33 @@ ERROR: broken"
     assert_output "true"
 }
 
+@test "arr_curl ignores curlrc URLs so credentials go only to the requested service" {
+    make_fake_repo
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    export CURL_HOME="$BATS_TEST_TMPDIR/curl-home"
+    mkdir -p "$CURL_HOME"
+    printf 'url = "%s/api/v3/system/status"\n' "$SONARR_URL" > "$CURL_HOME/.curlrc"
+
+    lib_run 'arr_get "$RADARR_URL/api/v3/system/status" "$RADARR_API_KEY" 1'
+    assert_success
+    run arr_request_count "/sonarr/"
+    assert_output "0"
+    run arr_request_count "/radarr/api/v3/system/status"
+    assert_output "1"
+}
+
+@test "arr_curl rejects CR and LF in API keys before making a request" {
+    make_fake_repo
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+
+    lib_run 'arr_curl "${RADARR_API_KEY}"$'"'\r'"'"X-Probe: injected" -m 1 "$RADARR_URL/api/v3/system/status"'
+    assert_failure
+    lib_run 'arr_curl "${RADARR_API_KEY}"$'"'\n'"'"X-Probe: injected" -m 1 "$RADARR_URL/api/v3/system/status"'
+    assert_failure
+    run arr_request_count "/"
+    assert_output "0"
+}
+
 @test "arr_get retries a failing request and succeeds on the third attempt" {
     make_fake_repo
     start_fake_arr "$BATS_TESTS_DIR/fixtures"

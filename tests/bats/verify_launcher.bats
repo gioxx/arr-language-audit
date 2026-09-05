@@ -396,3 +396,38 @@ arglog_line() {
     run grep -c '^WHISPER_MODEL=base$' "$ARGLOG"
     assert_output "1"
 }
+
+@test "dependency imports do not inherit the arr API keys" {
+    export RADARR_API_KEY=radarr-secret SONARR_API_KEY=sonarr-secret
+    export PYTHON_BIN="$TMP/private-python"
+    export PROBE_LOG="$TMP/probe-env.log"
+    cat > "$PYTHON_BIN" <<'EOF'
+#!/bin/sh
+printf 'probe\n' >> "$PROBE_LOG"
+env | grep -E '^(RADARR_API_KEY|SONARR_API_KEY)=' >> "$PROBE_LOG" || true
+exit 0
+EOF
+    chmod +x "$PYTHON_BIN"
+
+    run_launcher --check
+    assert_success
+    [ -s "$PROBE_LOG" ]
+    run grep -c 'API_KEY=' "$PROBE_LOG"
+    assert_output "0"
+}
+
+@test "the disk guard compares decimal MB values without octal or integer overflow" {
+    export FAKE_DF_AVAIL_MB=100
+    local minimum
+    for minimum in 0000101 18446744073709551616; do
+        export MIN_FREE_SPACE_MB="$minimum"
+        run_launcher "$IN" "$OUT"
+        assert_failure 1
+        assert_stderr_contains "Only 100 MB free"
+        [ ! -e "$ARGLOG" ]
+    done
+    export MIN_FREE_SPACE_MB=0000100
+    run_launcher "$IN" "$OUT"
+    assert_success
+    [ -s "$ARGLOG" ]
+}

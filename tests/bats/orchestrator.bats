@@ -590,12 +590,12 @@ ENVFILE
 
     # No phase 1 CSV: an explanation, and nothing is run.
     run_ala "PHASE2_READY=true; CSV='$TMP/never-scanned.csv'; action_verify" <<< $'\n'
-    assert_success
+    assert_failure 1
     assert_stderr_contains "Run 'Scan library (phase 1)' first."
     refute_log_contains "argv:"
 
     run_ala 'PHASE2_READY=false; PHASE2_NOTE="not installed"; action_verify' <<< $'\n'
-    assert_success
+    assert_failure 1
     assert_stderr_contains "Set up phase 2"
     refute_log_contains "argv:"
 
@@ -744,6 +744,130 @@ ENVFILE
     assert_stderr_contains "unknown choice: x"
     assert_stderr_contains "Bye."
     [ -d "$REPORTS" ]
+}
+
+@test "pipeline stops after a failed scan even when old reports exist" {
+    make_csv "$CSV"
+    make_csv "$VERIFIED_CSV"
+    export RECORDER_RC=2
+
+    run_ala 'ENV_READY=true; PHASE2_READY=true; action_pipeline' <<< $'y\nn\nn\n\n\n\n\n\n'
+    assert_failure 2
+    assert_log_contains "argv: $SCAN_SH"
+    refute_log_contains "argv: $VERIFY_SH"
+    refute_log_contains "$REPORT_PY"
+}
+
+@test "pipeline stops when verification is unavailable despite an old verdict CSV" {
+    make_csv "$CSV"
+    make_csv "$VERIFIED_CSV"
+
+    run_ala 'ENV_READY=true; PHASE2_READY=false; action_pipeline' <<< $'y\nn\nn\n\n\n\n'
+    assert_failure
+    refute_log_contains "$REPORT_PY"
+}
+
+@test "pipeline stops after the verification worker fails" {
+    make_csv "$CSV"
+    make_csv "$VERIFIED_CSV"
+    printf '#!/bin/sh\nexit 0\n' > "$SCAN_SH"
+    export RECORDER_RC=3
+
+    run_ala 'ENV_READY=true; PHASE2_READY=true; action_pipeline' <<< $'y\nn\nn\n\n\n\nn\n\n\n'
+    assert_failure 3
+    assert_log_contains "argv: $VERIFY_SH"
+    refute_log_contains "$REPORT_PY"
+}
+
+@test "pipeline stops when the model prompt is cancelled" {
+    make_csv "$CSV"
+    make_csv "$VERIFIED_CSV"
+
+    run_ala 'ENV_READY=true; PHASE2_READY=true; action_pipeline' <<< $'y\nn\nn'
+    assert_failure
+    refute_log_contains "argv: $VERIFY_SH"
+    refute_log_contains "$REPORT_PY"
+}
+
+@test "probe_app rejects successful HTTP responses without a valid status object" {
+    cp -R "$BATS_TESTS_DIR/fixtures" "$TMP/status-fixtures"
+    start_fake_arr "$TMP/status-fixtures"
+    local payload
+    for payload in 'null' '[]' '{}' '"login required"' '{"version":null}' '{"version":42}'; do
+        printf '%s\n' "$payload" > "$TMP/status-fixtures/radarr/system_status.json"
+        run_ala 'probe_app "$RADARR_URL" "$RADARR_API_KEY"'
+        assert_failure
+        refute_output --partial 'OK '
+    done
+}
+
+@test "reconfigure opens the active override or fallback dotenv" {
+    install_recorder "$TMP/editor"
+    export EDITOR="$TMP/editor"
+    export ALA_DOTENV_FILE="$TMP/custom.env"
+    printf 'WHISPER_MODEL=tiny\n' > "$ALA_DOTENV_FILE"
+
+    run_ala 'preflight_apps() { :; }; action_configure' <<< $'\n'
+    assert_success
+    assert_log_contains "argv: $TMP/editor $TMP/custom.env"
+    [ ! -e "$TMP/.env" ]
+
+    unset ALA_DOTENV_FILE
+    : > "$RECORDER_LOG"
+    printf 'WHISPER_MODEL=base\n' > "$TMP/scan/.env"
+    run_ala 'preflight_apps() { :; }; action_configure' <<< $'\n'
+    assert_success
+    assert_log_contains "argv: $TMP/editor $TMP/scan/.env"
+    [ ! -e "$TMP/.env" ]
+}
+
+@test "reconfigure stops before launching an editor when dotenv creation fails" {
+    install_recorder "$TMP/editor"
+    export EDITOR="$TMP/editor"
+    export ALA_DOTENV_FILE="$TMP/no-parent/custom.env"
+    printf 'WHISPER_MODEL=small\n' > "$TMP/.env.example"
+
+    run_ala 'action_configure' <<< $'\n'
+    assert_failure
+    refute_log_contains "argv: $TMP/editor"
+    refute_log_contains "--check"
+    refute_stderr_contains "Created "
+}
+
+@test "a failed HTML build propagates its exit status without claiming an output" {
+    make_csv "$VERIFIED_CSV"
+    export RECORDER_RC=2
+
+    run_ala "PHASE2_PYTHON='$FAKEPY'; action_report" <<< $'\n'
+    assert_failure 2
+    refute_stderr_contains "HTML report:"
+}
+
+@test "phase 2 installation commands do not inherit arr API keys" {
+    install_shim python3
+    mkdir -p "$TMP/verify/venv/bin"
+    printf '#!/bin/sh\nexit 0\n' > "$TMP/verify/venv/bin/python"
+    chmod +x "$TMP/verify/venv/bin/python"
+    install_recorder "$TMP/verify/venv/bin/pip"
+    export RADARR_API_KEY=radarr-secret SONARR_API_KEY=sonarr-secret
+    export RECORDER_RC=1
+
+    run_ala 'preflight_apps() { :; }; action_setup_phase2' <<< $'y\n\n'
+    assert_log_contains "install -r"
+    refute_log_contains "API_KEY="
+}
+
+@test "preflight normalizes URLs supplied only by the process environment" {
+    start_fake_arr "$BATS_TESTS_DIR/fixtures"
+    local radarr_base="$RADARR_URL" sonarr_base="$SONARR_URL"
+    export RADARR_URL="$radarr_base/// " SONARR_URL="$sonarr_base/ "
+
+    run_ala 'run_preflight
+             echo "radarr=$RADARR_OK:$RADARR_URL"
+             echo "sonarr=$SONARR_OK:$SONARR_URL"'
+    assert_success
+    assert_line "radarr=true:$radarr_base"
+    assert_line "sonarr=true:$sonarr_base"
 }
 
 @test "O17: -h prints the usage, exits 0 and touches nothing" {

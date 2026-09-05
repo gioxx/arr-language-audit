@@ -33,6 +33,7 @@ from conftest import (  # shared test helpers, not a private API
     read_rows,
     write_phase1,
 )
+from faster_whisper.audio import DecodedAudio
 
 pytestmark = pytest.mark.usefixtures("clean_env", "sys_temp")
 
@@ -276,12 +277,17 @@ def test_detect_language_prefers_the_dedicated_detection_api(fake_wav, whisper_s
 
     assert vam.detect_language(model, wav) == ("it", 0.97)
 
-    assert faster_whisper.WhisperModel.detect_calls == [{
-        "audio": wav,
+    calls = faster_whisper.WhisperModel.detect_calls
+    assert len(calls) == 1
+    audio = calls[0]["audio"]
+    assert isinstance(audio, DecodedAudio)
+    assert audio.source == "/media/x.mkv"
+    assert audio.shape[0] > 0
+    assert {key: value for key, value in calls[0].items() if key != "audio"} == {
         "vad_filter": True,
         "language_detection_segments": 2,
         "language_detection_threshold": 0.5,
-    }]
+    }
     assert faster_whisper.WhisperModel.transcribe_calls == []
     assert faster_whisper.WhisperModel.calls == ["/media/x.mkv"]
 
@@ -341,8 +347,8 @@ class _BrokenDetectModel:
 
 
 def test_detect_language_falls_back_on_a_signature_mismatch():
-    """faster-whisper is not pinned anywhere in this repo. A build whose
-    detect_language() predates the windowing keywords must reach the
+    """Users may still have older faster-whisper builds installed. A build
+    whose detect_language() predates the windowing keywords must reach the
     fallback, not turn every file in the library into DETECTION_FAILED."""
     model = _LegacyDetectModel()
 
@@ -350,13 +356,13 @@ def test_detect_language_falls_back_on_a_signature_mismatch():
     assert model.transcribe_calls == ["/tmp/s.wav"]
 
 
-def test_detect_language_does_not_swallow_a_real_detector_failure():
+def test_detect_language_does_not_swallow_a_real_detector_failure(fake_wav):
     """The fallback is for version drift only: a detector that blew up stays
     blown up, and verify_one records it as one DETECTION_FAILED row."""
     model = _BrokenDetectModel()
 
     with pytest.raises(RuntimeError):
-        vam.detect_language(model, "/tmp/s.wav")
+        vam.detect_language(model, fake_wav("/media/x.mkv"))
     assert model.transcribe_calls == []
 
 
