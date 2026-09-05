@@ -1,14 +1,34 @@
 #!/usr/bin/env bash
-# Fake ffprobe: report a scripted duration for the file it is asked about.
+# Fake ffprobe: report a scripted duration for the file it is asked about and,
+# when the caller asks for streams, a scripted list of streams.
 # The real invocation puts the media path last, so that is what we key on.
 #
 #   FAKE_DURATIONS   JSON map "<path>": <seconds>; anything not listed gets 600.
+#   FAKE_STREAMS     JSON array of stream objects, e.g.
+#                      [{"index":1,"codec_type":"audio","disposition":{"default":0}},
+#                       {"index":2,"codec_type":"audio","disposition":{"default":1}}]
+#                    Default: one default-disposition audio stream. Only
+#                    printed when the caller asked for streams, i.e. passed
+#                    -show_streams or -show_entries ...stream=... ; with
+#                    -select_streams a, non-audio streams are filtered out
+#                    exactly as the real ffprobe would.
 #   FAKE_FFPROBE_LOG file to append argv to, one invocation per line.
 set -u
 
 input=""
+prev=""
+want_streams=0
+audio_only=0
 for arg in "$@"; do
+    case "$arg" in
+        -show_streams) want_streams=1 ;;
+        *stream=*|*stream_disposition=*) want_streams=1 ;;
+    esac
+    if [[ "$prev" == "-select_streams" && "$arg" == a* ]]; then
+        audio_only=1
+    fi
     input="$arg"
+    prev="$arg"
 done
 
 if [[ -n "${FAKE_FFPROBE_LOG:-}" ]]; then
@@ -24,4 +44,15 @@ if [[ -n "${FAKE_DURATIONS:-}" ]]; then
     fi
 fi
 
-printf '{"format":{"duration":"%s"}}\n' "$duration"
+if (( want_streams == 0 )); then
+    printf '{"format":{"duration":"%s"}}\n' "$duration"
+    exit 0
+fi
+
+default_streams='[{"index":0,"codec_type":"audio","disposition":{"default":1}}]'
+printf '%s' "${FAKE_STREAMS:-$default_streams}" \
+    | "${REAL_JQ:-jq}" -c --arg d "$duration" --argjson audio_only "$audio_only" \
+        'if $audio_only == 1
+         then map(select((.codec_type // "audio") == "audio"))
+         else . end
+         | {format: {duration: $d}, streams: .}'

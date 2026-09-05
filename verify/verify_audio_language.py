@@ -10,6 +10,13 @@ Sonarr mediaInfo) against the ACTUALLY DETECTED spoken language.
 This does NOT rely on container metadata at all -- it listens to the audio.
 No media file is modified; the only output is the verdict CSV.
 
+What is listened to: the audio stream the container marks as default (else
+the first one), sampled for SAMPLE_SECONDS from SAMPLE_OFFSET_PCT into the
+file. Only that window decides -- a file whose sampled minute is music, or
+whose tracks differ from the default one, is judged on what that minute
+contains, which is why a detection below MIN_CONFIDENCE is reported as
+LOW_CONFIDENCE rather than as an answer.
+
 Normally you run this through verify-audio-language.sh, which performs the
 dependency and disk-space checks first. You can also call it directly:
 
@@ -56,6 +63,10 @@ Verdicts written to the output CSV:
                             wrong. Fix the mediaInfo/tag, no redownload.
     CONFIRMED_NOT_ITALIAN   spoken language really is not Italian. Needs a
                             real fix: redownload or remux an Italian track.
+    LOW_CONFIDENCE          a language was named but below MIN_CONFIDENCE, so
+                            it decides nothing. Re-run with a bigger
+                            WHISPER_MODEL or another SAMPLE_OFFSET_PCT, or
+                            with --retry-errors.
     FILE_NOT_FOUND          path from the phase 1 CSV does not exist here.
     EXTRACTION_FAILED       ffmpeg could not produce an audio sample.
     DETECTION_FAILED        faster-whisper raised while analyzing the sample,
@@ -74,6 +85,8 @@ Environment variables (optional):
     WHISPER_THREADS     CPU threads for the model (default: all cores)
     SAMPLE_SECONDS      length of the audio sample to analyze (default: 60)
     SAMPLE_OFFSET_PCT   where to start sampling, as % of duration (default: 25)
+    MIN_CONFIDENCE      0..1; a detection below it is LOW_CONFIDENCE
+                        (default: 0.6)
     MIN_FREE_SPACE_MB   minimum free space required in temp dir (default: 500)
     TEMP_DIR            PARENT directory for the run's scratch directory
                         (default: the system temp dir). A private
@@ -104,6 +117,7 @@ from audit_common import (
     VERDICT_DETECTION_FAILED,
     VERDICT_EXTRACTION_FAILED,
     VERDICT_FILE_NOT_FOUND,
+    VERDICT_LOW_CONFIDENCE,
     VERDICT_MISTAGGED,
     check_python_floor,
     log,
@@ -149,9 +163,8 @@ class Config:
     sample_offset_pct: float = 25.0
     min_free_space_mb: int = 500
     temp_parent: str | None = None
-    # Not consulted yet: the low-confidence verdict arrives with the switch to
-    # the dedicated detection API. Parsed here so the launcher can already
-    # export it and so a typo is reported at start-up rather than later.
+    # The floor a detection has to clear before its language is believed;
+    # anything under it is VERDICT_LOW_CONFIDENCE. See classify().
     min_confidence: float = 0.6
     whisper_threads: int = 0
 
@@ -215,26 +228,75 @@ def check_disk_space(path: str, min_mb: int) -> None:
         )
 
 
-def get_duration_seconds(file_path: str) -> float | None:
+@dataclass(frozen=True)
+class MediaProbe:
+    """What one ffprobe call tells us about a media file.
+
+    duration      length in seconds, or None when it could not be read
+    audio_stream  which audio stream to listen to, counted WITHIN the file's
+                  audio streams (what `-map 0:a:<n>` takes, not the container
+                  stream index), or None when the file has no audio stream or
+                  the probe failed
+    """
+
+    duration: float | None
+    audio_stream: int | None
+
+
+def probe_media(file_path: str) -> MediaProbe:
+    """Duration and the audio stream to sample, from ONE ffprobe invocation.
+
+    R5: ffmpeg left to itself takes the audio stream with the most channels,
+    so an Italian 2.0 track flagged default alongside an English 5.1 track was
+    being judged in English. The stream the container marks as default is the
+    one the user hears, and it is the one we listen to; failing that, the first
+    audio stream.
+
+    One invocation because this runs once per file over a whole library.
+    -select_streams a is what makes the array position an audio-relative
+    index; -show_streams (rather than -show_entries stream_disposition=...)
+    is spelled the way every ffprobe build accepts."""
     try:
         result = subprocess.run(
             [
                 "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
+                "-select_streams", "a",
+                "-show_streams",
+                "-show_format",
                 "-of", "json",
                 file_path,
             ],
             capture_output=True, text=True, timeout=30, check=False,
         )
         data = json.loads(result.stdout)
-        return float(data["format"]["duration"])
+        if not isinstance(data, dict):
+            raise ValueError("ffprobe did not return an object")
     except Exception:  # noqa: BLE001
-        # Any probe failure means "duration unknown"; the caller falls back.
-        return None
+        # Any probe failure means "nothing known"; the caller falls back to
+        # sampling from the start and letting ffmpeg choose the stream.
+        return MediaProbe(None, None)
+
+    try:
+        duration = float((data.get("format") or {})["duration"])
+    except (AttributeError, KeyError, TypeError, ValueError):
+        duration = None
+
+    # Defensive on top of -select_streams: a build that ignored it must not
+    # shift the numbering by counting a video stream.
+    audio = [s for s in (data.get("streams") or [])
+             if isinstance(s, dict) and (s.get("codec_type") or "audio") == "audio"]
+    if not audio:
+        return MediaProbe(duration, None)
+    chosen = 0
+    for position, stream in enumerate(audio):
+        if (stream.get("disposition") or {}).get("default"):
+            chosen = position
+            break
+    return MediaProbe(duration, chosen)
 
 
-def extract_sample(file_path: str, out_wav: str, cfg: Config) -> bool:
-    duration = get_duration_seconds(file_path)
+def extract_sample(file_path: str, out_wav: str, cfg: Config, probe: MediaProbe) -> bool:
+    duration = probe.duration
     if duration is None or duration <= 0:
         start = 0
     else:
@@ -242,22 +304,30 @@ def extract_sample(file_path: str, out_wav: str, cfg: Config) -> bool:
         # don't start so late that there's not enough left to sample
         start = min(start, max(0, duration - cfg.sample_seconds))
 
+    argv = [
+        "ffmpeg",
+        "-nostdin",
+        "-loglevel", "error",
+        "-y",
+        "-ss", str(start),
+        "-i", file_path,
+    ]
+    if probe.audio_stream is not None:
+        # R5: name the stream explicitly, or ffmpeg picks the one with the
+        # most channels rather than the one the container marks as default.
+        argv += ["-map", f"0:a:{probe.audio_stream}"]
+    argv += [
+        "-t", str(cfg.sample_seconds),
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        out_wav,
+    ]
+
     try:
         subprocess.run(
-            [
-                "ffmpeg",
-                "-nostdin",
-                "-loglevel", "error",
-                "-y",
-                "-ss", str(start),
-                "-i", file_path,
-                "-t", str(cfg.sample_seconds),
-                "-vn",
-                "-acodec", "pcm_s16le",
-                "-ar", "16000",
-                "-ac", "1",
-                out_wav,
-            ],
+            argv,
             capture_output=True, text=True, timeout=120, check=True,
         )
         return os.path.exists(out_wav) and os.path.getsize(out_wav) > 0
@@ -285,11 +355,48 @@ def load_model(cfg: Config):
 
 def detect_language(model, wav_path: str) -> tuple[str | None, float]:
     """(language, probability) for a sample. The language is None when the
-    detector could not name one -- the caller turns that into a verdict."""
-    _segments, info = model.transcribe(wav_path, beam_size=1, best_of=1, vad_filter=True)
-    # Force generator evaluation is not needed: info.language is populated
-    # after the initial language-detection pass, before segment decoding.
-    return info.language, float(info.language_probability or 0.0)
+    detector could not name one -- the caller turns that into a verdict.
+
+    P5: transcribe() identifies the language from the first 30 s window only,
+    so half of a 60 s sample never reached the decision. faster-whisper's
+    dedicated detect_language() takes a second window when the first one comes
+    back under language_detection_threshold, which is what a sample opening on
+    music or on a silent title card needs. transcribe() stays as the fallback
+    for a faster-whisper too old to have the method."""
+    if hasattr(model, "detect_language"):
+        result = model.detect_language(
+            audio=wav_path,
+            vad_filter=True,
+            language_detection_segments=2,
+            language_detection_threshold=0.5,
+        )
+        language, probability = result[0], result[1]
+    else:
+        _segments, info = model.transcribe(
+            wav_path, beam_size=1, best_of=1, vad_filter=True
+        )
+        # Force generator evaluation is not needed: info.language is populated
+        # after the initial language-detection pass, before segment decoding.
+        language, probability = info.language, info.language_probability
+    return language, float(probability or 0.0)
+
+
+def classify(lang: str | None, prob: float, min_confidence: float) -> str:
+    """The verdict for one detection result.
+
+    H5: the probability used to be thrown away, so a 31%-confident "en"
+    guessed off a window of music was written out as CONFIRMED_NOT_ITALIAN --
+    the verdict that tells the user to re-download the file. A detection that
+    does not clear `min_confidence` says nothing about the language and gets
+    its own verdict, which --retry-errors picks up again.
+
+    The threshold is a floor, not a gap: prob == min_confidence is believed."""
+    if not lang:
+        # Silence, or VAD stripped everything: no language to compare.
+        return VERDICT_DETECTION_FAILED
+    if prob < min_confidence:
+        return VERDICT_LOW_CONFIDENCE
+    return VERDICT_MISTAGGED if is_italian(lang) else VERDICT_CONFIRMED
 
 
 def is_italian(lang_code: str | None) -> bool:
@@ -587,7 +694,13 @@ def build_parser() -> argparse.ArgumentParser:
             "Verdicts:\n"
             "  MISTAGGED_IS_ITALIAN   spoken audio is Italian, only the tag was wrong\n"
             "  CONFIRMED_NOT_ITALIAN  really not Italian; redownload or remux needed\n"
+            "  LOW_CONFIDENCE         detected below MIN_CONFIDENCE; decides nothing.\n"
+            "                         Retry with a bigger model, another offset, or\n"
+            "                         --retry-errors\n"
             "  FILE_NOT_FOUND / EXTRACTION_FAILED / DETECTION_FAILED   see script header\n"
+            "\n"
+            "What is listened to: the default-disposition audio stream (else the first),\n"
+            "for SAMPLE_SECONDS from SAMPLE_OFFSET_PCT in. Only that window decides.\n"
             "\n"
             "Exit codes:\n"
             "  0   finished (including 'nothing new to verify')\n"
@@ -601,6 +714,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  WHISPER_THREADS    CPU threads for the model           (default: all cores)\n"
             "  SAMPLE_SECONDS     audio sample length, seconds        (default: 60)\n"
             "  SAMPLE_OFFSET_PCT  sampling start, % of duration       (default: 25)\n"
+            "  MIN_CONFIDENCE     floor below which a detection is    (default: 0.6)\n"
+            "                     LOW_CONFIDENCE, 0..1\n"
             "  MIN_FREE_SPACE_MB  minimum free space in temp dir, MB  (default: 500)\n"
             "  TEMP_DIR           parent for the run's scratch dir    (default: system temp)\n"
             "                     never deleted; only the 'lang-check-*' directory\n"
@@ -679,7 +794,8 @@ def verify_one(row, model, cfg: Config, temp_dir: str, index: int) -> dict:
     check_disk_space(temp_dir, cfg.min_free_space_mb)
     sample_path = os.path.join(temp_dir, f"sample_{index}.wav")
 
-    if not extract_sample(path, sample_path, cfg):
+    probe = probe_media(path)
+    if not extract_sample(path, sample_path, cfg, probe):
         return make_row(row, verdict=VERDICT_EXTRACTION_FAILED,
                         size=cur_size, mtime=cur_mtime)
 
@@ -695,14 +811,14 @@ def verify_one(row, model, cfg: Config, temp_dir: str, index: int) -> dict:
         if os.path.exists(sample_path):
             os.remove(sample_path)
 
-    if lang is None:
-        # Silence, or VAD stripped everything: no language to compare.
+    verdict = classify(lang, prob, cfg.min_confidence)
+    if verdict == VERDICT_DETECTION_FAILED:
         log("  Whisper detection failed: no language identified.")
-        return make_row(row, verdict=VERDICT_DETECTION_FAILED,
-                        size=cur_size, mtime=cur_mtime)
+        return make_row(row, verdict=verdict, size=cur_size, mtime=cur_mtime)
 
+    # A LOW_CONFIDENCE row keeps the language and probability it was given:
+    # they are what the user judges a re-run against.
     declared = row.get("AudioLanguages", "")
-    verdict = VERDICT_MISTAGGED if is_italian(lang) else VERDICT_CONFIRMED
     log(f"  -> detected: {lang} ({prob:.0%}) | declared: {declared} | {verdict}")
     return make_row(row, detected=lang, confidence=f"{prob:.2f}", verdict=verdict,
                     size=cur_size, mtime=cur_mtime)
@@ -790,6 +906,7 @@ def _run(args, cfg: Config, temp_dir: str) -> int:
     log(f"Dropped (relabelled):         {plan.dropped_superseded}")
     log(f"Mistagged (actually Italian): {counts.get(VERDICT_MISTAGGED, 0)}")
     log(f"Confirmed not Italian:        {counts.get(VERDICT_CONFIRMED, 0)}")
+    log(f"Low confidence:               {counts.get(VERDICT_LOW_CONFIDENCE, 0)}")
     log(f"Errors this run:              {error_count}")
     log(f"\nFull results written to: {args.output}")
 

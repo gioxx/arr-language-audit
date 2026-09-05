@@ -19,6 +19,7 @@ import faster_whisper
 import pytest
 import verify_audio_language as vam
 from conftest import (  # shared test helpers, not a private API
+    Recorder,
     media,
     phase1_row,
     read_rows,
@@ -33,24 +34,6 @@ pytestmark = pytest.mark.usefixtures("clean_env", "sys_temp")
 # --- helpers ----------------------------------------------------------------
 
 
-class Recorder:
-    """Stands in for subprocess.run: records argv, writes the output file."""
-
-    def __init__(self, payload=b"x", exc=None, stdout=""):
-        self.calls = []
-        self.payload = payload
-        self.exc = exc
-        self.stdout = stdout
-
-    def __call__(self, argv, **kwargs):
-        self.calls.append(list(argv))
-        if self.exc is not None:
-            raise self.exc
-        if self.payload is not None:
-            Path(argv[-1]).write_bytes(self.payload)
-        return subprocess.CompletedProcess(argv, 0, self.stdout, "")
-
-
 class _Info:
     def __init__(self, language, probability):
         self.language = language
@@ -58,7 +41,10 @@ class _Info:
 
 
 class ScriptedModel:
-    """A model injected in place of load_model()'s return value."""
+    """A model injected in place of load_model()'s return value.
+
+    Deliberately has no detect_language(), so it drives detect_language()'s
+    transcribe() fallback; the dedicated API is covered in test_detection.py."""
 
     def __init__(self, behaviour):
         self.behaviour = behaviour
@@ -87,6 +73,10 @@ def test_is_italian(lang, expected):
 
 # --- Y4-Y8: sample extraction ----------------------------------------------
 
+# What probe_media() would have returned for an ordinary 10-minute file; the
+# stream choice itself is exercised in test_detection.py.
+PROBE = vam.MediaProbe(duration=600.0, audio_stream=0)
+
 
 @pytest.mark.parametrize(
     ("duration", "expected_ss"),
@@ -95,11 +85,11 @@ def test_is_italian(lang, expected):
 def test_extract_sample_offset_math(tmp_path, monkeypatch, duration, expected_ss):
     """Y4: where the 60 s window starts, and the exact ffmpeg argv."""
     recorder = Recorder()
-    monkeypatch.setattr(vam, "get_duration_seconds", lambda _p: duration)
     monkeypatch.setattr(vam.subprocess, "run", recorder)
 
     out_wav = str(tmp_path / "sample_1.wav")
-    assert vam.extract_sample("/media/a.mkv", out_wav, vam.Config()) is True
+    probe = vam.MediaProbe(duration=duration, audio_stream=0)
+    assert vam.extract_sample("/media/a.mkv", out_wav, vam.Config(), probe) is True
 
     argv = recorder.calls[0]
     assert argv[0] == "ffmpeg"
@@ -114,19 +104,19 @@ def test_extract_sample_offset_math(tmp_path, monkeypatch, duration, expected_ss
 
 def test_extract_sample_zero_byte_output_is_failure(tmp_path, monkeypatch):
     """Y5: ffmpeg exited 0 but produced nothing usable."""
-    monkeypatch.setattr(vam, "get_duration_seconds", lambda _p: 600.0)
     monkeypatch.setattr(vam.subprocess, "run", Recorder(payload=b""))
-    assert vam.extract_sample("/media/a.mkv", str(tmp_path / "s.wav"), vam.Config()) is False
+    assert vam.extract_sample("/media/a.mkv", str(tmp_path / "s.wav"), vam.Config(),
+                              PROBE) is False
 
 
 def test_extract_sample_ffmpeg_error_logs_truncated_stderr(tmp_path, monkeypatch, capsys):
     """Y6: a 1 KB ffmpeg complaint is truncated, and names the file."""
     noise = "E" * 1000
     exc = subprocess.CalledProcessError(1, ["ffmpeg"], output="", stderr=noise)
-    monkeypatch.setattr(vam, "get_duration_seconds", lambda _p: 600.0)
     monkeypatch.setattr(vam.subprocess, "run", Recorder(exc=exc))
 
-    assert vam.extract_sample("/media/a.mkv", str(tmp_path / "s.wav"), vam.Config()) is False
+    assert vam.extract_sample("/media/a.mkv", str(tmp_path / "s.wav"), vam.Config(),
+                              PROBE) is False
 
     line = capsys.readouterr().err.strip()
     assert "/media/a.mkv" in line
@@ -137,16 +127,10 @@ def test_extract_sample_ffmpeg_error_logs_truncated_stderr(tmp_path, monkeypatch
 def test_extract_sample_timeout_is_failure(tmp_path, monkeypatch, capsys):
     """Y7: a hung ffmpeg is one failed row, not a dead run."""
     exc = subprocess.TimeoutExpired(["ffmpeg"], 120)
-    monkeypatch.setattr(vam, "get_duration_seconds", lambda _p: 600.0)
     monkeypatch.setattr(vam.subprocess, "run", Recorder(exc=exc))
-    assert vam.extract_sample("/media/a.mkv", str(tmp_path / "s.wav"), vam.Config()) is False
+    assert vam.extract_sample("/media/a.mkv", str(tmp_path / "s.wav"), vam.Config(),
+                              PROBE) is False
     assert "/media/a.mkv" in capsys.readouterr().err
-
-
-def test_get_duration_bad_json_is_none(monkeypatch):
-    """Y8: garbage from ffprobe means 'duration unknown', not a crash."""
-    monkeypatch.setattr(vam.subprocess, "run", Recorder(payload=None, stdout="not json{"))
-    assert vam.get_duration_seconds("/media/a.mkv") is None
 
 
 # --- Y9: model construction -------------------------------------------------
@@ -398,7 +382,11 @@ def test_detector_returning_none_language_is_detection_failed(tmp_path, shim_pat
 
 
 def test_null_probability_still_writes_a_verdict(tmp_path, shim_path, whisper_script):
-    """Y13/D8: ("it", None) is a normal row, not a traceback."""
+    """Y13/D8: ("it", None) is a normal row, not a traceback.
+
+    H5 decides which row: a detector that names a language but no probability
+    at all has told us nothing, so 0.00 is below any MIN_CONFIDENCE and the
+    verdict is LOW_CONFIDENCE, not "this file is fine"."""
     path = media(tmp_path, "a.mkv")
     whisper_script({path: ["it", None]})
     inp = write_phase1(tmp_path, [phase1_row(path)])
@@ -406,7 +394,8 @@ def test_null_probability_still_writes_a_verdict(tmp_path, shim_path, whisper_sc
     assert vam.main(["--input", inp, "--output", out]) == 0
 
     _header, rows = read_rows(out)
-    assert rows[0]["Verdict"] == audit_common.VERDICT_MISTAGGED
+    assert rows[0]["Verdict"] == audit_common.VERDICT_LOW_CONFIDENCE
+    assert rows[0]["DetectedLanguage"] == "it"
     assert rows[0]["Confidence"] == "0.00"
 
 

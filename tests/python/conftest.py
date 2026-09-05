@@ -17,6 +17,7 @@ import csv
 import json
 import os
 import struct
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -39,6 +40,8 @@ ENV_VARS = (
     "FAKE_FFMPEG_FAIL",
     "FAKE_FFMPEG_LOG",
     "FAKE_DURATIONS",
+    "FAKE_STREAMS",
+    "FAKE_FFPROBE_LOG",
 )
 
 
@@ -57,14 +60,19 @@ def _wav_bytes(media_path: str) -> bytes:
     )
 
 
+def _forget_fake_whisper():
+    faster_whisper.WhisperModel.instances = []
+    faster_whisper.WhisperModel.calls = []
+    faster_whisper.WhisperModel.transcribe_calls = []
+    faster_whisper.WhisperModel.detect_calls = []
+
+
 @pytest.fixture(autouse=True)
 def _reset_fake_whisper():
     """Each test sees a fresh recording of constructed models and media seen."""
-    faster_whisper.WhisperModel.instances = []
-    faster_whisper.WhisperModel.calls = []
+    _forget_fake_whisper()
     yield
-    faster_whisper.WhisperModel.instances = []
-    faster_whisper.WhisperModel.calls = []
+    _forget_fake_whisper()
 
 
 @pytest.fixture
@@ -115,6 +123,31 @@ def sys_temp(tmp_path, monkeypatch):
 def shim_path(monkeypatch):
     """Put the fake ffmpeg/ffprobe ahead of anything real."""
     monkeypatch.setenv("PATH", str(SHIM_BIN) + os.pathsep + os.environ["PATH"])
+
+
+# --- test doubles -----------------------------------------------------------
+
+
+class Recorder:
+    """Stands in for subprocess.run: records argv, writes the output file.
+
+    Shared because both the extraction tests and the probe tests need to see
+    the exact argv the worker builds -- that argv IS the behaviour under test
+    (which stream ffmpeg is told to take, what ffprobe is asked for)."""
+
+    def __init__(self, payload=b"x", exc=None, stdout=""):
+        self.calls = []
+        self.payload = payload
+        self.exc = exc
+        self.stdout = stdout
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if self.exc is not None:
+            raise self.exc
+        if self.payload is not None:
+            Path(argv[-1]).write_bytes(self.payload)
+        return subprocess.CompletedProcess(argv, 0, self.stdout, "")
 
 
 # --- CSV helpers ------------------------------------------------------------
