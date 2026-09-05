@@ -197,9 +197,10 @@ HTML_TEMPLATE = r"""<!doctype html>
 
 <div class="bar" id="chips"></div>
 
-<div class="tools">
+<div class="tools" id="tools">
   <input type="search" id="q" placeholder="Filter by title, path, episode, language...">
   <button id="copyPaths">Copy visible paths</button>
+  <button id="showAll" hidden></button>
   <span class="count" id="count"></span>
 </div>
 
@@ -221,6 +222,11 @@ const GEN  = __GEN_JSON__;
 const VERDICTS = __VERDICT_META_JSON__;
 const COLUMNS = __COLUMNS_JSON__;
 
+// Rendering tens of thousands of <tr> at once blocks the tab for seconds, so
+// cap the first paint and let the reader ask for the rest.
+const ROW_CAP = 2000;
+const SEARCH_DEBOUNCE_MS = 150;
+
 document.getElementById("src").textContent = SRC;
 document.getElementById("gen").textContent = GEN;
 
@@ -241,11 +247,23 @@ const COL_LABELS = {
 };
 const COLS = COLUMNS.map(k => ({key: k, label: COL_LABELS[k] || k, num: k === "Confidence"}));
 
+// One collator for the whole page: building one per comparison is the single
+// most expensive thing a sort of this table can do.
+const COLLATOR = new Intl.Collator(undefined, {numeric: true});
+
+// The search text of a row never changes, so concatenate and lowercase it
+// once at load instead of on every keystroke.
+for (const r of DATA) {
+  r._hay = (r.Title + " " + r.Path + " " + r.Episode + " " +
+            r.DetectedLanguage + " " + r.DeclaredAudioLanguages).toLowerCase();
+}
+
 const state = {
   q: "",
   hidden: new Set(),        // verdict values toggled off
   sortKey: "Verdict",
   sortDir: 1,
+  showAll: false,           // set by "Show all N rows"
 };
 
 // --- summary chips -------------------------------------------------------
@@ -271,52 +289,54 @@ for (const v of Object.keys(counts).sort()) {
   const meta = verdictMeta(v);
   const c = makeChip("chip " + meta.cls + " on", meta.label, counts[v]);
   c.dataset.verdict = v;
-  c.addEventListener("click", () => {
-    if (state.hidden.has(v)) { state.hidden.delete(v); c.classList.add("on"); c.classList.remove("off"); }
-    else { state.hidden.add(v); c.classList.remove("on"); c.classList.add("off"); }
-    render();
-  });
   chips.appendChild(c);
 }
+
+chips.addEventListener("click", e => {
+  const c = e.target.closest(".chip[data-verdict]");
+  if (!c) return;
+  const v = c.dataset.verdict;
+  if (state.hidden.has(v)) { state.hidden.delete(v); c.classList.add("on"); c.classList.remove("off"); }
+  else { state.hidden.add(v); c.classList.remove("on"); c.classList.add("off"); }
+  render();
+});
 
 // --- header ------------------------------------------------------------
 const head = document.getElementById("head");
 for (const col of COLS) {
   const th = document.createElement("th");
   th.textContent = col.label + " ";
+  th.dataset.key = col.key;
   const arrow = document.createElement("span");
   arrow.className = "arrow";
   arrow.dataset.for = col.key;
   th.appendChild(arrow);
-  th.addEventListener("click", () => {
-    if (state.sortKey === col.key) state.sortDir *= -1;
-    else { state.sortKey = col.key; state.sortDir = 1; }
-    render();
-  });
   head.appendChild(th);
 }
 const thCopy = document.createElement("th");
 thCopy.textContent = "";
 head.appendChild(thCopy);
 
+head.addEventListener("click", e => {
+  const th = e.target.closest("th[data-key]");
+  if (!th) return;
+  const key = th.dataset.key;
+  if (state.sortKey === key) state.sortDir *= -1;
+  else { state.sortKey = key; state.sortDir = 1; }
+  render();
+});
+
 // --- filtering / sorting --------------------------------------------------
 function currentRows() {
   const q = state.q.toLowerCase();
+  // filter() already returns a fresh array, so sorting it in place is safe.
   let rows = DATA.filter(r => !state.hidden.has(r.Verdict));
-  if (q) {
-    rows = rows.filter(r =>
-      (r.Title + " " + r.Path + " " + r.Episode + " " +
-       r.DetectedLanguage + " " + r.DeclaredAudioLanguages).toLowerCase().includes(q)
-    );
-  }
+  if (q) rows = rows.filter(r => r._hay.includes(q));
   const k = state.sortKey, dir = state.sortDir;
-  rows = rows.slice().sort((a, b) => {
-    let x = a[k], y = b[k];
-    if (k === "Confidence" || k === "Year") {
-      x = parseFloat(x) || 0; y = parseFloat(y) || 0;
-      return (x - y) * dir;
-    }
-    return String(x).localeCompare(String(y), undefined, {numeric: true}) * dir;
+  const numeric = (k === "Confidence" || k === "Year");
+  rows.sort((a, b) => {
+    if (numeric) return ((parseFloat(a[k]) || 0) - (parseFloat(b[k]) || 0)) * dir;
+    return COLLATOR.compare(String(a[k]), String(b[k])) * dir;
   });
   return rows;
 }
@@ -328,10 +348,13 @@ function fmtConfidence(v) {
 
 function render() {
   const rows = currentRows();
+  const shownRows = (!state.showAll && rows.length > ROW_CAP) ? rows.slice(0, ROW_CAP) : rows;
   const body = document.getElementById("body");
   body.textContent = "";
 
-  for (const r of rows) {
+  // One reflow instead of one per row.
+  const frag = document.createDocumentFragment();
+  for (const r of shownRows) {
     const tr = document.createElement("tr");
     for (const col of COLS) {
       const td = document.createElement("td");
@@ -355,41 +378,68 @@ function render() {
     }
     const tdCopy = document.createElement("td");
     if (r.Path) {
+      // The click is handled once on <tbody>; the path travels on the button.
       const b = document.createElement("button");
       b.className = "copy";
       b.textContent = "copy";
-      b.addEventListener("click", () => {
-        navigator.clipboard.writeText(r.Path).then(() => {
-          b.textContent = "ok"; setTimeout(() => (b.textContent = "copy"), 900);
-        });
-      });
+      b.dataset.path = r.Path;
       tdCopy.appendChild(b);
     }
     tr.appendChild(tdCopy);
-    body.appendChild(tr);
+    frag.appendChild(tr);
   }
+  body.appendChild(frag);
 
   document.getElementById("empty").hidden = rows.length !== 0;
-  document.getElementById("count").textContent =
-    rows.length + " / " + DATA.length + " rows";
+
+  const showAll = document.getElementById("showAll");
+  const capped = shownRows.length !== rows.length;
+  showAll.hidden = !capped;
+  showAll.textContent = capped ? "Show all " + rows.length + " rows" : "";
+
+  document.getElementById("count").textContent = capped
+    ? shownRows.length + " of " + rows.length + " shown / " + DATA.length + " rows"
+    : rows.length + " / " + DATA.length + " rows";
 
   for (const a of document.querySelectorAll(".arrow")) {
     a.textContent = (a.dataset.for === state.sortKey) ? (state.sortDir > 0 ? "▲" : "▼") : "";
   }
 }
 
-document.getElementById("q").addEventListener("input", e => {
-  state.q = e.target.value; render();
+// --- copy buttons: one listener for the whole table ------------------------
+document.getElementById("body").addEventListener("click", e => {
+  const b = e.target.closest("button.copy");
+  if (!b || !b.dataset.path) return;
+  navigator.clipboard.writeText(b.dataset.path).then(() => {
+    b.textContent = "ok";
+    setTimeout(() => { b.textContent = "copy"; }, 900);
+  });
 });
 
-document.getElementById("copyPaths").addEventListener("click", () => {
-  const rows = currentRows();
-  const paths = rows.map(r => r.Path).filter(Boolean);
-  navigator.clipboard.writeText(paths.join("\n"));
-  const btn = document.getElementById("copyPaths");
-  const old = btn.textContent;
-  btn.textContent = "copied " + paths.length;
-  setTimeout(() => (btn.textContent = old), 1200);
+// --- toolbar: one listener for both buttons -------------------------------
+document.getElementById("tools").addEventListener("click", e => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  if (btn.id === "showAll") {
+    state.showAll = true;
+    render();
+    return;
+  }
+  if (btn.id === "copyPaths") {
+    const paths = currentRows().map(r => r.Path).filter(Boolean);
+    navigator.clipboard.writeText(paths.join("\n"));
+    const old = "Copy visible paths";
+    btn.textContent = "copied " + paths.length;
+    setTimeout(() => { btn.textContent = old; }, 1200);
+  }
+});
+
+// Typing is cheap; re-sorting and re-rendering the table is not.
+let searchTimer = 0;
+document.getElementById("q").addEventListener("input", e => {
+  const value = e.target.value;
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { state.q = value; render(); }, SEARCH_DEBOUNCE_MS);
 });
 
 render();

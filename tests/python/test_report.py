@@ -354,3 +354,26 @@ def test_build_html_uses_the_supplied_generated_timestamp(tmp_path):
 
     assert js_const(html, "GEN") == "2026-01-01 00:00:00"
     assert js_const(html, "SRC") == "x.csv"
+
+
+# --- R19: the page does the expensive work once, not per keystroke -----------
+def test_r19_the_table_script_is_written_for_large_reports():
+    template = report.HTML_TEMPLATE
+
+    # One collator, reused by the sort comparator.
+    assert "Intl.Collator" in template
+    assert "COLLATOR.compare" in template
+    # A precomputed lowercased search haystack, not a concat per row per key.
+    assert "_hay" in template
+    # A cap on the rendered rows, with a way out.
+    assert "ROW_CAP" in template
+    assert "Show all " in template
+    # Debounced search input.
+    assert "SEARCH_DEBOUNCE_MS = 150" in template
+    # Copy buttons are delegated, so the row loop attaches no listeners.
+    assert "dataset.path" in template
+    assert template.count('addEventListener("click"') <= 4
+
+
+def test_r19_the_row_cap_is_two_thousand():
+    assert "const ROW_CAP = 2000;" in report.HTML_TEMPLATE
